@@ -283,7 +283,7 @@ export default function AdminDashboard() {
           <Text style={s.headerSub}>{greeting}, {adminName} 👋</Text>
         </View>
         <View style={s.headerRight}>
-          <TouchableOpacity style={s.bellWrap} onPress={() => router.push("/admin/bookings" as any)}>
+          <TouchableOpacity style={s.bellWrap} onPress={() => router.push("/admin/adminnotification" as any)}>
             <Ionicons name="notifications-outline" size={22} color="#FFFFFF" />
             {notifCount > 0 && (
               <View style={s.badge}>
@@ -292,11 +292,15 @@ export default function AdminDashboard() {
             )}
           </TouchableOpacity>
           {adminPhoto ? (
+           
+
             <Image source={{ uri: adminPhoto }} style={s.avatar} />
           ) : (
+             <TouchableOpacity onPress={ () => router.push("/admin/settings")}>
             <View style={[s.avatar, s.avatarFallback]}>
               <Text style={s.avatarInitial}>{adminName[0]?.toUpperCase()}</Text>
             </View>
+            </TouchableOpacity>
           )}
         </View>
       </View>
@@ -341,9 +345,10 @@ export default function AdminDashboard() {
             {([
               { icon: "business-outline",   label: "Add Turf",       route: "/admin/add-turf", color: "#6366F1", bg: "#EEF2FF" },
               { icon: "grid-outline",       label: "Manage\nTurfs",  route: "/admin/turfs",    color: "#22C55E", bg: "#DCFCE7" },
-              { icon: "person-add-outline", label: "Create\nOwner",  route: "/admin/owners",   color: "#F59E0B", bg: "#FEF3C7" },
+          //    { icon: "person-add-outline", label: "Create\nOwner",  route: "/admin/owners",   color: "#F59E0B", bg: "#FEF3C7" },
               { icon: "people-outline",     label: "Manage\nOwners", route: "/admin/owners",   color: "#3B82F6", bg: "#DBEAFE" },
               { icon: "image-outline",      label: "Banners",        route: "/admin/settings", color: "#8B5CF6", bg: "#EDE9FE" },
+                { icon: "apps-outline",      label: "user home control",        route: "/admin/user-home-control", color: "#000000", bg: "#d6d6d6" },
             ] as const).map((q, i) => (
               <TouchableOpacity key={i} style={s.quickItem} onPress={() => router.push(q.route as any)} activeOpacity={0.75}>
                 <View style={[s.quickIcon, { backgroundColor: q.bg }]}>

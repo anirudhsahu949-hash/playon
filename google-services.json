@@ -1,0 +1,40 @@
+{
+  "project_info": {
+    "project_number": "465570382852",
+    "firebase_url": "https://sportora-5f30f-default-rtdb.asia-southeast1.firebasedatabase.app",
+    "project_id": "sportora-5f30f",
+    "storage_bucket": "sportora-5f30f.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:465570382852:android:5aca1b7ba70ca7b3b12151",
+        "android_client_info": {
+          "package_name": "com.playonnew.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "465570382852-5dq60omn8fmmo87edv70icn3nin1lcjg.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDnBV-BKS-PGZPk0lphXDUwyompVRaIO14"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "465570382852-5dq60omn8fmmo87edv70icn3nin1lcjg.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

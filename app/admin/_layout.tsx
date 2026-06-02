@@ -11,7 +11,10 @@ import { auth, db } from "../../firebaseConfig";
 
 import { Ionicons } from "@expo/vector-icons";
 
+
+
 export default function AdminLayout() {
+  
   const router = useRouter();
   const [checking, setChecking] = useState(true);
 
@@ -134,6 +137,145 @@ export default function AdminLayout() {
           ),
         }}
       />
+
+       <Drawer.Screen
+        name="add-turf"
+        options={{
+          drawerLabel: "add turfs",
+          drawerIcon: ({ color, size }) => (
+            <Ionicons name="add" size={size} color={color} />
+          ),
+        }}
+      />
+
+       
+
+
+
+<Drawer.Screen
+  name="user-monitor"
+  options={{
+    title: "Users",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="eye-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
+<Drawer.Screen
+  name="booking-analysis"
+  options={{
+    title: "Analytics",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="stats-chart-outline" size={size} color={color} />
+    ),
+  }}
+/>
+   <Drawer.Screen
+        name="adminavabar"
+        options={{
+          drawerItemStyle: { display: "none" },
+        }}
+      />
+
+       <Drawer.Screen
+       name="notification-center"
+       options={{
+       title: "notification managament",
+       drawerIcon: ({ color, size }) => (
+       <Ionicons name="notifications-outline" size={size} color={color} />
+       ),
+      }}
+     />
+
+     
+       <Drawer.Screen
+       name="Adminsettlementscreen"
+       options={{
+       title: "settlement",
+       drawerIcon: ({ color, size }) => (
+       <Ionicons name="calculator-outline" size={size} color={color} />
+       ),
+      }}
+     />
+
+            <Drawer.Screen
+  name="support-solve"
+  options={{
+    title: "Support",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="chatbubbles-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
+  <Drawer.Screen
+  name="user-home-control"
+  options={{
+    title: "user-home-control",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="apps-outline" size={size} color={color} />
+    ),
+  }}
+/>
+  <Drawer.Screen
+  name="admin-link"
+  options={{
+    title: "user-share-link-update",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="share-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
+<Drawer.Screen
+  name="area-analysis"
+  options={{
+    title: "user-location-filter",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="location-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
+<Drawer.Screen
+  name="adminnotification"
+  options={{
+    title: "notification",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="notifications-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
+<Drawer.Screen
+  name="booking-analytics"
+  options={{
+    title: "booking-analysis",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="analytics-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
+<Drawer.Screen
+  name="admin-owner-details-banking-online"
+  options={{
+    title: "owners-baninkg-details",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="wallet-outline" size={size} color={color} />
+    ),
+  }}
+/>
+<Drawer.Screen
+  name="promo-code-admin"
+  options={{
+    title: "promo code for users",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="code-outline" size={size} color={color} />
+    ),
+  }}
+/>
     </Drawer>
   );
 }

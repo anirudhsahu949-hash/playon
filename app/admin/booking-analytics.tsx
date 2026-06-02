@@ -5,7 +5,7 @@ import {
 } from "react-native";
 import { useEffect, useMemo, useState } from "react";
 import { db } from "../../firebaseConfig";
-import { collection, getDocs } from "firebase/firestore";
+import { collection, getDocs, query, where, orderBy, limit, Timestamp } from "firebase/firestore"
 import { Ionicons } from "@expo/vector-icons";
 import Svg, { Rect, Text as ST, G, Circle, Path, Defs, LinearGradient, Stop } from "react-native-svg";
 import AdminNavBar from "./adminavabar";
@@ -35,7 +35,7 @@ function fmt(n: number)        { return n >= 100000 ? `₹${(n/100000).toFixed(1
 
 const TF_OPTIONS: {key: TimeFrame; label: string}[] = [
   {key:"7d",label:"7 Days"},{key:"1m",label:"1 Month"},
-  {key:"3m",label:"3 Months"},{key:"6m",label:"6 Months"},{key:"all",label:"All Time"},
+  {key:"3m",label:"3 Months"},{key:"6m",label:"6 Months"},{key:"all",label:"6M All"},
 ];
 
 // ─── Horizontal Bar Chart ─────────────────────────────────────────────────────
@@ -137,10 +137,26 @@ export default function BookingAnalysis() {
   const fetchBookings = async (isRefresh = false) => {
     isRefresh ? setRefreshing(true) : setLoading(true);
     try {
-      const snap = await getDocs(collection(db, "bookings"));
-      setBookings(snap.docs.map((d) => ({id: d.id, ...d.data()} as Booking)));
-    } catch { Alert.alert("Error", "Could not load analytics."); }
-    finally { setLoading(false); setRefreshing(false); }
+      // REPLACE with — limits to last 6 months + max 1000 docs
+const sixMonthsAgo = new Date();
+sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+const q = query(
+  collection(db, "bookings"),
+  where("date", ">=", Timestamp.fromDate(sixMonthsAgo)),
+  orderBy("date", "desc"),
+  limit(1000)
+);
+const snap = await getDocs(q);
+setBookings((snap.docs ?? []).map((d) => ({id: d.id, ...d.data()} as Booking)));
+    } catch (e) {
+      console.error("BookingAnalysis fetch error:", e);
+      setBookings([]); // ensure state is clean so empty states render correctly
+      Alert.alert("Error", "Could not load analytics. Pull down to retry.");
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
   };
 
   // ── Apply time frame filter ──────────────────────────────────────────────────
@@ -216,7 +232,11 @@ export default function BookingAnalysis() {
     // ── Peak hour analysis ──
     const hourCount: Record<string,number> = {};
     for (const b of filtered) {
-      const slots = Array.isArray(b.selectedSlots) ? b.selectedSlots : b.slotTime ? [b.slotTime] : [];
+      const slots = Array.isArray(b.selectedSlots) && b.selectedSlots.length > 0
+        ? b.selectedSlots
+        : Array.isArray((b as any).slots) && (b as any).slots.length > 0
+        ? (b as any).slots
+        : b.slotTime ? [b.slotTime] : [];
       for (const sl of slots) {
         const hr = sl.split(":")[0] + ":00";
         if (hr && hr !== ":00") hourCount[hr] = (hourCount[hr]||0) + 1;
@@ -310,14 +330,24 @@ export default function BookingAnalysis() {
             <Text style={s.cardTitle}>Booking Trend (Last 7 Days)</Text>
           </View>
           <Text style={s.cardSub}>Daily booking volume over the past week.</Text>
-          <View style={{marginTop:12}}>
-            <Sparkline data={analytics.trend7} color="#3B82F6"/>
-          </View>
-          <View style={s.trendLabels}>
-            {["6d","5d","4d","3d","2d","1d","Today"].map((l,i)=>(
-              <Text key={i} style={s.trendLabel}>{l}</Text>
-            ))}
-          </View>
+          {analytics.trend7.every((v) => v === 0) ? (
+            <View style={s.noDataBox}>
+              <Ionicons name="trending-up-outline" size={28} color="#D1D5DB"/>
+              <Text style={s.noDataTitle}>No bookings in the last 7 days</Text>
+              <Text style={s.noDataSub}>The trend chart will appear once bookings are made.</Text>
+            </View>
+          ) : (
+            <>
+              <View style={{marginTop:12}}>
+                <Sparkline data={analytics.trend7} color="#3B82F6"/>
+              </View>
+              <View style={s.trendLabels}>
+                {["6d","5d","4d","3d","2d","1d","Today"].map((l,i)=>(
+                  <Text key={i} style={s.trendLabel}>{l}</Text>
+                ))}
+              </View>
+            </>
+          )}
         </View>
 
         {/* ── Most Booked Turfs ── */}
@@ -327,9 +357,17 @@ export default function BookingAnalysis() {
             <Text style={s.cardTitle}>Most Booked Turfs</Text>
           </View>
           <Text style={s.cardSub}>Turfs ranked by number of bookings received.</Text>
-          <View style={{marginTop:14}}>
-            <BarChart rows={analytics.topTurfsByCount.map((t)=>({label:t.name,value:t.count}))} color="#6366F1"/>
-          </View>
+          {analytics.topTurfsByCount.length === 0 ? (
+            <View style={s.noDataBox}>
+              <Ionicons name="location-outline" size={28} color="#D1D5DB"/>
+              <Text style={s.noDataTitle}>No bookings yet</Text>
+              <Text style={s.noDataSub}>Turf rankings appear once the first booking is made.</Text>
+            </View>
+          ) : (
+            <View style={{marginTop:14}}>
+              <BarChart rows={analytics.topTurfsByCount.map((t)=>({label:t.name,value:t.count}))} color="#6366F1"/>
+            </View>
+          )}
         </View>
 
         {/* ── Turf Revenue Breakdown ── */}
@@ -339,23 +377,31 @@ export default function BookingAnalysis() {
             <Text style={s.cardTitle}>Revenue by Turf</Text>
           </View>
           <Text style={s.cardSub}>Which turfs generate the most revenue for the platform.</Text>
-          <View style={s.donutRow}>
-            <DonutChart data={analytics.topTurfsByRevenue}/>
-            <View style={s.legend}>
-              {analytics.topTurfsByRevenue.map((t,i)=>{
-                const pct = analytics.totalRevenue>0?Math.round((t.revenue/analytics.totalRevenue)*100):0;
-                return (
-                  <View key={i} style={s.legendRow}>
-                    <View style={[s.legendDot,{backgroundColor:t.color}]}/>
-                    <View style={{flex:1}}>
-                      <Text style={s.legendName} numberOfLines={1}>{t.name}</Text>
-                      <Text style={s.legendVal}>{fmt(t.revenue)} · {pct}%</Text>
-                    </View>
-                  </View>
-                );
-              })}
+          {analytics.topTurfsByRevenue.length === 0 ? (
+            <View style={s.noDataBox}>
+              <Ionicons name="pie-chart-outline" size={28} color="#D1D5DB"/>
+              <Text style={s.noDataTitle}>No revenue yet</Text>
+              <Text style={s.noDataSub}>Revenue breakdown appears once bookings are completed.</Text>
             </View>
-          </View>
+          ) : (
+            <View style={s.donutRow}>
+              <DonutChart data={analytics.topTurfsByRevenue}/>
+              <View style={s.legend}>
+                {analytics.topTurfsByRevenue.map((t,i)=>{
+                  const pct = analytics.totalRevenue>0?Math.round((t.revenue/analytics.totalRevenue)*100):0;
+                  return (
+                    <View key={i} style={s.legendRow}>
+                      <View style={[s.legendDot,{backgroundColor:t.color}]}/>
+                      <View style={{flex:1}}>
+                        <Text style={s.legendName} numberOfLines={1}>{t.name}</Text>
+                        <Text style={s.legendVal}>{fmt(t.revenue)} · {pct}%</Text>
+                      </View>
+                    </View>
+                  );
+                })}
+              </View>
+            </View>
+          )}
         </View>
 
         {/* ── Top Customers ── */}
@@ -413,9 +459,17 @@ export default function BookingAnalysis() {
             <Text style={s.cardTitle}>Peak Day of Week</Text>
           </View>
           <Text style={s.cardSub}>Which days users prefer to book turfs.</Text>
-          <View style={{marginTop:14}}>
-            <BarChart rows={analytics.dowData.map((d)=>({label:d.label,value:d.value}))} color="#06B6D4"/>
-          </View>
+          {analytics.dowData.every((d) => d.value === 0) ? (
+            <View style={s.noDataBox}>
+              <Ionicons name="calendar-outline" size={28} color="#D1D5DB"/>
+              <Text style={s.noDataTitle}>No bookings yet</Text>
+              <Text style={s.noDataSub}>Day-of-week trends appear once bookings are made.</Text>
+            </View>
+          ) : (
+            <View style={{marginTop:14}}>
+              <BarChart rows={analytics.dowData.map((d)=>({label:d.label,value:d.value}))} color="#06B6D4"/>
+            </View>
+          )}
         </View>
 
         {/* ── Peak Hours ── */}
@@ -439,24 +493,31 @@ export default function BookingAnalysis() {
             <Text style={s.cardTitle}>Revenue by Owner</Text>
           </View>
           <Text style={s.cardSub}>How much each owner's turfs have earned on the platform.</Text>
-          <View style={s.donutRow}>
-            <DonutChart data={analytics.topOwners}/>
-            <View style={s.legend}>
-              {analytics.topOwners.map((o,i)=>{
-                const pct = analytics.totalRevenue>0?Math.round((o.revenue/analytics.totalRevenue)*100):0;
-                return (
-                  <View key={i} style={s.legendRow}>
-                    <View style={[s.legendDot,{backgroundColor:o.color}]}/>
-                    <View style={{flex:1}}>
-                      <Text style={s.legendName} numberOfLines={1}>{o.name}</Text>
-                      <Text style={s.legendVal}>{fmt(o.revenue)} · {pct}%</Text>
-                    </View>
-                  </View>
-                );
-              })}
+          {analytics.topOwners.length === 0 ? (
+            <View style={s.noDataBox}>
+              <Ionicons name="business-outline" size={28} color="#D1D5DB"/>
+              <Text style={s.noDataTitle}>No revenue data yet</Text>
+              <Text style={s.noDataSub}>Owner earnings appear once bookings are completed.</Text>
             </View>
-          </View>
-          {analytics.topOwners.length===0&&<Text style={s.noData}>No revenue data yet.</Text>}
+          ) : (
+            <View style={s.donutRow}>
+              <DonutChart data={analytics.topOwners}/>
+              <View style={s.legend}>
+                {analytics.topOwners.map((o,i)=>{
+                  const pct = analytics.totalRevenue>0?Math.round((o.revenue/analytics.totalRevenue)*100):0;
+                  return (
+                    <View key={i} style={s.legendRow}>
+                      <View style={[s.legendDot,{backgroundColor:o.color}]}/>
+                      <View style={{flex:1}}>
+                        <Text style={s.legendName} numberOfLines={1}>{o.name}</Text>
+                        <Text style={s.legendVal}>{fmt(o.revenue)} · {pct}%</Text>
+                      </View>
+                    </View>
+                  );
+                })}
+              </View>
+            </View>
+          )}
         </View>
 
         {/* ── Summary insight box ── */}

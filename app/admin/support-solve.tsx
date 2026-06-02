@@ -1,388 +1,464 @@
-import React, { useEffect, useState, useMemo, useRef } from "react";
+import React, { useEffect, useState, useMemo, useRef, useCallback } from "react";
 import {
-  View, Text, StyleSheet, SafeAreaView, ScrollView, TouchableOpacity,
+  View, Text, StyleSheet, SafeAreaView, FlatList, TouchableOpacity,
   TextInput, Alert, ActivityIndicator, RefreshControl, StatusBar,
-  Platform, Modal, KeyboardAvoidingView, Linking,
+  Platform, Modal, KeyboardAvoidingView, Linking, ScrollView, Animated,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
-import { useRouter } from "expo-router";
 import {
-  collection, getDocs, doc, updateDoc, addDoc,
-  serverTimestamp, query, orderBy, getDoc,
+  collection, getDocs, doc, updateDoc,
+  serverTimestamp, query, orderBy,
 } from "firebase/firestore";
 import { db } from "../../firebaseConfig";
 import AdminNavBar from "./adminavabar";
 
-// ─── Theme ────────────────────────────────────────────────────────────────────
-const DARK   = "#0F1923";
-const ACCENT = "#0EA5A4";
-const BG     = "#F0F4F8";
+// ─── Tokens ───────────────────────────────────────────────────────────────────
+const DARK    = "#0B1220";
+const WHITE   = "#FFFFFF";
+const GREEN   = "#4DB408";
+const GREEN_LT= "#EBF9E0";
+const BODY_BG = "#F5F6FA";
+const GRAY1   = "#F3F4F6";
+const GRAY2   = "#E5E7EB";
+const GRAY3   = "#9CA3AF";
+const GRAY4   = "#6B7280";
+const GRAY5   = "#4B5563";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 type TicketStatus = "open" | "in-progress" | "resolved" | "closed";
 type TicketSource = "user" | "owner";
 type Priority     = "high" | "normal";
 
-interface Reply {
-  text: string;
-  by: string;
-  at: any;
-}
-
-interface Ticket {
-  id: string;
-  source: TicketSource;
-  status: TicketStatus;
-  priority: Priority;
-  category: string;
-  subject: string;
-  message: string;
-  userName?: string;
-  ownerName?: string;
-  userEmail?: string;
-  ownerEmail?: string;
-  userPhone?: string;
-  ownerPhone?: string;
-  turfName?: string;
-  uid?: string;
-  createdAt?: any;
-  replies?: Reply[];
-  resolvedAt?: any;
-  adminNote?: string;
+interface Reply   { text: string; by: string; at: any; }
+interface Ticket  {
+  id: string; source: TicketSource; status: TicketStatus; priority: Priority;
+  category: string; subject: string; message: string;
+  userName?: string; ownerName?: string; userEmail?: string; ownerEmail?: string;
+  userPhone?: string; ownerPhone?: string; turfName?: string; uid?: string;
+  createdAt?: any; replies?: Reply[]; resolvedAt?: any; adminNote?: string;
 }
 
 type FilterStatus = "all" | TicketStatus;
 type FilterSource = "all" | TicketSource;
 
+// ─── Config ───────────────────────────────────────────────────────────────────
+const STATUS_CFG: Record<TicketStatus, { label: string; color: string; bg: string; icon: string }> = {
+  "open":        { label: "Open",        color: "#DC2626", bg: "#FEE2E2", icon: "alert-circle"     },
+  "in-progress": { label: "In Progress", color: "#D97706", bg: "#FEF3C7", icon: "time"             },
+  "resolved":    { label: "Resolved",    color: "#059669", bg: "#D1FAE5", icon: "checkmark-circle" },
+  "closed":      { label: "Closed",      color: GRAY4,     bg: GRAY1,     icon: "close-circle"     },
+};
+
+const SOURCE_CFG: Record<TicketSource, { label: string; color: string; bg: string; icon: string }> = {
+  "user":  { label: "User",  color: "#2563EB", bg: "#DBEAFE", icon: "person"   },
+  "owner": { label: "Owner", color: "#7C3AED", bg: "#EDE9FE", icon: "business" },
+};
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-function getSenderName(t: Ticket) {
-  return t.source === "owner" ? (t.ownerName || "Owner") : (t.userName || "User");
-}
-function getSenderEmail(t: Ticket) {
-  return t.source === "owner" ? (t.ownerEmail || "") : (t.userEmail || "");
-}
-function getSenderPhone(t: Ticket) {
-  return t.source === "owner" ? (t.ownerPhone || "") : (t.userPhone || "");
-}
-function formatDate(ts: any): string {
+const getSenderName  = (t: Ticket) => t.source === "owner" ? (t.ownerName  || "Owner") : (t.userName  || "User");
+const getSenderEmail = (t: Ticket) => t.source === "owner" ? (t.ownerEmail || "")       : (t.userEmail || "");
+const getSenderPhone = (t: Ticket) => t.source === "owner" ? (t.ownerPhone || "")       : (t.userPhone || "");
+
+function fmtDate(ts: any): string {
   if (!ts) return "—";
   const d = ts.toDate ? ts.toDate() : new Date(ts);
-  const now = new Date();
-  const diff = Math.floor((now.getTime() - d.getTime()) / 1000);
-  if (diff < 60) return "just now";
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
-  return d.toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+  if (isNaN(d.getTime())) return "—";
+  const diff = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (diff < 60)      return "just now";
+  if (diff < 3600)    return `${Math.floor(diff/60)}m ago`;
+  if (diff < 86400)   return `${Math.floor(diff/3600)}h ago`;
+  if (diff < 604800)  return `${Math.floor(diff/86400)}d ago`;
+  return d.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
 }
 
-const STATUS_META: Record<TicketStatus, { label: string; color: string; bg: string; icon: string }> = {
-  "open":        { label: "Open",        color: "#DC2626", bg: "#FEE2E2", icon: "alert-circle"        },
-  "in-progress": { label: "In Progress", color: "#D97706", bg: "#FEF3C7", icon: "time"                },
-  "resolved":    { label: "Resolved",    color: "#059669", bg: "#D1FAE5", icon: "checkmark-circle"    },
-  "closed":      { label: "Closed",      color: "#6B7280", bg: "#F3F4F6", icon: "close-circle"        },
-};
+function fmtFull(ts: any): string {
+  if (!ts) return "—";
+  const d = ts.toDate ? ts.toDate() : new Date(ts);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleString("en-IN", { day: "numeric", month: "short", year: "numeric", hour: "numeric", minute: "2-digit" });
+}
 
-const SOURCE_META: Record<TicketSource, { label: string; color: string; bg: string }> = {
-  "user":  { label: "User",  color: "#2563EB", bg: "#DBEAFE" },
-  "owner": { label: "Owner", color: "#7C3AED", bg: "#EDE9FE" },
-};
+// ─── Quick reply templates ────────────────────────────────────────────────────
+const QUICK_REPLIES = [
+  "Thank you for reaching out. We're looking into your issue and will get back to you shortly.",
+  "Your issue has been escalated to our technical team. We'll update you within 24 hours.",
+  "We're happy to inform you that your issue has been resolved. Please let us know if you need further assistance.",
+  "Could you please provide more details about the issue so we can assist you better?",
+  "We apologize for the inconvenience. Our team is actively working on a fix.",
+  "Your booking has been reviewed. Please check the app for updated details.",
+];
 
-// ─── Ticket card (list) ───────────────────────────────────────────────────────
-function TicketCard({ ticket, onPress }: { ticket: Ticket; onPress: () => void }) {
-  const sm = STATUS_META[ticket.status] || STATUS_META.open;
-  const src = SOURCE_META[ticket.source] || SOURCE_META.user;
-  const replyCount = ticket.replies?.length || 0;
+// ─── Ticket Card ──────────────────────────────────────────────────────────────
+const TicketCard = React.memo(function TicketCard({ ticket, onPress }: { ticket: Ticket; onPress: () => void }) {
+  const sm  = STATUS_CFG[ticket.status]  ?? STATUS_CFG.open;
+  const src = SOURCE_CFG[ticket.source]  ?? SOURCE_CFG.user;
+  const replyCount = ticket.replies?.length ?? 0;
+  const isHigh = ticket.priority === "high";
 
   return (
-    <TouchableOpacity style={cs.card} onPress={onPress} activeOpacity={0.82}>
-      {/* Priority stripe */}
-      {ticket.priority === "high" && <View style={cs.priorityStripe} />}
+    <TouchableOpacity style={[cc.card, isHigh && cc.cardHigh]} onPress={onPress} activeOpacity={0.85}>
+      {/* Left status bar */}
+      <View style={[cc.bar, { backgroundColor: sm.color }]} />
 
-      <View style={cs.cardTop}>
-        {/* Source badge */}
-        <View style={[cs.sourcePill, { backgroundColor: src.bg }]}>
-          <Text style={[cs.sourceTxt, { color: src.color }]}>{src.label}</Text>
+      <View style={cc.inner}>
+        {/* Top row */}
+        <View style={cc.topRow}>
+          <View style={[cc.srcPill, { backgroundColor: src.bg }]}>
+            <Ionicons name={src.icon as any} size={10} color={src.color} />
+            <Text style={[cc.srcTxt, { color: src.color }]}>{src.label}</Text>
+          </View>
+          <View style={[cc.stPill, { backgroundColor: sm.bg }]}>
+            <Ionicons name={sm.icon as any} size={10} color={sm.color} />
+            <Text style={[cc.stTxt, { color: sm.color }]}>{sm.label}</Text>
+          </View>
+          {isHigh && (
+            <View style={cc.highPill}>
+              <Ionicons name="flame" size={10} color="#DC2626" />
+              <Text style={cc.highTxt}>Urgent</Text>
+            </View>
+          )}
+          <Text style={cc.time}>{fmtDate(ticket.createdAt)}</Text>
         </View>
 
-        {/* Status badge */}
-        <View style={[cs.statusPill, { backgroundColor: sm.bg }]}>
-          <Ionicons name={sm.icon as any} size={10} color={sm.color} style={{ marginRight: 3 }} />
-          <Text style={[cs.statusTxt, { color: sm.color }]}>{sm.label}</Text>
+        {/* Subject */}
+        <Text style={cc.subject} numberOfLines={1}>{ticket.subject || ticket.category}</Text>
+
+        {/* Sender */}
+        <View style={cc.senderRow}>
+          <Ionicons name={src.icon as any} size={11} color={GRAY3} />
+          <Text style={cc.senderName}>{getSenderName(ticket)}</Text>
+          {!!ticket.turfName && <Text style={cc.senderSub}>· {ticket.turfName}</Text>}
         </View>
 
-        {/* High priority tag */}
-        {ticket.priority === "high" && (
-          <View style={cs.highPill}>
-            <Ionicons name="flame" size={10} color="#DC2626" />
-            <Text style={cs.highTxt}>High</Text>
-          </View>
-        )}
-      </View>
+        {/* Preview */}
+        <Text style={cc.preview} numberOfLines={2}>{ticket.message}</Text>
 
-      <Text style={cs.subject} numberOfLines={1}>{ticket.subject || ticket.category}</Text>
-      <Text style={cs.senderRow}>
-        <Text style={cs.senderName}>{getSenderName(ticket)}</Text>
-        {ticket.turfName ? <Text style={cs.senderSub}>  ·  {ticket.turfName}</Text> : null}
-      </Text>
-      <Text style={cs.preview} numberOfLines={2}>{ticket.message}</Text>
-
-      <View style={cs.cardFooter}>
-        <Text style={cs.timeText}>{formatDate(ticket.createdAt)}</Text>
-        {replyCount > 0 && (
-          <View style={cs.replyCount}>
-            <Ionicons name="chatbubble-outline" size={11} color="#6B7280" />
-            <Text style={cs.replyCountTxt}>{replyCount}</Text>
+        {/* Footer */}
+        <View style={cc.footer}>
+          <View style={cc.categoryChip}>
+            <Text style={cc.categoryTxt}>{ticket.category}</Text>
           </View>
-        )}
-        <Ionicons name="chevron-forward" size={14} color="#D1D5DB" />
+          {replyCount > 0 && (
+            <View style={cc.replyBadge}>
+              <Ionicons name="chatbubble-outline" size={11} color={GRAY4} />
+              <Text style={cc.replyCount}>{replyCount} repl{replyCount === 1 ? "y" : "ies"}</Text>
+            </View>
+          )}
+          <Ionicons name="chevron-forward" size={14} color={GRAY2} style={{ marginLeft: "auto" as any }} />
+        </View>
       </View>
     </TouchableOpacity>
   );
-}
+});
 
-// ─── Detail modal ─────────────────────────────────────────────────────────────
-function TicketDetailModal({
-  ticket,
-  visible,
-  onClose,
-  onUpdated,
-}: {
-  ticket: Ticket | null;
-  visible: boolean;
-  onClose: () => void;
-  onUpdated: (t: Ticket) => void;
+// ─── Detail Modal ─────────────────────────────────────────────────────────────
+function TicketDetailModal({ ticket, visible, onClose, onUpdated }: {
+  ticket: Ticket | null; visible: boolean;
+  onClose: () => void; onUpdated: (t: Ticket) => void;
 }) {
-  const [replyText, setReplyText]   = useState("");
-  const [sending,   setSending]     = useState(false);
-  const [updating,  setUpdating]    = useState(false);
+  const [replyText,    setReplyText]    = useState("");
+  const [sending,      setSending]      = useState(false);
+  const [updating,     setUpdating]     = useState(false);
+  const [showQuick,    setShowQuick]    = useState(false);
+  const [adminNote,    setAdminNote]    = useState("");
+  const [savingNote,   setSavingNote]   = useState(false);
   const scrollRef = useRef<ScrollView>(null);
 
-  useEffect(() => { if (visible) setReplyText(""); }, [visible]);
+  useEffect(() => {
+    if (visible && ticket) {
+      setReplyText("");
+      setAdminNote(ticket.adminNote || "");
+      setShowQuick(false);
+    }
+  }, [visible, ticket?.id]);
 
   if (!ticket) return null;
 
-  const sm  = STATUS_META[ticket.status]  || STATUS_META.open;
-  const src = SOURCE_META[ticket.source]  || SOURCE_META.user;
+  const sm  = STATUS_CFG[ticket.status]  ?? STATUS_CFG.open;
+  const src = SOURCE_CFG[ticket.source]  ?? SOURCE_CFG.user;
 
   const sendReply = async () => {
     if (!replyText.trim()) return;
     setSending(true);
     try {
-      const newReply: Reply = {
-        text: replyText.trim(),
-        by:   "Admin",
-        at:   new Date(),
-      };
-      const updatedReplies = [...(ticket.replies || []), newReply];
+      const newReply: Reply = { text: replyText.trim(), by: "Admin", at: new Date() };
+      const updatedReplies  = [...(ticket.replies || []), newReply];
+      const newStatus: TicketStatus = ticket.status === "open" ? "in-progress" : ticket.status;
       await updateDoc(doc(db, "supportTickets", ticket.id), {
-        replies:    updatedReplies,
-        status:     ticket.status === "open" ? "in-progress" : ticket.status,
-        updatedAt:  serverTimestamp(),
+        replies: updatedReplies, status: newStatus, updatedAt: serverTimestamp(),
       });
-      const updated: Ticket = {
-        ...ticket,
-        replies: updatedReplies,
-        status:  ticket.status === "open" ? "in-progress" : ticket.status,
-      };
-      onUpdated(updated);
+      onUpdated({ ...ticket, replies: updatedReplies, status: newStatus });
       setReplyText("");
-    } catch {
-      Alert.alert("Error", "Could not send reply.");
-    } finally {
-      setSending(false);
-    }
+      setShowQuick(false);
+      setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 200);
+    } catch { Alert.alert("Error", "Could not send reply."); }
+    finally { setSending(false); }
   };
 
   const changeStatus = async (newStatus: TicketStatus) => {
     setUpdating(true);
     try {
       await updateDoc(doc(db, "supportTickets", ticket.id), {
-        status:     newStatus,
-        updatedAt:  serverTimestamp(),
+        status: newStatus, updatedAt: serverTimestamp(),
         ...(newStatus === "resolved" ? { resolvedAt: serverTimestamp() } : {}),
       });
       onUpdated({ ...ticket, status: newStatus });
-    } catch {
-      Alert.alert("Error", "Could not update status.");
-    } finally {
-      setUpdating(false);
-    }
+    } catch { Alert.alert("Error", "Could not update status."); }
+    finally { setUpdating(false); }
   };
 
-  const openEmail = () => {
-    const email = getSenderEmail(ticket);
-    if (!email) return;
-    Linking.openURL(`mailto:${email}?subject=Re: ${ticket.subject || ticket.category}`);
+  const saveNote = async () => {
+    setSavingNote(true);
+    try {
+      await updateDoc(doc(db, "supportTickets", ticket.id), { adminNote: adminNote.trim(), updatedAt: serverTimestamp() });
+      onUpdated({ ...ticket, adminNote: adminNote.trim() });
+      Alert.alert("Saved", "Admin note saved.");
+    } catch { Alert.alert("Error", "Could not save note."); }
+    finally { setSavingNote(false); }
   };
 
-  const openPhone = () => {
-    const phone = getSenderPhone(ticket);
-    if (!phone) return;
-    Linking.openURL(`tel:${phone}`);
-  };
-
-  const openWhatsapp = () => {
-    const phone = getSenderPhone(ticket);
-    if (!phone) return;
-    const clean = phone.replace(/\D/g, "");
-    Linking.openURL(`https://wa.me/91${clean}?text=Hi, this is Playon support regarding your ticket: "${ticket.subject || ticket.category}"`);
-  };
+  const email = getSenderEmail(ticket);
+  const phone = getSenderPhone(ticket);
 
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
-      <SafeAreaView style={ds.root}>
+      <SafeAreaView style={dm.root}>
         <StatusBar barStyle="dark-content" />
 
         {/* Header */}
-        <View style={ds.header}>
-          <TouchableOpacity onPress={onClose} style={ds.backBtn}>
-            <Ionicons name="close" size={22} color="#374151" />
+        <View style={dm.header}>
+          <TouchableOpacity style={dm.closeBtn} onPress={onClose}>
+            <Ionicons name="close" size={18} color={GRAY5} />
           </TouchableOpacity>
-          <Text style={ds.headerTitle} numberOfLines={1}>{ticket.subject || ticket.category}</Text>
-          <View style={[ds.statusBadge, { backgroundColor: sm.bg }]}>
-            <Text style={[ds.statusBadgeTxt, { color: sm.color }]}>{sm.label}</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={dm.headerTitle} numberOfLines={1}>{ticket.subject || ticket.category}</Text>
+            <Text style={dm.headerSub}>#{ticket.id.slice(0,10)}  ·  {fmtFull(ticket.createdAt)}</Text>
+          </View>
+          <View style={[dm.stBadge, { backgroundColor: sm.bg }]}>
+            <Ionicons name={sm.icon as any} size={11} color={sm.color} />
+            <Text style={[dm.stBadgeTxt, { color: sm.color }]}>{sm.label}</Text>
           </View>
         </View>
 
-        <KeyboardAvoidingView
-          style={{ flex: 1 }}
-          behavior={Platform.OS === "ios" ? "padding" : undefined}
-          keyboardVerticalOffset={90}
-        >
-          <ScrollView
-            ref={scrollRef}
-            contentContainerStyle={ds.scroll}
-            showsVerticalScrollIndicator={false}
-          >
-            {/* Sender info */}
-            <View style={ds.senderCard}>
-              <View style={[ds.avatarCircle, { backgroundColor: src.bg }]}>
-                <Ionicons
-                  name={ticket.source === "owner" ? "business" : "person"}
-                  size={20}
-                  color={src.color}
-                />
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : undefined} keyboardVerticalOffset={90}>
+          <ScrollView ref={scrollRef} contentContainerStyle={dm.scroll} showsVerticalScrollIndicator={false}>
+
+            {/* ── Sender card ── */}
+            <View style={dm.card}>
+              <View style={[dm.avatarCircle, { backgroundColor: src.bg }]}>
+                <Ionicons name={src.icon as any} size={22} color={src.color} />
               </View>
               <View style={{ flex: 1 }}>
-                <View style={ds.senderTopRow}>
-                  <Text style={ds.senderName}>{getSenderName(ticket)}</Text>
-                  <View style={[ds.srcPill, { backgroundColor: src.bg }]}>
-                    <Text style={[ds.srcPillTxt, { color: src.color }]}>{src.label}</Text>
+                <View style={dm.senderTopRow}>
+                  <Text style={dm.senderName}>{getSenderName(ticket)}</Text>
+                  <View style={[dm.srcPill, { backgroundColor: src.bg }]}>
+                    <Text style={[dm.srcPillTxt, { color: src.color }]}>{src.label}</Text>
                   </View>
                   {ticket.priority === "high" && (
-                    <View style={ds.highPill}>
-                      <Ionicons name="flame" size={11} color="#DC2626" />
-                      <Text style={ds.highPillTxt}>High priority</Text>
+                    <View style={dm.highPill}>
+                      <Ionicons name="flame" size={10} color="#DC2626" />
+                      <Text style={dm.highTxt}>Urgent</Text>
                     </View>
                   )}
                 </View>
-                {getSenderEmail(ticket) ? <Text style={ds.senderMeta}>{getSenderEmail(ticket)}</Text> : null}
-                {getSenderPhone(ticket) ? <Text style={ds.senderMeta}>{getSenderPhone(ticket)}</Text> : null}
-                {ticket.turfName        ? <Text style={ds.senderMeta}>Turf: {ticket.turfName}</Text>  : null}
-                <Text style={ds.senderTime}>{formatDate(ticket.createdAt)}</Text>
+                {!!email && <Text style={dm.senderMeta}>{email}</Text>}
+                {!!phone && <Text style={dm.senderMeta}>{phone}</Text>}
+                {!!ticket.turfName && <Text style={dm.senderMeta}>Turf: {ticket.turfName}</Text>}
               </View>
             </View>
 
-            {/* Quick contact actions */}
-            <View style={ds.contactRow}>
-              {getSenderEmail(ticket) ? (
-                <TouchableOpacity style={ds.contactBtn} onPress={openEmail}>
-                  <Ionicons name="mail-outline" size={16} color="#2563EB" />
-                  <Text style={[ds.contactBtnTxt, { color: "#2563EB" }]}>Email</Text>
-                </TouchableOpacity>
-              ) : null}
-              {getSenderPhone(ticket) ? (
-                <>
-                  <TouchableOpacity style={ds.contactBtn} onPress={openPhone}>
-                    <Ionicons name="call-outline" size={16} color="#059669" />
-                    <Text style={[ds.contactBtnTxt, { color: "#059669" }]}>Call</Text>
+            {/* ── Contact buttons ── */}
+            {(email || phone) && (
+              <View style={dm.contactRow}>
+                {!!email && (
+                  <TouchableOpacity style={dm.contactBtn} onPress={() => Linking.openURL(`mailto:${email}?subject=Re: ${ticket.subject || ticket.category}`)}>
+                    <Ionicons name="mail-outline" size={16} color="#2563EB" />
+                    <Text style={[dm.contactLbl, { color: "#2563EB" }]}>Email</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity style={ds.contactBtn} onPress={openWhatsapp}>
-                    <Ionicons name="logo-whatsapp" size={16} color="#25D366" />
-                    <Text style={[ds.contactBtnTxt, { color: "#25D366" }]}>WhatsApp</Text>
-                  </TouchableOpacity>
-                </>
-              ) : null}
-            </View>
-
-            {/* Category + subject */}
-            <View style={ds.metaRow}>
-              <View style={ds.metaChip}>
-                <Text style={ds.metaChipTxt}>{ticket.category}</Text>
-              </View>
-            </View>
-
-            {/* Original message */}
-            <View style={ds.messageBox}>
-              <Text style={ds.messageLabel}>Message</Text>
-              <Text style={ds.messageText}>{ticket.message}</Text>
-            </View>
-
-            {/* Replies thread */}
-            {(ticket.replies || []).length > 0 && (
-              <View style={ds.threadSection}>
-                <Text style={ds.threadTitle}>Conversation</Text>
-                {(ticket.replies || []).map((r, i) => (
-                  <View key={i} style={[ds.bubble, r.by === "Admin" ? ds.bubbleAdmin : ds.bubbleUser]}>
-                    <View style={ds.bubbleHeader}>
-                      <Text style={ds.bubbleBy}>{r.by}</Text>
-                      <Text style={ds.bubbleTime}>{formatDate(r.at)}</Text>
-                    </View>
-                    <Text style={ds.bubbleText}>{r.text}</Text>
-                  </View>
-                ))}
+                )}
+                {!!phone && (
+                  <>
+                    <TouchableOpacity style={dm.contactBtn} onPress={() => Linking.openURL(`tel:${phone}`)}>
+                      <Ionicons name="call-outline" size={16} color="#059669" />
+                      <Text style={[dm.contactLbl, { color: "#059669" }]}>Call</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={dm.contactBtn} onPress={() => {
+                      const c = phone.replace(/\D/g, "");
+                      Linking.openURL(`https://wa.me/91${c}?text=Hi, this is Playon support regarding your ticket: "${ticket.subject || ticket.category}"`);
+                    }}>
+                      <Ionicons name="logo-whatsapp" size={16} color="#25D366" />
+                      <Text style={[dm.contactLbl, { color: "#25D366" }]}>WhatsApp</Text>
+                    </TouchableOpacity>
+                  </>
+                )}
               </View>
             )}
 
-            {/* Status change */}
-            <View style={ds.statusSection}>
-              <Text style={ds.sectionLabel}>Change status</Text>
-              <View style={ds.statusRow}>
+            {/* ── Category chip ── */}
+            <View style={dm.metaRow}>
+              <View style={dm.catChip}>
+                <Ionicons name="pricetag-outline" size={11} color="#7C3AED" />
+                <Text style={dm.catTxt}>{ticket.category}</Text>
+              </View>
+              {ticket.priority === "high" && (
+                <View style={[dm.catChip, { backgroundColor: "#FEE2E2" }]}>
+                  <Ionicons name="flame" size={11} color="#DC2626" />
+                  <Text style={[dm.catTxt, { color: "#DC2626" }]}>High Priority</Text>
+                </View>
+              )}
+            </View>
+
+            {/* ── Original message ── */}
+            <View style={dm.msgBox}>
+              <Text style={dm.sectionLbl}>Original Message</Text>
+              <Text style={dm.msgText}>{ticket.message}</Text>
+            </View>
+
+            {/* ── Conversation thread ── */}
+            {(ticket.replies || []).length > 0 && (
+              <View style={dm.threadWrap}>
+                <Text style={dm.sectionLbl}>Conversation ({ticket.replies!.length})</Text>
+                {ticket.replies!.map((r, i) => {
+                  const isAdmin = r.by === "Admin";
+                  return (
+                    <View key={i} style={[dm.bubble, isAdmin ? dm.bubbleAdmin : dm.bubbleUser]}>
+                      <View style={dm.bubbleHeader}>
+                        <View style={[dm.bubbleAvatar, { backgroundColor: isAdmin ? GREEN_LT : GRAY1 }]}>
+                          <Text style={[dm.bubbleAvatarTxt, { color: isAdmin ? GREEN : GRAY4 }]}>
+                            {isAdmin ? "A" : getSenderName(ticket)[0]}
+                          </Text>
+                        </View>
+                        <Text style={dm.bubbleBy}>{r.by}</Text>
+                        <Text style={dm.bubbleTime}>{fmtDate(r.at)}</Text>
+                      </View>
+                      <Text style={dm.bubbleText}>{r.text}</Text>
+                    </View>
+                  );
+                })}
+              </View>
+            )}
+
+            {/* ── Status change ── */}
+            <View style={dm.section}>
+              <Text style={dm.sectionLbl}>Change Status</Text>
+              <View style={dm.statusRow}>
                 {(["open", "in-progress", "resolved", "closed"] as TicketStatus[]).map((s) => {
-                  const m = STATUS_META[s];
+                  const m = STATUS_CFG[s];
                   const active = ticket.status === s;
                   return (
                     <TouchableOpacity
                       key={s}
-                      style={[ds.statusBtn, active && { backgroundColor: m.bg, borderColor: m.color }]}
+                      style={[dm.stBtn, active && { backgroundColor: m.bg, borderColor: m.color }]}
                       onPress={() => !active && changeStatus(s)}
                       disabled={updating || active}
                       activeOpacity={0.75}
                     >
-                      <Ionicons name={m.icon as any} size={13} color={active ? m.color : "#9CA3AF"} />
-                      <Text style={[ds.statusBtnTxt, active && { color: m.color }]}>{m.label}</Text>
+                      <Ionicons name={m.icon as any} size={13} color={active ? m.color : GRAY3} />
+                      <Text style={[dm.stBtnTxt, active && { color: m.color, fontWeight: "700" }]}>{m.label}</Text>
                     </TouchableOpacity>
                   );
                 })}
               </View>
+              {updating && <ActivityIndicator size="small" color={GREEN} style={{ marginTop: 8 }} />}
             </View>
 
-            <View style={{ height: 20 }} />
-          </ScrollView>
-
-          {/* Reply input */}
-          {ticket.status !== "closed" && (
-            <View style={ds.replyBar}>
+            {/* ── Admin internal note ── */}
+            <View style={dm.section}>
+              <Text style={dm.sectionLbl}>Internal Note (Admin only)</Text>
               <TextInput
-                style={ds.replyInput}
-                placeholder="Type your reply..."
-                placeholderTextColor="#9CA3AF"
-                value={replyText}
-                onChangeText={setReplyText}
+                style={dm.noteInput}
+                placeholder="Add a private note about this ticket..."
+                placeholderTextColor={GRAY3}
+                value={adminNote}
+                onChangeText={setAdminNote}
                 multiline
-                maxLength={1000}
+                maxLength={500}
               />
               <TouchableOpacity
-                style={[ds.sendBtn, (!replyText.trim() || sending) && ds.sendBtnDim]}
-                onPress={sendReply}
-                disabled={!replyText.trim() || sending}
+                style={[dm.saveNoteBtn, savingNote && { opacity: 0.6 }]}
+                onPress={saveNote}
+                disabled={savingNote}
               >
-                {sending
-                  ? <ActivityIndicator size="small" color="#fff" />
-                  : <Ionicons name="send" size={16} color="#fff" />
+                {savingNote
+                  ? <ActivityIndicator size="small" color={WHITE} />
+                  : <Text style={dm.saveNoteTxt}>Save Note</Text>
                 }
               </TouchableOpacity>
+            </View>
+
+            {/* ── Ticket info ── */}
+            <View style={dm.section}>
+              <Text style={dm.sectionLbl}>Ticket Info</Text>
+              <View style={dm.infoBlock}>
+                {[
+                  { label: "Ticket ID",  value: `#${ticket.id.slice(0,14)}` },
+                  { label: "Created",    value: fmtFull(ticket.createdAt) },
+                  { label: "Source",     value: src.label },
+                  { label: "Priority",   value: ticket.priority === "high" ? "High" : "Normal" },
+                  { label: "Replies",    value: String(ticket.replies?.length ?? 0) },
+                  ...(ticket.resolvedAt ? [{ label: "Resolved at", value: fmtFull(ticket.resolvedAt) }] : []),
+                ].map((row, i) => (
+                  <View key={i} style={[dm.infoRow, i > 0 && dm.infoRowBorder]}>
+                    <Text style={dm.infoLabel}>{row.label}</Text>
+                    <Text style={dm.infoValue}>{row.value}</Text>
+                  </View>
+                ))}
+              </View>
+            </View>
+
+            <View style={{ height: 24 }} />
+          </ScrollView>
+
+          {/* ── Reply bar ── */}
+          {ticket.status !== "closed" && (
+            <View style={dm.replyWrap}>
+              {/* Quick replies toggle */}
+              <TouchableOpacity style={dm.quickToggle} onPress={() => setShowQuick(v => !v)}>
+                <Ionicons name="flash" size={14} color={GREEN} />
+                <Text style={dm.quickToggleTxt}>Quick replies</Text>
+                <Ionicons name={showQuick ? "chevron-down" : "chevron-up"} size={13} color={GRAY3} />
+              </TouchableOpacity>
+
+              {/* Quick reply chips */}
+              {showQuick && (
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={dm.quickRow}>
+                  {QUICK_REPLIES.map((qr, i) => (
+                    <TouchableOpacity key={i} style={dm.quickChip} onPress={() => { setReplyText(qr); setShowQuick(false); }}>
+                      <Text style={dm.quickChipTxt} numberOfLines={2}>{qr}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
+              )}
+
+              {/* Input + send */}
+              <View style={dm.replyBar}>
+                <TextInput
+                  style={dm.replyInput}
+                  placeholder="Type your reply…"
+                  placeholderTextColor={GRAY3}
+                  value={replyText}
+                  onChangeText={setReplyText}
+                  multiline
+                  maxLength={1000}
+                />
+                <TouchableOpacity
+                  style={[dm.sendBtn, (!replyText.trim() || sending) && { opacity: 0.4 }]}
+                  onPress={sendReply}
+                  disabled={!replyText.trim() || sending}
+                >
+                  {sending
+                    ? <ActivityIndicator size="small" color={WHITE} />
+                    : <Ionicons name="send" size={16} color={WHITE} />
+                  }
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
+
+          {ticket.status === "closed" && (
+            <View style={dm.closedBar}>
+              <Ionicons name="lock-closed" size={14} color={GRAY3} />
+              <Text style={dm.closedBarTxt}>This ticket is closed. Change status to reply.</Text>
             </View>
           )}
         </KeyboardAvoidingView>
@@ -391,203 +467,209 @@ function TicketDetailModal({
   );
 }
 
-// ─── Main screen ──────────────────────────────────────────────────────────────
+// ─── Main Screen ──────────────────────────────────────────────────────────────
 export default function AdminSupport() {
-  const router = useRouter();
-
-  const [tickets,     setTickets]     = useState<Ticket[]>([]);
-  const [loading,     setLoading]     = useState(true);
-  const [refreshing,  setRefreshing]  = useState(false);
+  const [tickets,      setTickets]      = useState<Ticket[]>([]);
+  const [loading,      setLoading]      = useState(true);
+  const [refreshing,   setRefreshing]   = useState(false);
   const [filterStatus, setFilterStatus] = useState<FilterStatus>("all");
   const [filterSource, setFilterSource] = useState<FilterSource>("all");
-  const [search,      setSearch]      = useState("");
-  const [selected,    setSelected]    = useState<Ticket | null>(null);
-  const [modalOpen,   setModalOpen]   = useState(false);
+  const [search,       setSearch]       = useState("");
+  const [selected,     setSelected]     = useState<Ticket | null>(null);
+  const [modalOpen,    setModalOpen]    = useState(false);
 
   useEffect(() => { fetchTickets(); }, []);
 
   const fetchTickets = async (isRefresh = false) => {
-    if (isRefresh) setRefreshing(true);
-    else setLoading(true);
+    isRefresh ? setRefreshing(true) : setLoading(true);
     try {
-      const snap = await getDocs(
-        query(collection(db, "supportTickets"), orderBy("createdAt", "desc"))
-      );
+      const snap = await getDocs(query(collection(db, "supportTickets"), orderBy("createdAt", "desc")));
       setTickets(snap.docs.map(d => ({ id: d.id, ...d.data() } as Ticket)));
-    } catch {
-      Alert.alert("Error", "Could not load tickets.");
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
+    } catch { Alert.alert("Error", "Could not load tickets."); }
+    finally { setLoading(false); setRefreshing(false); }
   };
 
-  const openTicket = (t: Ticket) => {
-    setSelected(t);
-    setModalOpen(true);
-  };
-
-  const onTicketUpdated = (updated: Ticket) => {
+  const openTicket    = useCallback((t: Ticket) => { setSelected(t); setModalOpen(true); }, []);
+  const onTicketUpdated = useCallback((updated: Ticket) => {
     setTickets(prev => prev.map(t => t.id === updated.id ? updated : t));
     setSelected(updated);
-  };
+  }, []);
 
-  // ── Filter + search ──────────────────────────────────────────────────────
   const filtered = useMemo(() => {
-    return tickets.filter(t => {
-      if (filterStatus !== "all" && t.status !== filterStatus) return false;
-      if (filterSource !== "all" && t.source !== filterSource) return false;
-      if (search.trim()) {
-        const q = search.toLowerCase();
-        const name  = getSenderName(t).toLowerCase();
-        const subj  = (t.subject || "").toLowerCase();
-        const cat   = (t.category || "").toLowerCase();
-        const msg   = (t.message || "").toLowerCase();
-        const email = getSenderEmail(t).toLowerCase();
-        if (!name.includes(q) && !subj.includes(q) && !cat.includes(q) && !msg.includes(q) && !email.includes(q)) return false;
-      }
-      return true;
+    let list = [...tickets];
+    if (filterStatus !== "all") list = list.filter(t => t.status === filterStatus);
+    if (filterSource !== "all") list = list.filter(t => t.source === filterSource);
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter(t =>
+        [getSenderName(t), t.subject, t.category, t.message, getSenderEmail(t), t.turfName]
+          .some(f => f?.toLowerCase().includes(q))
+      );
+    }
+    // High priority first, then by date
+    return list.sort((a, b) => {
+      if (a.priority === "high" && b.priority !== "high") return -1;
+      if (b.priority === "high" && a.priority !== "high") return 1;
+      return 0;
     });
   }, [tickets, filterStatus, filterSource, search]);
 
-  // ── Summary counts ───────────────────────────────────────────────────────
   const counts = useMemo(() => ({
     open:       tickets.filter(t => t.status === "open").length,
     inProgress: tickets.filter(t => t.status === "in-progress").length,
     resolved:   tickets.filter(t => t.status === "resolved").length,
+    closed:     tickets.filter(t => t.status === "closed").length,
     high:       tickets.filter(t => t.priority === "high" && t.status === "open").length,
+    total:      tickets.length,
   }), [tickets]);
 
   if (loading) return (
     <SafeAreaView style={s.loadWrap}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
-      <ActivityIndicator size="large" color={ACCENT} />
-      <Text style={s.loadText}>Loading tickets...</Text>
+      <ActivityIndicator size="large" color={GREEN} />
+      <Text style={s.loadTxt}>Loading tickets…</Text>
     </SafeAreaView>
   );
 
   return (
-    <SafeAreaView style={s.safe}>
+    <SafeAreaView style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
-      {/* ── Hero header ── */}
-      <View style={s.hero}>
-        <View style={s.heroGlow} />
-        <TouchableOpacity style={s.backBtn} onPress={() => router.back()}>
-          <Ionicons name="arrow-back" size={20} color="#fff" />
-        </TouchableOpacity>
-        <Text style={s.heroTag}>Admin · Support</Text>
-        <Text style={s.heroTitle}>Support Inbox</Text>
-        <Text style={s.heroSub}>Manage all user and owner tickets in one place.</Text>
-
-        {/* Summary chips */}
-        <View style={s.chipRow}>
-          <View style={s.chip}>
-            <Text style={s.chipNum}>{counts.open}</Text>
-            <Text style={s.chipLbl}>Open</Text>
-          </View>
-          <View style={s.chip}>
-            <Text style={s.chipNum}>{counts.inProgress}</Text>
-            <Text style={s.chipLbl}>In Progress</Text>
-          </View>
-          <View style={s.chip}>
-            <Text style={s.chipNum}>{counts.resolved}</Text>
-            <Text style={s.chipLbl}>Resolved</Text>
-          </View>
-          {counts.high > 0 && (
-            <View style={[s.chip, s.chipHigh]}>
-              <Ionicons name="flame" size={12} color="#DC2626" />
-              <Text style={[s.chipNum, { color: "#DC2626" }]}>{counts.high}</Text>
-              <Text style={[s.chipLbl, { color: "#DC2626" }]}>High</Text>
-            </View>
-          )}
-        </View>
-      </View>
-
-      {/* ── Search + filters ── */}
-      <View style={s.controls}>
-        {/* Search */}
-        <View style={s.searchBar}>
-          <Ionicons name="search-outline" size={16} color="#9CA3AF" />
-          <TextInput
-            style={s.searchInput}
-            placeholder="Search tickets, names, emails..."
-            placeholderTextColor="#9CA3AF"
-            value={search}
-            onChangeText={setSearch}
-            returnKeyType="search"
-          />
-          {search.length > 0 && (
-            <TouchableOpacity onPress={() => setSearch("")}>
-              <Ionicons name="close-circle" size={16} color="#9CA3AF" />
-            </TouchableOpacity>
-          )}
-        </View>
-
-        {/* Source filter */}
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.filterRow}>
-          {(["all", "user", "owner"] as const).map(src => (
-            <TouchableOpacity
-              key={src}
-              style={[s.filterChip, filterSource === src && s.filterChipOn]}
-              onPress={() => setFilterSource(src)}
-            >
-              <Text style={[s.filterTxt, filterSource === src && s.filterTxtOn]}>
-                {src === "all" ? "All Sources" : src === "user" ? "👤 Users" : "🏢 Owners"}
-              </Text>
-            </TouchableOpacity>
-          ))}
-          <View style={s.filterDivider} />
-          {(["all", "open", "in-progress", "resolved", "closed"] as const).map(st => (
-            <TouchableOpacity
-              key={st}
-              style={[s.filterChip, filterStatus === st && s.filterChipOn]}
-              onPress={() => setFilterStatus(st)}
-            >
-              <Text style={[s.filterTxt, filterStatus === st && s.filterTxtOn]}>
-                {st === "all" ? "All Status" : STATUS_META[st as TicketStatus]?.label ?? st}
-              </Text>
-            </TouchableOpacity>
-          ))}
-        </ScrollView>
-      </View>
-
-      {/* ── Ticket list ── */}
-      <ScrollView
+      <FlatList
+        data={filtered}
+        keyExtractor={(t) => t.id}
         contentContainerStyle={s.list}
         showsVerticalScrollIndicator={false}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchTickets(true)} tintColor={ACCENT} />}
-      >
-        {filtered.length === 0 ? (
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchTickets(true)} tintColor={GREEN} />}
+        renderItem={({ item }) => <TicketCard ticket={item} onPress={() => openTicket(item)} />}
+
+        ListHeaderComponent={
+          <View>
+            {/* ── Dark header ── */}
+            <View style={s.header}>
+              <View>
+                <Text style={s.headerTag}>Admin · Support</Text>
+                <Text style={s.headerTitle}>Support Inbox</Text>
+              </View>
+              {counts.high > 0 && (
+                <View style={s.urgentBadge}>
+                  <Ionicons name="flame" size={13} color="#DC2626" />
+                  <Text style={s.urgentTxt}>{counts.high} urgent</Text>
+                </View>
+              )}
+            </View>
+
+            {/* ── Stats strip ── */}
+            <View style={s.statsStrip}>
+              {[
+                { val: counts.total,      lbl: "Total",       color: WHITE     },
+                { val: counts.open,       lbl: "Open",        color: "#F87171" },
+                { val: counts.inProgress, lbl: "In Progress", color: "#FBBF24" },
+                { val: counts.resolved,   lbl: "Resolved",    color: "#4ADE80" },
+                { val: counts.closed,     lbl: "Closed",      color: "#94A3B8" },
+              ].map((st, i) => (
+                <React.Fragment key={i}>
+                  {i > 0 && <View style={s.stripDiv} />}
+                  <View style={s.stripItem}>
+                    <Text style={[s.stripVal, { color: st.color }]}>{st.val}</Text>
+                    <Text style={s.stripLbl}>{st.lbl}</Text>
+                  </View>
+                </React.Fragment>
+              ))}
+            </View>
+
+            {/* ── Search ── */}
+            <View style={s.searchDark}>
+              <View style={s.searchWrap}>
+                <Ionicons name="search-outline" size={16} color={GRAY3} />
+                <TextInput
+                  style={s.searchInput}
+                  placeholder="Search tickets, names, emails, categories…"
+                  placeholderTextColor={GRAY3}
+                  value={search}
+                  onChangeText={setSearch}
+                  returnKeyType="search"
+                  clearButtonMode="while-editing"
+                />
+                {search.length > 0 && (
+                  <TouchableOpacity onPress={() => setSearch("")}>
+                    <Ionicons name="close-circle" size={16} color={GRAY3} />
+                  </TouchableOpacity>
+                )}
+              </View>
+            </View>
+
+            {/* ── Filter tabs ── */}
+            <View style={s.filterWrap}>
+              {/* Source filter */}
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.filterRow}>
+                {(["all", "user", "owner"] as const).map(src => {
+                  const active = filterSource === src;
+                  return (
+                    <TouchableOpacity
+                      key={src}
+                      style={[s.filterChip, active && s.filterChipActive]}
+                      onPress={() => setFilterSource(src)}
+                    >
+                      {src !== "all" && <Ionicons name={SOURCE_CFG[src].icon as any} size={11} color={active ? WHITE : GRAY4} />}
+                      <Text style={[s.filterTxt, active && s.filterTxtActive]}>
+                        {src === "all" ? "All" : SOURCE_CFG[src].label}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+
+                <View style={s.filterDivider} />
+
+                {(["all", "open", "in-progress", "resolved", "closed"] as const).map(st => {
+                  const active = filterStatus === st;
+                  const meta   = st !== "all" ? STATUS_CFG[st as TicketStatus] : null;
+                  return (
+                    <TouchableOpacity
+                      key={st}
+                      style={[s.filterChip, active && { backgroundColor: meta?.color ?? DARK, borderColor: meta?.color ?? DARK }]}
+                      onPress={() => setFilterStatus(st)}
+                    >
+                      {meta && <Ionicons name={meta.icon as any} size={11} color={active ? WHITE : meta.color} />}
+                      <Text style={[s.filterTxt, active && s.filterTxtActive]}>
+                        {st === "all" ? "All Status" : meta!.label}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
+            </View>
+
+            {/* ── Result count ── */}
+            <View style={s.resultRow}>
+              <Text style={s.resultCount}>{filtered.length} ticket{filtered.length !== 1 ? "s" : ""}</Text>
+              {counts.high > 0 && filterStatus === "all" && (
+                <TouchableOpacity style={s.urgentFilter} onPress={() => setFilterStatus("open")}>
+                  <Ionicons name="flame" size={11} color="#DC2626" />
+                  <Text style={s.urgentFilterTxt}>Show urgent first ↑</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          </View>
+        }
+
+        ListEmptyComponent={
           <View style={s.empty}>
-            <Ionicons name="chatbubbles-outline" size={48} color="#D1D5DB" />
+            <Ionicons name="chatbubbles-outline" size={48} color={GRAY2} />
             <Text style={s.emptyTitle}>No tickets found</Text>
             <Text style={s.emptySub}>
-              {search ? "Try a different search term." : "All tickets matching your filters will appear here."}
+              {search ? `No results for "${search}"` : "All matching tickets will appear here."}
             </Text>
           </View>
-        ) : (
-          <>
-            <Text style={s.resultCount}>{filtered.length} ticket{filtered.length !== 1 ? "s" : ""}</Text>
-            {/* High priority first */}
-            {filtered
-              .sort((a, b) => {
-                if (a.priority === "high" && b.priority !== "high") return -1;
-                if (b.priority === "high" && a.priority !== "high") return 1;
-                return 0;
-              })
-              .map(t => (
-                <TicketCard key={t.id} ticket={t} onPress={() => openTicket(t)} />
-              ))
-            }
-          </>
-        )}
-        <View style={{ height: 120 }} />
-      </ScrollView>
+        }
+
+        ListFooterComponent={<View style={{ height: 120 }} />}
+      />
 
       <AdminNavBar />
 
-      {/* ── Detail modal ── */}
       <TicketDetailModal
         ticket={selected}
         visible={modalOpen}
@@ -599,224 +681,153 @@ export default function AdminSupport() {
 }
 
 // ─── Card styles ──────────────────────────────────────────────────────────────
-const cs = StyleSheet.create({
+const cc = StyleSheet.create({
   card: {
-    backgroundColor: "#FFFFFF",
-    borderRadius: 14,
-    padding: 14,
-    marginBottom: 10,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.06,
-    shadowRadius: 6,
-    elevation: 2,
-    overflow: "hidden",
+    flexDirection: "row", backgroundColor: WHITE,
+    borderRadius: 16, marginBottom: 10, marginHorizontal: 16,
+    borderWidth: 1, borderColor: GRAY2, overflow: "hidden",
+    shadowColor: "#000", shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.06, shadowRadius: 4, elevation: 2,
   },
-  priorityStripe: {
-    position: "absolute",
-    left: 0,
-    top: 0,
-    bottom: 0,
-    width: 4,
-    backgroundColor: "#DC2626",
-    borderTopLeftRadius: 14,
-    borderBottomLeftRadius: 14,
-  },
-  cardTop: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-    marginBottom: 8,
-    flexWrap: "wrap",
-  },
-  sourcePill: {
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 20,
-  },
-  sourceTxt: { fontSize: 10, fontWeight: "700" },
-  statusPill: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: 7,
-    paddingVertical: 3,
-    borderRadius: 20,
-  },
-  statusTxt: { fontSize: 10, fontWeight: "700" },
-  highPill: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 3,
-    backgroundColor: "#FEE2E2",
-    paddingHorizontal: 7,
-    paddingVertical: 3,
-    borderRadius: 20,
-  },
-  highTxt: { fontSize: 10, fontWeight: "700", color: "#DC2626" },
-  subject:   { fontSize: 15, fontWeight: "700", color: "#111827", marginBottom: 2 },
-  senderRow: { flexDirection: "row", marginBottom: 4 },
-  senderName:{ fontSize: 12, fontWeight: "600", color: "#374151" },
-  senderSub: { fontSize: 12, color: "#9CA3AF" },
-  preview:   { fontSize: 13, color: "#6B7280", lineHeight: 18, marginBottom: 10 },
-  cardFooter:{ flexDirection: "row", alignItems: "center", gap: 8 },
-  timeText:  { fontSize: 11, color: "#9CA3AF", flex: 1 },
-  replyCount:{ flexDirection: "row", alignItems: "center", gap: 3 },
-  replyCountTxt: { fontSize: 11, color: "#6B7280" },
+  cardHigh: { borderColor: "#FECACA" },
+  bar:      { width: 4, flexShrink: 0 },
+  inner:    { flex: 1, padding: 13 },
+  topRow:   { flexDirection: "row", alignItems: "center", gap: 6, marginBottom: 8, flexWrap: "wrap" },
+  srcPill:  { flexDirection: "row", alignItems: "center", gap: 3, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 20 },
+  srcTxt:   { fontSize: 9, fontWeight: "800", textTransform: "uppercase", letterSpacing: 0.3 },
+  stPill:   { flexDirection: "row", alignItems: "center", gap: 3, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 20 },
+  stTxt:    { fontSize: 9, fontWeight: "800" },
+  highPill: { flexDirection: "row", alignItems: "center", gap: 3, backgroundColor: "#FEE2E2", paddingHorizontal: 7, paddingVertical: 3, borderRadius: 20 },
+  highTxt:  { fontSize: 9, fontWeight: "800", color: "#DC2626" },
+  time:     { fontSize: 10, color: GRAY3, marginLeft: "auto" as any },
+  subject:  { fontSize: 14, fontWeight: "800", color: DARK, marginBottom: 4 },
+  senderRow:{ flexDirection: "row", alignItems: "center", gap: 5, marginBottom: 6 },
+  senderName:{ fontSize: 12, fontWeight: "600", color: GRAY5 },
+  senderSub: { fontSize: 12, color: GRAY3 },
+  preview:  { fontSize: 13, color: GRAY4, lineHeight: 18, marginBottom: 10 },
+  footer:   { flexDirection: "row", alignItems: "center", gap: 8 },
+  categoryChip: { backgroundColor: "#EDE9FE", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 20 },
+  categoryTxt:  { fontSize: 10, fontWeight: "700", color: "#7C3AED" },
+  replyBadge:   { flexDirection: "row", alignItems: "center", gap: 3 },
+  replyCount:   { fontSize: 10, color: GRAY4, fontWeight: "600" },
 });
 
 // ─── Detail modal styles ──────────────────────────────────────────────────────
-const ds = StyleSheet.create({
-  root: { flex: 1, backgroundColor: "#F9FAFB" },
-  header: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: "#F3F4F6",
-    backgroundColor: "#FFFFFF",
-    gap: 10,
-  },
-  backBtn:    { padding: 4 },
-  headerTitle:{ flex: 1, fontSize: 15, fontWeight: "700", color: "#111827" },
-  statusBadge:{ paddingHorizontal: 10, paddingVertical: 4, borderRadius: 20 },
-  statusBadgeTxt: { fontSize: 11, fontWeight: "700" },
-  scroll: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 24 },
+const dm = StyleSheet.create({
+  root:    { flex: 1, backgroundColor: BODY_BG },
+  header:  {  marginTop:30, flexDirection: "row", alignItems: "flex-start", paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: GRAY2, backgroundColor: WHITE, gap: 10 },
+  closeBtn:{ width: 32, height: 32, borderRadius: 9, backgroundColor: GRAY1, alignItems: "center", justifyContent: "center", marginTop: 2 },
+  headerTitle: { fontSize: 15, fontWeight: "800", color: DARK, marginBottom: 2 },
+  headerSub:   { fontSize: 10, color: GRAY3, fontWeight: "500" },
+  stBadge: { flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 9, paddingVertical: 5, borderRadius: 20, marginTop: 2 },
+  stBadgeTxt:  { fontSize: 10, fontWeight: "800" },
+  scroll:  { paddingHorizontal: 16, paddingTop: 16 },
 
-  senderCard: {
-    flexDirection: "row",
-    gap: 12,
-    backgroundColor: "#FFFFFF",
-    borderRadius: 14,
-    padding: 14,
-    marginBottom: 10,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05,
-    shadowRadius: 4,
-    elevation: 1,
-  },
-  avatarCircle: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  senderTopRow:{ flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap", marginBottom: 4 },
-  senderName:  { fontSize: 15, fontWeight: "700", color: "#111827" },
-  srcPill:     { paddingHorizontal: 8, paddingVertical: 2, borderRadius: 20 },
-  srcPillTxt:  { fontSize: 10, fontWeight: "700" },
-  highPill:    { flexDirection: "row", alignItems: "center", gap: 3, backgroundColor: "#FEE2E2", paddingHorizontal: 7, paddingVertical: 2, borderRadius: 20 },
-  highPillTxt: { fontSize: 10, fontWeight: "700", color: "#DC2626" },
-  senderMeta:  { fontSize: 12, color: "#6B7280", marginBottom: 1 },
-  senderTime:  { fontSize: 11, color: "#9CA3AF", marginTop: 4 },
+  card:    { flexDirection: "row", gap: 12, backgroundColor: WHITE, borderRadius: 14, padding: 14, marginBottom: 12, borderWidth: 1, borderColor: GRAY2 },
+  avatarCircle: { width: 44, height: 44, borderRadius: 22, justifyContent: "center", alignItems: "center", flexShrink: 0 },
+  senderTopRow: { flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap", marginBottom: 4 },
+  senderName:   { fontSize: 15, fontWeight: "800", color: DARK },
+  srcPill:      { paddingHorizontal: 8, paddingVertical: 2, borderRadius: 20 },
+  srcPillTxt:   { fontSize: 9, fontWeight: "800" },
+  highPill:     { flexDirection: "row", alignItems: "center", gap: 3, backgroundColor: "#FEE2E2", paddingHorizontal: 7, paddingVertical: 2, borderRadius: 20 },
+  highTxt:      { fontSize: 9, fontWeight: "800", color: "#DC2626" },
+  senderMeta:   { fontSize: 12, color: GRAY4, marginBottom: 2 },
 
-  contactRow:  { flexDirection: "row", gap: 8, marginBottom: 12 },
-  contactBtn:  { flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: "#FFFFFF", paddingHorizontal: 14, paddingVertical: 8, borderRadius: 20, borderWidth: 1, borderColor: "#E5E7EB" },
-  contactBtnTxt:{ fontSize: 13, fontWeight: "600" },
+  contactRow: { flexDirection: "row", gap: 8, marginBottom: 14 },
+  contactBtn: { flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, backgroundColor: WHITE, paddingVertical: 10, borderRadius: 22, borderWidth: 1, borderColor: GRAY2 },
+  contactLbl: { fontSize: 12, fontWeight: "700" },
 
-  metaRow:     { flexDirection: "row", gap: 8, marginBottom: 12 },
-  metaChip:    { backgroundColor: "#EDE9FE", paddingHorizontal: 12, paddingVertical: 5, borderRadius: 20 },
-  metaChipTxt: { fontSize: 12, fontWeight: "600", color: "#7C3AED" },
+  metaRow:  { flexDirection: "row", gap: 8, marginBottom: 14, flexWrap: "wrap" },
+  catChip:  { flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: "#EDE9FE", paddingHorizontal: 10, paddingVertical: 5, borderRadius: 20 },
+  catTxt:   { fontSize: 11, fontWeight: "700", color: "#7C3AED" },
 
-  messageBox:  { backgroundColor: "#FFFFFF", borderRadius: 14, padding: 14, marginBottom: 16, shadowColor: "#000", shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 4, elevation: 1 },
-  messageLabel:{ fontSize: 11, fontWeight: "700", color: "#9CA3AF", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 },
-  messageText: { fontSize: 14, color: "#374151", lineHeight: 21 },
+  msgBox:    { backgroundColor: WHITE, borderRadius: 14, padding: 14, marginBottom: 14, borderWidth: 1, borderColor: GRAY2 },
+  sectionLbl:{ fontSize: 11, fontWeight: "800", color: GRAY3, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 10 },
+  msgText:   { fontSize: 14, color: GRAY5, lineHeight: 22 },
 
-  threadSection:{ marginBottom: 16 },
-  threadTitle:  { fontSize: 13, fontWeight: "700", color: "#374151", marginBottom: 10 },
-  bubble:       { borderRadius: 12, padding: 12, marginBottom: 8, maxWidth: "90%" },
-  bubbleAdmin:  { backgroundColor: "#E0F2F1", alignSelf: "flex-end" },
-  bubbleUser:   { backgroundColor: "#FFFFFF", alignSelf: "flex-start", borderWidth: 1, borderColor: "#F3F4F6" },
-  bubbleHeader: { flexDirection: "row", justifyContent: "space-between", marginBottom: 4 },
-  bubbleBy:     { fontSize: 11, fontWeight: "700", color: "#374151" },
-  bubbleTime:   { fontSize: 11, color: "#9CA3AF" },
-  bubbleText:   { fontSize: 13, color: "#374151", lineHeight: 19 },
+  threadWrap: { marginBottom: 14 },
+  bubble:     { borderRadius: 14, padding: 12, marginBottom: 8, maxWidth: "92%" },
+  bubbleAdmin:{ backgroundColor: GREEN_LT, alignSelf: "flex-end", borderWidth: 1, borderColor: GREEN + "33" },
+  bubbleUser: { backgroundColor: WHITE,    alignSelf: "flex-start", borderWidth: 1, borderColor: GRAY2 },
+  bubbleHeader:   { flexDirection: "row", alignItems: "center", gap: 6, marginBottom: 6 },
+  bubbleAvatar:   { width: 22, height: 22, borderRadius: 11, alignItems: "center", justifyContent: "center" },
+  bubbleAvatarTxt:{ fontSize: 11, fontWeight: "800" },
+  bubbleBy:   { fontSize: 11, fontWeight: "700", color: GRAY5 },
+  bubbleTime: { fontSize: 10, color: GRAY3, marginLeft: "auto" as any },
+  bubbleText: { fontSize: 13, color: GRAY5, lineHeight: 20 },
 
-  statusSection:{ marginBottom: 16 },
-  sectionLabel: { fontSize: 12, fontWeight: "700", color: "#374151", marginBottom: 10 },
-  statusRow:    { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  statusBtn:    { flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 12, paddingVertical: 7, borderRadius: 20, borderWidth: 1, borderColor: "#E5E7EB", backgroundColor: "#FFFFFF" },
-  statusBtnTxt: { fontSize: 12, fontWeight: "600", color: "#6B7280" },
+  section:   { backgroundColor: WHITE, borderRadius: 14, padding: 14, marginBottom: 14, borderWidth: 1, borderColor: GRAY2 },
+  statusRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  stBtn:     { flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 20, borderWidth: 1, borderColor: GRAY2, backgroundColor: WHITE },
+  stBtnTxt:  { fontSize: 11, fontWeight: "600", color: GRAY4 },
 
-  replyBar:   { flexDirection: "row", alignItems: "flex-end", gap: 8, padding: 12, backgroundColor: "#FFFFFF", borderTopWidth: 1, borderTopColor: "#F3F4F6" },
-  replyInput: { flex: 1, backgroundColor: "#F9FAFB", borderRadius: 20, paddingHorizontal: 14, paddingVertical: 10, fontSize: 14, color: "#111827", maxHeight: 100, borderWidth: 1, borderColor: "#E5E7EB" },
-  sendBtn:    { width: 40, height: 40, borderRadius: 20, backgroundColor: ACCENT, justifyContent: "center", alignItems: "center" },
-  sendBtnDim: { opacity: 0.4 },
+  noteInput: { backgroundColor: GRAY1, borderRadius: 10, borderWidth: 1, borderColor: GRAY2, paddingHorizontal: 14, paddingVertical: 12, fontSize: 14, color: DARK, minHeight: 80, textAlignVertical: "top", marginBottom: 10 },
+  saveNoteBtn: { backgroundColor: DARK, paddingVertical: 11, borderRadius: 11, alignItems: "center" },
+  saveNoteTxt: { color: WHITE, fontWeight: "800", fontSize: 13 },
+
+  infoBlock:    { borderRadius: 10, overflow: "hidden", borderWidth: 1, borderColor: GRAY2 },
+  infoRow:      { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 10, paddingHorizontal: 14, backgroundColor: WHITE },
+  infoRowBorder:{ borderTopWidth: 1, borderTopColor: GRAY1 },
+  infoLabel:    { fontSize: 12, color: GRAY3, fontWeight: "600" },
+  infoValue:    { fontSize: 13, color: DARK, fontWeight: "700" },
+
+  replyWrap:    { backgroundColor: WHITE, borderTopWidth: 1, borderTopColor: GRAY2, paddingBottom: Platform.OS === "ios" ? 4 : 0 },
+  quickToggle:  { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 14, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: GRAY1 },
+  quickToggleTxt:{ fontSize: 12, fontWeight: "700", color: GREEN, flex: 1 },
+  quickRow:     { paddingHorizontal: 12, paddingVertical: 8, gap: 8 },
+  quickChip:    { backgroundColor: GREEN_LT, borderWidth: 1, borderColor: GREEN + "33", borderRadius: 10, padding: 10, maxWidth: 200 },
+  quickChipTxt: { fontSize: 12, color: DARK, fontWeight: "500", lineHeight: 17 },
+  replyBar:     { flexDirection: "row", alignItems: "flex-end", gap: 8, padding: 12 },
+  replyInput:   { flex: 1, backgroundColor: GRAY1, borderRadius: 20, paddingHorizontal: 14, paddingVertical: 10, fontSize: 14, color: DARK, maxHeight: 100, borderWidth: 1, borderColor: GRAY2 },
+  sendBtn:      { width: 42, height: 42, borderRadius: 21, backgroundColor: GREEN, justifyContent: "center", alignItems: "center" },
+
+  closedBar: {  flexDirection: "row", alignItems: "center", gap: 8, padding: 16, backgroundColor: GRAY1, borderTopWidth: 1, borderTopColor: GRAY2, justifyContent: "center" },
+  closedBarTxt:{ fontSize: 13, color: GRAY3, fontWeight: "500",  },
 });
 
 // ─── Screen styles ────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
-  safe:    { flex: 1, backgroundColor: BG },
+  root:    { flex: 1, backgroundColor: BODY_BG },
   loadWrap:{ flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: DARK },
-  loadText:{ marginTop: 12, color: "#9CA3AF", fontSize: 14 },
+  loadTxt: { marginTop: 12, color: GRAY3, fontSize: 14, fontWeight: "600" },
+  list:    { paddingTop: 0 },
 
-  hero: {
+  header: {
     backgroundColor: DARK,
     paddingHorizontal: 20,
-    paddingTop: Platform.OS === "android" ? 48 : 16,
-    paddingBottom: 20,
-    position: "relative",
-    overflow: "hidden",
+    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 14,
+    paddingBottom: 16,
+    flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between",
   },
-  heroGlow: {
-    position: "absolute",
-    top: -40,
-    right: -40,
-    width: 160,
-    height: 160,
-    borderRadius: 80,
-    backgroundColor: ACCENT,
-    opacity: 0.12,
-  },
-  backBtn:  { marginBottom: 12 },
-  heroTag:  { fontSize: 11, fontWeight: "700", color: ACCENT, letterSpacing: 1.2, textTransform: "uppercase", marginBottom: 4 },
-  heroTitle:{ fontSize: 26, fontWeight: "800", color: "#FFFFFF", marginBottom: 4 },
-  heroSub:  { fontSize: 13, color: "#94A3B8", marginBottom: 14 },
+  headerTag:   { color: GREEN, fontSize: 11, fontWeight: "800", letterSpacing: 1.5, textTransform: "uppercase" },
+  headerTitle: { color: WHITE, fontSize: 26, fontWeight: "900", marginTop: 2, letterSpacing: -0.5 },
+  urgentBadge: { flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: "#FEE2E2", borderWidth: 1, borderColor: "#FECACA", paddingHorizontal: 10, paddingVertical: 6, borderRadius: 20, marginTop: 6 },
+  urgentTxt:   { fontSize: 12, fontWeight: "700", color: "#DC2626" },
 
-  chipRow: { flexDirection: "row", gap: 8, flexWrap: "wrap" },
-  chip: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 5,
-    backgroundColor: "rgba(255,255,255,0.1)",
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 20,
-  },
-  chipHigh: { backgroundColor: "#FEE2E2" },
-  chipNum:  { fontSize: 14, fontWeight: "800", color: "#FFFFFF" },
-  chipLbl:  { fontSize: 11, color: "#94A3B8" },
+  statsStrip: { flexDirection: "row", alignItems: "center", backgroundColor: DARK, paddingHorizontal: 16, paddingBottom: 12 },
+  stripItem:  { flex: 1, alignItems: "center" },
+  stripVal:   { fontSize: 14, fontWeight: "900" },
+  stripLbl:   { fontSize: 9, color: "#64748B", marginTop: 2, textAlign: "center" },
+  stripDiv:   { width: 1, height: 28, backgroundColor: "rgba(255,255,255,0.08)" },
 
-  controls: { backgroundColor: "#FFFFFF", paddingBottom: 8, borderBottomWidth: 1, borderBottomColor: "#F3F4F6" },
+  searchDark: { backgroundColor: DARK, paddingHorizontal: 16, paddingBottom: 20, paddingTop: 14 },
+  searchWrap: { flexDirection: "row", alignItems: "center", gap: 8, backgroundColor: WHITE, paddingHorizontal: 14, borderRadius: 13, borderWidth: 1, borderColor: GRAY2, height: 46, shadowColor: "#000", shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.08, shadowRadius: 4, elevation: 2 },
+  searchInput:{ flex: 1, fontSize: 14, color: DARK, fontWeight: "500" },
 
-  searchBar: {
-    flexDirection: "row",
-    alignItems: "center",
-    backgroundColor: "#F9FAFB",
-    margin: 12,
-    marginBottom: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 12,
-    gap: 8,
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-  },
-  searchInput:{ flex: 1, fontSize: 14, color: "#111827" },
+  filterWrap: { backgroundColor: WHITE, borderBottomWidth: 1, borderBottomColor: GRAY2 },
+  filterRow:  { paddingHorizontal: 16, paddingVertical: 10, gap: 7 },
+  filterChip: { flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 12, paddingVertical: 7, borderRadius: 20, backgroundColor: GRAY1, borderWidth: 1, borderColor: GRAY2 },
+  filterChipActive: { backgroundColor: DARK, borderColor: DARK },
+  filterTxt:  { fontSize: 12, fontWeight: "700", color: GRAY4 },
+  filterTxtActive:  { color: WHITE },
+  filterDivider:    { width: 1, backgroundColor: GRAY2, marginHorizontal: 2 },
 
-  filterRow:   { paddingHorizontal: 12, paddingBottom: 4, gap: 6, flexDirection: "row" },
-  filterChip:  { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, backgroundColor: "#F3F4F6" },
-  filterChipOn:{ backgroundColor: ACCENT },
-  filterTxt:   { fontSize: 12, fontWeight: "600", color: "#6B7280" },
-  filterTxtOn: { color: "#FFFFFF" },
-  filterDivider:{ width: 1, backgroundColor: "#E5E7EB", marginHorizontal: 4 },
+  resultRow:  { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 20, paddingTop: 12, paddingBottom: 8 },
+  resultCount:{ fontSize: 11, color: GRAY3, fontWeight: "700", textTransform: "uppercase", letterSpacing: 0.5 },
+  urgentFilter:    { flexDirection: "row", alignItems: "center", gap: 4 },
+  urgentFilterTxt: { fontSize: 11, color: "#DC2626", fontWeight: "700" },
 
-  list:       { paddingHorizontal: 16, paddingTop: 12 },
-  resultCount:{ fontSize: 12, color: "#9CA3AF", marginBottom: 8 },
-
-  empty:      { alignItems: "center", paddingVertical: 60 },
-  emptyTitle: { fontSize: 16, fontWeight: "700", color: "#374151", marginTop: 12 },
-  emptySub:   { fontSize: 13, color: "#9CA3AF", marginTop: 4, textAlign: "center" },
+  empty:      { alignItems: "center", paddingVertical: 80, marginHorizontal: 16 },
+  emptyTitle: { fontSize: 17, fontWeight: "800", color: DARK, marginTop: 14 },
+  emptySub:   { fontSize: 13, color: GRAY3, marginTop: 6, textAlign: "center" },
 });
