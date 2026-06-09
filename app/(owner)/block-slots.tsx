@@ -1100,7 +1100,10 @@ async function cancelOfflineBooking() {
         <View style={styles.backdrop}>
           <View style={[styles.sheet, { maxHeight: "90%" }]}>
             <View style={styles.sheetHandle} />
-            <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+            <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled" contentContainerStyle={{
+    ...styles.scrollContent,
+    paddingBottom: 140,  // ✅ Space for the bottom bar
+  }}>
               <Text style={styles.sheetTitle}>Offline Booking</Text>
 
               <View style={styles.slotBox}>
@@ -1321,16 +1324,26 @@ const styles = StyleSheet.create({
   freeBtn: { backgroundColor: "#FEE2E2", paddingHorizontal: 14, paddingVertical: 8, borderRadius: 12 },
   freeBtnText: { color: "#DC2626", fontSize: 12, fontWeight: "800" },
 
-  bottomBar: {
-    position: "absolute", bottom: 30, left: 0, right: 0,
-    flexDirection: "row", alignItems: "center",
-    backgroundColor: "#FFFFFF", paddingHorizontal: 30,
-    paddingTop: 14,
-    paddingBottom: Platform.OS === "android" ? 20 : 12,
-    borderTopWidth: 1, borderTopColor: "#F0F0F0",
-    shadowColor: "#000", shadowOffset: { width: 0, height: -4 },
-    shadowOpacity: 0.06, shadowRadius: 10, elevation: 8,
-  },
+bottomBar: {
+  position: "absolute",
+  bottom: 0,  // ✅ Fills to very bottom
+  left: 0,
+  right: 0,
+  flexDirection: "row",
+  alignItems: "center",
+  justifyContent: "space-between",  // ✅ Space between content & button
+  backgroundColor: "#FFFFFF",
+  paddingHorizontal: 20,
+  paddingTop: 16,
+  paddingBottom: Platform.OS === "android" ? 50 : 24,  // ✅ Account for home indicator
+  borderTopWidth: 1,
+  borderTopColor: "#E5E7EB",
+  shadowColor: "#000",
+  shadowOffset: { width: 0, height: -4 },
+  shadowOpacity: 0.08,
+  shadowRadius: 12,
+  elevation: 12,
+},
   bottomLabel: { color: "#9CA3AF", fontSize: 10, fontWeight: "800", textTransform: "uppercase" },
   bottomTime: { color: "#111827", fontSize: 17, fontWeight: "900", marginTop: 2 },
   bottomDur: { color: "#6B7280", fontSize: 11, fontWeight: "600", marginTop: 2 },

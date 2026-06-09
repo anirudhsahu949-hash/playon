@@ -93,8 +93,10 @@ interface SlotChip {
 const FALLBACK_IMAGE =
   "https://media.istockphoto.com/id/1405637348/photo/red-cricket-ball.jpg?s=612x612&w=0&k=20&c=DBkyp2Pp7AZOtqJrn9daux-NHl7ZwdDC5VnH8mCSZrE=";
 
-const MAX_BOOKING_HOURS = 2;
+const MAX_BOOKING_HOURS = 3;        // ✅ Was 2, now 3
 const MIN_BOOKING_HOURS = 1;
+const ADVANCE_THRESHOLD_HOURS = 2;  // ✅ NEW: above this, advance jumps 50%
+const ADVANCE_MULTIPLIER = 1.5;     // ✅ NEW: 50% extra for 3-hour bookings
 
 // ── Turf status config ────────────────────────────────────────────────────────
 const STATUS_CONFIG: Record<string, {
@@ -676,10 +678,24 @@ function getFacilityIcon(facility: string): keyof typeof MaterialCommunityIcons.
     return getRangePrice(selectedStartValue, selectedEndValue);
   }, [selectedStartValue, selectedEndValue, specialPrices, turf]);
 
-  const advanceAmount = useMemo(() => {
-    if (bookingType === "full") return totalPrice;
-    return Number(turf?.bookingPrice || 0);
-  }, [bookingType, totalPrice, turf]);
+// ✅ NEW: Always shows the advance price (ignores bookingType selection)
+// Used in the payment selector card so user sees correct ₹750 even before tapping
+const computedAdvanceAmount = useMemo(() => {
+  const baseBookingPrice = Number(turf?.bookingPrice || 0);
+  const selectedHours = durationMinutes / 60;
+
+  if (selectedHours > ADVANCE_THRESHOLD_HOURS) {
+    return Math.round(baseBookingPrice * ADVANCE_MULTIPLIER);
+  }
+
+  return baseBookingPrice;
+}, [turf, durationMinutes]);
+
+// Used for actual payment — depends on what the user selected
+const advanceAmount = useMemo(() => {
+  if (bookingType === "full") return totalPrice;
+  return computedAdvanceAmount;
+}, [bookingType, totalPrice, computedAdvanceAmount]);
 
   
 
@@ -850,10 +866,13 @@ function getFacilityIcon(facility: string): keyof typeof MaterialCommunityIcons.
       Alert.alert("Continuous Slots Only", "You can only select the slot immediately before or after your current selection.");
       return;
     }
-    if (selectedQuickSlots.length >= 2) {
-      Alert.alert("Maximum Limit", "You can book maximum 2 quick slots at a time.");
-      return;
-    }
+  if (selectedQuickSlots.length >= MAX_BOOKING_HOURS) {
+  Alert.alert(
+    "Maximum Limit", 
+    `You can book maximum ${MAX_BOOKING_HOURS} slots at a time.`
+  );
+  return;
+}
     setSelectedQuickSlots([...selectedQuickSlots, slot].sort((a, b) => a.startValue - b.startValue));
   }
 
@@ -1003,7 +1022,7 @@ function getFacilityIcon(facility: string): keyof typeof MaterialCommunityIcons.
       }
 
       const options = {
-        description: "Turf Booking",
+        description: `Booking - ${turf!.name}`,
         image:       turfImages[0] || FALLBACK_IMAGE,
         currency:    order.currency,
         key:         order.key,
@@ -1473,7 +1492,12 @@ function requestCloseBilling() {
                       ))}
                     </ScrollView>
                   )}
-                  <Text style={styles.maxDurationNote}>Minimum 1 hour • Maximum {MAX_BOOKING_HOURS} hours</Text>
+                  <View>
+  <Text style={styles.maxDurationNote}>
+    Minimum 1 hour • Maximum {MAX_BOOKING_HOURS} hours
+  </Text>
+  
+</View>
                 </View>
               </Animated.View>
 
@@ -1531,10 +1555,13 @@ function requestCloseBilling() {
   <View style={[styles.bottomWrapper, { paddingBottom: insets.bottom }]}>
     <View style={styles.bottomBar}>
       <View style={{ flex: 1 }}>
-        <Text style={styles.bottomLabel}>Advance booking amount</Text>
-        <Text style={styles.bottomAmount}>₹{advanceAmount}</Text>
-        <Text style={styles.bottomRemaining}>{selectedTimeLabel} · {durationLabel}</Text>
-      </View>
+  <Text style={styles.bottomLabel}>Advance booking amount</Text>
+  <Text style={styles.bottomAmount}>₹{advanceAmount}</Text>
+  <Text style={styles.bottomRemaining}>
+    {selectedTimeLabel} · {durationLabel}
+    {durationMinutes / 60 > ADVANCE_THRESHOLD_HOURS && " · Extended booking"}
+  </Text>
+</View>
       <TouchableOpacity
         style={styles.bookBtn}
         onPress={() => { if (!validateSelection(true)) return; setShowBilling(true); }}
@@ -1592,7 +1619,9 @@ function requestCloseBilling() {
           </View>
         )}
         <Text style={[styles.paymentOptionLabel, active && styles.paymentOptionLabelActive]}>{type === "advance" ? "Advance" : "Full Payment"}</Text>
-        <Text style={[styles.paymentOptionAmount, active && styles.paymentOptionAmountActive]}>₹{type === "advance" ? (turf.bookingPrice || 0) : totalPrice}</Text>
+        <Text style={[styles.paymentOptionAmount, active && styles.paymentOptionAmountActive]}>
+  ₹{type === "advance" ? computedAdvanceAmount : totalPrice}
+</Text>
         <Text style={[styles.paymentOptionNote, active && styles.paymentOptionNoteActive]}>{type === "advance" ? "Pay rest at turf" : "Paid online"}</Text>
       </TouchableOpacity>
     );

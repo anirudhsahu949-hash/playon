@@ -95,12 +95,7 @@ export default function GymCard({ item, userCoords, onPress }: {
           <Text style={gc.gymBadgeTxt}>GYM</Text>
         </View>
 
-        {dist != null && (
-          <View style={gc.distBadge}>
-            <Ionicons name="navigate" size={10} color="#fff" />
-            <Text style={gc.distTxt}>{fmtDist(dist)}</Text>
-          </View>
-        )}
+       
 
         {/* name + rating sit over the image for a bolder feel */}
         <View style={gc.imgFooter}>
@@ -213,7 +208,7 @@ const gc = StyleSheet.create({
   footerRow: { flexDirection: "row", alignItems: "flex-end", justifyContent: "space-between", marginTop: 14 },
   fromLabel: { fontSize: 11, color: MUTED, fontWeight: "600" },
   priceRow:  { flexDirection: "row", alignItems: "flex-end", gap: 2, marginTop: 2 },
-  price:     { fontSize: 22, fontWeight: "900", color: BRAND, letterSpacing: -0.5 },
+  price:     { fontSize: 18, fontWeight: "900", color: BRAND, letterSpacing: -0.5 },
   priceUnit: { fontSize: 12, fontWeight: "700", color: MUTED, marginBottom: 3 },
 
   viewBtn: {

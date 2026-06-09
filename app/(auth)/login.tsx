@@ -6,7 +6,7 @@ import {
   StyleSheet,
   Alert,
   ActivityIndicator,
-  Platform,
+  
 } from "react-native";
 import { useState } from "react";
 import { auth, db } from "../../firebaseConfig";
@@ -19,7 +19,7 @@ import { doc, getDoc } from "firebase/firestore";
 import { useRouter } from "expo-router";
 import { useAppTheme } from "../../theme/themeprovider";
 import { Ionicons } from "@expo/vector-icons";
-import {  collection, getDocs, query, where } from "firebase/firestore";
+
 
 export default function Login() {
   const router = useRouter();
@@ -75,17 +75,7 @@ const role = data.role;
 if (role === "admin") {
   router.replace("/admin");
 } else if (role === "owner") {
-  // Venue-aware: a gym-only owner goes straight to the gym dashboard
-  const uid = userCred.user.uid;
-  const [gymSnap, turfSnap] = await Promise.all([
-    getDocs(query(collection(db, "gyms"),  where("ownerId", "==", uid))),
-    getDocs(query(collection(db, "turfs"), where("ownerId", "==", uid))),
-  ]);
-  if (!gymSnap.empty && turfSnap.empty) {
-    router.replace("/(owner)/owner-gym");   // gym only → gym dashboard
-  } else {
-    router.replace("/(owner)");     // turf only, or both → turf home
-  }
+  router.replace("/(owner)");
 } else if (role === "operator" || role === "turf-operator") {
   router.replace("/(turf-operator)");
 } else {

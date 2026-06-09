@@ -276,6 +276,26 @@ export default function AdminLayout() {
     ),
   }}
 />
+
+<Drawer.Screen
+  name="booking-rules"
+  options={{
+    title: "booking-rule",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="build-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
+<Drawer.Screen
+  name="Add-gym"
+  options={{
+    title: "add-gyms",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="barbell-outline" size={size} color={color} />
+    ),
+  }}
+/>
     </Drawer>
   );
 }

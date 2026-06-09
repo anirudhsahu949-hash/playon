@@ -47,7 +47,7 @@ let _turfsCache:      CacheEntry<any[]>             = null;
 let _bannersCache:    CacheEntry<any[]>             = null;
 let _sectionsCache:   CacheEntry<FeaturedSection[]> = null;
 let _highlightsCache: CacheEntry<HighlightCard[]>   = null;
-let _gymsCache: CacheEntry<any[]> = null;
+
 
 function isFresh(entry: CacheEntry<any>): boolean {
   if (!entry) return false;
@@ -56,14 +56,15 @@ function isFresh(entry: CacheEntry<any>): boolean {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
-// ─────────────────────────────────────────────────────────────────────────────
 type FeaturedSection = {
   id: string;
   title: string;
   subtitle?: string;
   icon: string;
+  venueType?: "turf" | "gym";      // ✅ NEW — which venue type to show (default "turf")
   type: "manual" | "sport" | "location" | "nearby" | "all" | "highlights";
   turfIds: string[];
+  gymIds?: string[];                 // ✅ NEW — for manual gym sections
   filter?: { sport?: string; location?: string };
   maxItems?: number;
   active: boolean;
@@ -339,42 +340,66 @@ sportTxt:       { fontSize: 11, fontWeight: "700", color: "#fff" },
 // ─────────────────────────────────────────────────────────────────────────────
 // FeaturedSectionRow — unchanged, renders one admin-controlled section
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// FeaturedSectionRow — handles both turf AND gym sections
+// ─────────────────────────────────────────────────────────────────────────────
 function FeaturedSectionRow({
-  section, allTurfs, sortedTurfs, allHighlights, userCoords, onTurf, onExplore, onHighlight,
+  section, 
+  allTurfs, sortedTurfs,
+  allGyms, sortedGyms,
+  allHighlights, 
+  userCoords, 
+  onTurf, 
+  onGym,
+  onExplore, 
+  onHighlight,
 }: {
   section: FeaturedSection;
   allTurfs: any[];
   sortedTurfs: any[];
+  allGyms: any[];
+  sortedGyms: any[];
   allHighlights: HighlightCard[];
   userCoords: { lat: number; lng: number } | null;
   onTurf: (id: string) => void;
+  onGym: (id: string) => void;
   onExplore: () => void;
   onHighlight: (card: HighlightCard) => void;
 }) {
-  const turfsToShow = useMemo(() => {
+  // ✅ Determine if this section shows gyms
+  const isGymSection = section.venueType === "gym";
+
+  // ✅ Pick the right data sources based on venueType
+  const allVenues    = isGymSection ? allGyms    : allTurfs;
+  const sortedVenues = isGymSection ? sortedGyms : sortedTurfs;
+  const manualIds    = isGymSection ? (section.gymIds || []) : section.turfIds;
+  const onTap        = isGymSection ? onGym : onTurf;
+
+  const venuesToShow = useMemo(() => {
     const max = section.maxItems ?? 6;
-    if (section.type === "nearby")    return sortedTurfs.slice(0, max);
-    if (section.type === "all")       return sortedTurfs.slice(0, max);
+    if (section.type === "nearby")     return sortedVenues.slice(0, max);
+    if (section.type === "all")        return sortedVenues.slice(0, max);
     if (section.type === "highlights") return [];
     if (section.type === "manual") {
-      return section.turfIds
-        .map(id => allTurfs.find(t => t.id === id))
+      return manualIds
+        .map(id => allVenues.find(v => v.id === id))
         .filter(Boolean);
     }
     if (section.type === "sport") {
       const sp = section.filter?.sport?.toLowerCase();
-      return allTurfs.filter(t => {
+      return allVenues.filter(t => {
         const sports = Array.isArray(t.sport) ? t.sport : [t.sport];
         return sports.some((s: string) => s?.toLowerCase() === sp);
       });
     }
     if (section.type === "location") {
       const loc = section.filter?.location?.toLowerCase() || "";
-      return allTurfs.filter(t => (t.location || "").toLowerCase().includes(loc));
+      return allVenues.filter(t => (t.location || "").toLowerCase().includes(loc));
     }
     return [];
-  }, [section, allTurfs, sortedTurfs]);
+  }, [section, allVenues, sortedVenues, manualIds]);
 
+  // ── Highlights section (unchanged) ────────────────────────────────────
   if (section.type === "highlights") {
     if (allHighlights.length === 0) return null;
     return (
@@ -412,7 +437,7 @@ function FeaturedSectionRow({
     );
   }
 
-  if (turfsToShow.length === 0) return null;
+  if (venuesToShow.length === 0) return null;
 
   return (
     <View style={s.section}>
@@ -430,25 +455,44 @@ function FeaturedSectionRow({
         </TouchableOpacity>
       </View>
 
-      {section.style === "horizontal" ? (
+      {/* ✅ Render the right card based on venueType */}
+      {isGymSection ? (
+        // ── Gym sections always use horizontal scroll with GymCard ──
         <ScrollView
           horizontal
           showsHorizontalScrollIndicator={false}
           contentContainerStyle={{ gap: 12, paddingRight: 4 }}
         >
-          {turfsToShow.map((item: any, i: number) => (
+          {venuesToShow.map((item: any) => (
+            <GymCard
+              key={item.id}
+              item={item}
+              userCoords={userCoords}
+              onPress={() => onTap(item.id)}
+            />
+          ))}
+        </ScrollView>
+      ) : section.style === "horizontal" ? (
+        // ── Turf horizontal: PopCard ──
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={{ gap: 12, paddingRight: 4 }}
+        >
+          {venuesToShow.map((item: any) => (
             <PopCard
               key={item.id}
               item={item}
               userCoords={userCoords}
-              onPress={() => onTurf(item.id)}
+              onPress={() => onTap(item.id)}
             />
           ))}
         </ScrollView>
       ) : (
+        // ── Turf grid: FullCard ──
         <View>
-          {turfsToShow.map((item: any) => (
-            <FullCard key={item.id} item={item} userCoords={userCoords} onPress={() => onTurf(item.id)} />
+          {venuesToShow.map((item: any) => (
+            <FullCard key={item.id} item={item} userCoords={userCoords} onPress={() => onTap(item.id)} />
           ))}
         </View>
       )}
@@ -475,9 +519,7 @@ export default function Home() {
   const [userCoords,  setUserCoords]  = useState<{ lat: number; lng: number } | null>(null);
   const router = useRouter();
 
-  // gym 
-  const [gyms, setGyms] = useState<any[]>([]);
-  // end
+  
 
   useEffect(() => {
     loadHome();
@@ -499,13 +541,11 @@ export default function Home() {
     try {
       setLoading(true);
       await Promise.all([
-        fetchTurfs(forceRefresh),
-        fetchBanners(forceRefresh),
-        fetchSections(forceRefresh),
-        fetchHighlights(forceRefresh),
-        // gym
-         fetchGyms(forceRefresh), 
-      ]);
+  fetchTurfs(forceRefresh),
+  fetchBanners(forceRefresh),
+  fetchSections(forceRefresh),
+  fetchHighlights(forceRefresh),
+]);
     } catch (e) { console.error(e); }
     finally { setLoading(false); }
   };
@@ -531,18 +571,7 @@ const data = snap.docs
   };
 
   // gym code
-  const fetchGyms = async (forceRefresh = false) => {
-  if (!forceRefresh && isFresh(_gymsCache)) {
-    setGyms(_gymsCache!.data);
-    return;
-  }
-  const snap = await getDocs(collection(db, "gyms"));
-  const data = snap.docs
-    .map(d => ({ id: d.id, ...d.data() }))
-    .filter((g: any) => g.active !== false);
-  _gymsCache = { data, fetchedAt: Date.now() };
-  setGyms(data);
-};
+ 
 
   // ─── fetchBanners ─────────────────────────────────────────────────────────
   // Banners change only when admin updates them — safe to cache for 10 min
@@ -635,9 +664,24 @@ const data = snap.docs
 
   const activeBanners = useMemo(() => banners.filter(b => b.active !== false), [banners]);
 
+// ─── Split turfs from gyms based on venueType ──────────────────────────
+  // ALL venues live in `turfs` collection now; we filter by venueType here.
+  // - actualTurfs = anything that's NOT a gym (turf, court, pool, club, other, or no type)
+  // - actualGyms  = only docs with venueType === "gym"
+  const actualTurfs = useMemo(
+    () => turfs.filter((t: any) => t.venueType !== "gym"),
+    [turfs]
+  );
+
+  const actualGyms = useMemo(
+    () => turfs.filter((t: any) => t.venueType === "gym"),
+    [turfs]
+  );
+
+  // ─── Sort turfs (excluding gyms) by distance ──────────────────────────
   const sortedTurfs = useMemo(() => {
-    if (!userCoords) return turfs;
-    return [...turfs].sort((a, b) => {
+    if (!userCoords) return actualTurfs;
+    return [...actualTurfs].sort((a, b) => {
       const hasA = a.latitude != null && a.longitude != null;
       const hasB = b.latitude != null && b.longitude != null;
       if (!hasA && !hasB) return 0;
@@ -646,21 +690,23 @@ const data = snap.docs
       return haversine(userCoords.lat, userCoords.lng, a.latitude, a.longitude) -
              haversine(userCoords.lat, userCoords.lng, b.latitude, b.longitude);
     });
-  }, [turfs, userCoords]);
+  }, [actualTurfs, userCoords]);
 
-  // gym code
+  // ─── Sort gyms by distance ─────────────────────────────────────────────
   const sortedGyms = useMemo(() => {
-  if (!userCoords) return gyms;
-  return [...gyms].sort((a, b) => {
-    const hasA = a.latitude != null && a.longitude != null;
-    const hasB = b.latitude != null && b.longitude != null;
-    if (!hasA && !hasB) return 0;
-    if (!hasA) return 1;
-    if (!hasB) return -1;
-    return haversine(userCoords.lat, userCoords.lng, a.latitude, a.longitude) -
-           haversine(userCoords.lat, userCoords.lng, b.latitude, b.longitude);
-  });
-}, [gyms, userCoords]);
+    if (!userCoords) return actualGyms;
+    return [...actualGyms].sort((a, b) => {
+      const hasA = a.latitude != null && a.longitude != null;
+      const hasB = b.latitude != null && b.longitude != null;
+      if (!hasA && !hasB) return 0;
+      if (!hasA) return 1;
+      if (!hasB) return -1;
+      return haversine(userCoords.lat, userCoords.lng, a.latitude, a.longitude) -
+             haversine(userCoords.lat, userCoords.lng, b.latitude, b.longitude);
+    });
+  }, [actualGyms, userCoords]);
+
+
 
 const goToGym = (id: string) => {
   if (!auth.currentUser) {
@@ -670,7 +716,7 @@ const goToGym = (id: string) => {
     ]);
     return;
   }
-  router.push(`../turf/gym-details/${id}`);
+  router.push(`/turf/gym-details/${id}`);
 };
 
   if (loading) return (
@@ -743,7 +789,7 @@ const goToGym = (id: string) => {
                     )}
                     {!!item.link && (
                       <TouchableOpacity style={s.bannerBtn} onPress={() => openBannerLink(item.link)} activeOpacity={0.85}>
-                        <Text style={s.bannerBtnTxt}>Book Now</Text>
+                        <Text style={s.bannerBtnTxt}>View Now</Text>
                         <Ionicons name="arrow-forward" size={13} color="#fff" />
                       </TouchableOpacity>
                     )}
@@ -760,43 +806,25 @@ const goToGym = (id: string) => {
         )}
 
         {/* ── All sections — fully controlled by admin ── */}
-        {sections.map(section => (
-          <FeaturedSectionRow
-            key={section.id}
-            section={section}
-            allTurfs={turfs}
-            sortedTurfs={sortedTurfs}
-            allHighlights={highlights}
-            userCoords={userCoords}
-            onTurf={goToTurf}
-            onExplore={() => router.push("/(tabs)/explore")}
-            onHighlight={onHighlightTap}
-          />
-        ))}
+     {sections.map(section => (
+  <FeaturedSectionRow
+    key={section.id}
+    section={section}
+    allTurfs={actualTurfs}
+    sortedTurfs={sortedTurfs}
+    allGyms={actualGyms}            // ✅ NEW
+    sortedGyms={sortedGyms}         // ✅ NEW
+    allHighlights={highlights}
+    userCoords={userCoords}
+    onTurf={goToTurf}
+    onGym={goToGym}                 // ✅ NEW
+    onExplore={() => router.push("/(tabs)/explore")}
+    onHighlight={onHighlightTap}
+  />
+))}
 
       {/** gym code */}
-      {sortedGyms.length > 0 && (
-  <View style={s.section}>
-    <View style={s.sectionRow}>
-      <View style={s.sectionTitleWrap}>
-        <Text style={s.sectionEmoji}>🏋️</Text>
-        <View>
-          <Text style={s.sectionTitle}>Gyms near you</Text>
-          <Text style={s.sectionSubtitle}>Monthly · Quarterly · Yearly plans</Text>
-        </View>
-      </View>
-      <TouchableOpacity style={s.seeAllBtn} onPress={() => router.push("/(tabs)/explore")} activeOpacity={0.7}>
-        <Text style={s.seeAllTxt}>See all</Text>
-        <Ionicons name="arrow-forward" size={13} color={BRAND} />
-      </TouchableOpacity>
-    </View>
-    <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 12, paddingRight: 4 }}>
-      {sortedGyms.map((item: any) => (
-        <GymCard key={item.id} item={item} userCoords={userCoords} onPress={() => goToGym(item.id)} />
-      ))}
-    </ScrollView>
-  </View>
-)}
+    
       </ScrollView>
     </SafeAreaView>
   );
@@ -841,7 +869,7 @@ const s = StyleSheet.create({
   bannerSub:     { fontSize: 10, color: "rgba(255,255,255,0.75)", marginTop: 3 },
   bannerDateRow: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 5 },
   bannerDateTxt: { fontSize: 12, color: "rgba(255,255,255,0.8)", fontWeight: "500" },
-  bannerBtn:     { position: "absolute", right: 5, flexDirection: "row", alignItems: "center", gap: 5, alignSelf: "flex-start", backgroundColor: GREEN, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 10, marginTop: 10 },
+  bannerBtn:     { position: "absolute", right: 5,bottom:2, flexDirection: "row", alignItems: "center", gap: 5, alignSelf: "flex-start", backgroundColor: GREEN, paddingHorizontal: 12, paddingVertical: 7, borderRadius: 10, marginTop: 10 },
   bannerBtnTxt:  { fontSize: 12, fontWeight: "800", color: "#fff" },
   dotRow:        { position: "absolute", bottom: 14, left: 0, right: 0, flexDirection: "row", justifyContent: "center", alignItems: "center", gap: 6, zIndex: 20 },
   dot:           { width: 7, height: 6, borderRadius: 99, backgroundColor: "rgba(255,255,255,0.35)" },

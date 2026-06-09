@@ -385,7 +385,7 @@ const handleShare = async () => {
       <Ionicons name="share-social-outline" size={20} color="#0B1220" />
     </View>
     <View>
-      <Text style={s.shareBtnTitle}>Share Playon & Earn commission</Text>
+      <Text style={s.shareBtnTitle}>Share Playon & Earn </Text>
       <Text style={s.shareBtnSub}>Invite friends to book sports venues</Text>
     </View>
   </View>

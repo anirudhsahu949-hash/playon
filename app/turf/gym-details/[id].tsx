@@ -153,16 +153,27 @@ export default function GymDetailScreen() {
     return () => { s.remove(); h.remove(); };
   }, []);
 
-  const loadGym = async () => {
-    try {
-      const snap = await getDoc(doc(db, "gyms", String(id)));
-      if (snap.exists()) {
-        setGym({ id: snap.id, ...snap.data() } as any);
-        // NOTE: no default plan selected — user must choose.
+ const loadGym = async () => {
+  try {
+    const snap = await getDoc(doc(db, "turfs", String(id)));  // ✅ NEW: read from turfs collection
+    if (snap.exists()) {
+      const data = { id: snap.id, ...snap.data() } as any;
+      
+      // ✅ Safety check: make sure this is actually a gym
+      if (data.venueType !== "gym") {
+        Alert.alert(
+          "Wrong page", 
+          "This venue isn't a gym. Redirecting...",
+          [{ text: "OK", onPress: () => router.replace(`/turf/${id}`) }]
+        );
+        return;
       }
-    } catch (e) { console.log(e); }
-    finally { setLoading(false); }
-  };
+      
+      setGym(data);
+    }
+  } catch (e) { console.log(e); }
+  finally { setLoading(false); }
+};
 
   const images = useMemo(() => getImages(gym), [gym]);
   const batches = useMemo(() => getBatches(gym), [gym]);
@@ -201,6 +212,48 @@ export default function GymDetailScreen() {
       Alert.alert("Error", "Couldn't open the map link.")
     );
   };
+
+ const contactGym = () => {
+  // ✅ Try new fields first (from updated add-gym.tsx), fall back to old fields
+  const phone = String(
+    gym?.gymPhone ||         // ← NEW field from add-gym.tsx
+    gym?.contactPhone || 
+    gym?.phone || 
+    gym?.ownerPhone || 
+    ""
+  ).replace(/\s/g, "");
+  
+  const whatsappNumber = String(
+    gym?.gymWhatsapp ||       // ← NEW field, falls back to phone
+    gym?.gymPhone ||
+    phone
+  ).replace(/\s/g, "");
+
+  const email = gym?.gymEmail || gym?.ownerEmail || "";  // ← NEW + fallback
+  const ownerName = gym?.ownerName || "the gym";
+
+  const buttons: any[] = [];
+  if (phone) {
+    buttons.push({ text: "Call", onPress: () => Linking.openURL(`tel:${phone}`) });
+    buttons.push({
+      text: "WhatsApp",
+      onPress: () => {
+        const num = whatsappNumber.replace(/\D/g, "");
+        const wa = num.length === 10 ? `91${num}` : num;
+        Linking.openURL(
+          `https://wa.me/${wa}?text=${encodeURIComponent(`Hi, I'm interested in a membership at ${gym.name}.`)}`
+        ).catch(() => Alert.alert("WhatsApp not installed", `Call ${phone} instead.`));
+      },
+    });
+  }
+  buttons.push({ text: "Close", style: "cancel" });
+
+  const message = phone
+    ? `${gym.name}\n\nFor membership details & joining, contact:\n\n📞 ${phone}  ${gym.location ? `\n📍 ${gym.location}` : ""}`
+    : `${gym.name}\n\nNo contact number added yet. Add one from the Add Gym screen.`;
+
+  Alert.alert("Booking coming soon", message, buttons);
+};
 
   // ── Step 1: open the booking sheet (was: go straight to Razorpay) ──
   const openBookingSheet = () => {
@@ -452,12 +505,18 @@ export default function GymDetailScreen() {
           </View>
           <View style={styles.statDivider} />
           <View style={styles.statItem}>
-            <View style={styles.statIconWell}><Ionicons name="time-outline" size={16} color={GYM} /></View>
-            <Text style={styles.statValue} numberOfLines={1}>
-              {gym.openingTime != null ? fmtHour(gym.openingTime) : "—"}
-            </Text>
-            <Text style={styles.statLabel}>Opens</Text>
-          </View>
+  <View style={styles.statIconWell}><Ionicons name="time-outline" size={16} color={GYM} /></View>
+  <Text style={styles.statValue} numberOfLines={1}>
+    {gym.splitSessions 
+      ? `${fmtHour(gym.morningOpen)}` 
+      : gym.openingTime != null 
+        ? fmtHour(gym.openingTime) 
+        : "—"}
+  </Text>
+  <Text style={styles.statLabel}>
+    {gym.splitSessions ? "Morning" : "Opens"}
+  </Text>
+</View>
           <View style={styles.statDivider} />
           <View style={styles.statItem}>
             <View style={styles.statIconWell}><Ionicons name="pricetags-outline" size={16} color={GYM} /></View>
@@ -484,6 +543,56 @@ export default function GymDetailScreen() {
           </View>
         )}
 
+      
+
+    {/* ── Operating Hours (split sessions or continuous) ── */}
+<View style={styles.section}>
+  <Text style={styles.sectionTitle}>Operating Hours</Text>
+  <Text style={styles.sectionSub}>
+    {gym.splitSessions ? "Morning & evening sessions" : "Open continuously"}
+  </Text>
+
+  {gym.splitSessions ? (
+    <View style={{ gap: 10 }}>
+      {/* Morning session */}
+      <View style={styles.locCard}>
+        <View style={styles.locIcon}>
+          <Ionicons name="sunny-outline" size={20} color={GYM} />
+        </View>
+        <View style={{ flex: 1 }}>
+          <Text style={{ fontSize: 13, fontWeight: "800", color: INK }}>Morning Session</Text>
+          <Text style={{ fontSize: 12, color: MUTED, marginTop: 2 }}>
+            {fmtHour(gym.morningOpen)} — {fmtHour(gym.morningClose)}
+          </Text>
+        </View>
+      </View>
+
+      {/* Evening session */}
+      <View style={styles.locCard}>
+        <View style={styles.locIcon}>
+          <Ionicons name="moon-outline" size={20} color={GYM} />
+        </View>
+        <View style={{ flex: 1 }}>
+          <Text style={{ fontSize: 13, fontWeight: "800", color: INK }}>Evening Session</Text>
+          <Text style={{ fontSize: 12, color: MUTED, marginTop: 2 }}>
+            {fmtHour(gym.eveningOpen)} — {fmtHour(gym.eveningClose)}
+          </Text>
+        </View>
+      </View>
+    </View>
+  ) : (
+    <View style={styles.locCard}>
+      <View style={styles.locIcon}>
+        <Ionicons name="time-outline" size={20} color={GYM} />
+      </View>
+      <Text style={styles.locText}>
+        {gym.openingTime != null && gym.closingTime != null
+          ? `${fmtHour(gym.openingTime)} — ${fmtHour(gym.closingTime)}`
+          : "Hours not set"}
+      </Text>
+    </View>
+  )}
+</View>
         {/* ── Membership plans ── */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Membership Plans</Text>
@@ -579,15 +688,14 @@ export default function GymDetailScreen() {
             </View>
           )}
         </View>
-        <TouchableOpacity
-          style={[styles.ctaBtn, !selectedPlan && { opacity: 0.4 }]}
-          onPress={openBookingSheet}
-          disabled={!selectedPlan}
-          activeOpacity={0.9}
-        >
-          <Text style={styles.ctaTxt}>Get Membership</Text>
-          <Ionicons name="arrow-forward" size={16} color="#fff" />
-        </TouchableOpacity>
+     <TouchableOpacity
+  style={styles.ctaBtn}
+  onPress={contactGym}
+  activeOpacity={0.9}
+>
+  <Ionicons name="call" size={16} color="#fff" />
+  <Text style={styles.ctaTxt}>Get membership</Text>
+</TouchableOpacity>
       </View>
 
       {/* ── Booking summary bottom sheet ── */}
@@ -873,7 +981,7 @@ const styles = StyleSheet.create({
   planMeta:    { fontSize: 12, color: MUTED, fontWeight: "600" },
   metaDot:     { width: 3, height: 3, borderRadius: 1.5, backgroundColor: "#D1D5DB" },
   strike:      { fontSize: 12, color: MUTED, textDecorationLine: "line-through", fontWeight: "600" },
-  price:       { fontSize: 17, fontWeight: "900", color: INK },
+  price:       { fontSize: 16, fontWeight: "900", color: INK },
   saveChip:    { flexDirection: "row", alignItems: "center", gap: 3, backgroundColor: "#ECFDF5", paddingHorizontal: 7, paddingVertical: 3, borderRadius: 7, marginTop: 4 },
   saveChipTxt: { fontSize: 10, fontWeight: "800", color: "#059669" },
   emptyPlans:  { alignItems: "center", paddingVertical: 28, gap: 8 },
@@ -907,7 +1015,7 @@ const styles = StyleSheet.create({
   barRating:   { flexDirection: "row", alignItems: "center", gap: 3, backgroundColor: TINT, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 7 },
   barRatingTxt:{ fontSize: 11, fontWeight: "800", color: GYM },
   bottomLabel: { fontSize: 12, color: MUTED, fontWeight: "600", flexShrink: 1 },
-  bottomPrice: { fontSize: 22, fontWeight: "900", color: INK, marginTop: 2 },
+  bottomPrice: { fontSize: 20, fontWeight: "900", color: INK, marginTop: 2 },
   ctaBtn: {
     flexDirection: "row", alignItems: "center", gap: 7,
     backgroundColor: GYM, paddingHorizontal: 22, paddingVertical: 15, borderRadius: 14,

@@ -10,6 +10,7 @@ import {
   StatusBar,
   ActivityIndicator,
   Platform,
+  Switch,
 } from "react-native";
 import { useState, useEffect } from "react";
 import { db } from "../../firebaseConfig";
@@ -29,19 +30,45 @@ const DARK = "#081120";
 const ACCENT = "#0EA5A4";
 
 // ── Gym amenities ───────────────────────────────────────────────────────────────
+// ── Gym amenities (expanded) ────────────────────────────────────────────────
 const GYM_AMENITIES = [
-  { label: "Cardio Zone",      icon: "🏃" },
-  { label: "Free Weights",     icon: "🏋️" },
-  { label: "Machines",         icon: "⚙️" },
-  { label: "Personal Trainer", icon: "🧑‍🏫" },
-  { label: "Steam / Sauna",    icon: "♨️" },
-  { label: "Locker Room",      icon: "🔐" },
-  { label: "Showers",          icon: "🚿" },
-  { label: "Parking",          icon: "🅿️" },
-  { label: "Drinking Water",   icon: "💧" },
-  { label: "WiFi",             icon: "📶" },
-  { label: "Air Conditioned",  icon: "❄️" },
-  { label: "Yoga / Zumba",     icon: "🧘" },
+  // Core workout zones
+  { label: "Cardio Zone",         icon: "🏃" },
+  { label: "Free Weights",        icon: "🏋️" },
+  { label: "Weight Machines",     icon: "⚙️" },
+  { label: "Cross-Fit Zone",      icon: "💪" },
+  { label: "Boxing Area",         icon: "🥊" },
+  { label: "Spin / Cycling",      icon: "🚴" },
+  { label: "Functional Training", icon: "🤸" },
+  { label: "Stretching Area",     icon: "🧘‍♂️" },
+
+  // Classes & training
+  { label: "Personal Trainer",    icon: "🧑‍🏫" },
+  { label: "Group Classes",       icon: "👥" },
+  { label: "Yoga / Zumba",        icon: "🧘" },
+  { label: "Nutrition Counsel",   icon: "🥗" },
+
+  // Wellness & recovery
+  { label: "Steam / Sauna",       icon: "♨️" },
+  { label: "Swimming Pool",       icon: "🏊" },
+  { label: "Massage Therapy",     icon: "💆" },
+
+  // Facilities
+  { label: "Locker Room",         icon: "🔐" },
+  { label: "Showers",             icon: "🚿" },
+  { label: "Changing Room",       icon: "👕" },
+  { label: "Towel Service",       icon: "🧖" },
+  { label: "Juice Bar / Cafe",    icon: "🥤" },
+
+  // Comfort & security
+  { label: "Drinking Water",      icon: "💧" },
+  { label: "Air Conditioned",     icon: "❄️" },
+  { label: "WiFi",                icon: "📶" },
+  { label: "Music System",        icon: "🎵" },
+  { label: "Parking",             icon: "🅿️" },
+  { label: "Bike Parking",        icon: "🏍️" },
+  { label: "CCTV Security",       icon: "📹" },
+  { label: "First Aid",           icon: "🏥" },
 ];
 
 // ── Membership plan presets (tap to add a pre-filled row) ───────────────────────
@@ -117,8 +144,25 @@ export default function AddGym() {
   const [location,    setLocation]    = useState("");
   const [mapLink,     setMapLink]     = useState("");
   const [rating,      setRating]      = useState("");
+// Split sessions toggle — many gyms have morning + evening sessions
+  const [splitSessions, setSplitSessions] = useState(true);
+
+  // Morning session
+  const [morningOpen,  setMorningOpen]  = useState("5");
+  const [morningClose, setMorningClose] = useState("11");
+
+  // Evening session
+  const [eveningOpen,  setEveningOpen]  = useState("16");
+  const [eveningClose, setEveningClose] = useState("22");
+
+  // Continuous timing (when not split)
   const [openingTime, setOpeningTime] = useState("6");
   const [closingTime, setClosingTime] = useState("22");
+
+  // ── Gym contact details (for enquiries) ────────────────────────────────
+  const [gymPhone,    setGymPhone]    = useState("");
+  const [gymWhatsapp, setGymWhatsapp] = useState("");
+  const [gymEmail,    setGymEmail]    = useState("");
 
   // Section 2 — membership plans
   const [plans, setPlans] = useState<DraftPlan[]>([newPlan("Monthly", "1")]);
@@ -136,6 +180,7 @@ export default function AddGym() {
   const [selectedOwner, setSelectedOwner] = useState<Owner | null>(null);
   const [ownerSearch,   setOwnerSearch]   = useState("");
   const [loadingOwners, setLoadingOwners] = useState(true);
+  
 
   const [saving, setSaving] = useState(false);
 
@@ -194,17 +239,37 @@ export default function AddGym() {
   const validate = (): string | null => {
     if (!name.trim()) return "Gym name is required.";
     if (!location.trim()) return "Location is required.";
+
+    // Contact validation
+    if (!gymPhone.trim()) return "Gym contact phone is required.";
+    if (gymPhone.trim().length < 10) return "Enter a valid phone number.";
+
+    // Timing validation
+    if (splitSessions) {
+      if (Number(morningOpen) >= Number(morningClose))
+        return "Morning closing must be after opening.";
+      if (Number(eveningOpen) >= Number(eveningClose))
+        return "Evening closing must be after opening.";
+      if (Number(morningClose) > Number(eveningOpen))
+        return "Morning session must end before evening session starts.";
+    } else {
+      if (Number(openingTime) >= Number(closingTime))
+        return "Closing time must be after opening time.";
+    }
+
+    // Plan validation
     const validPlans = plans.filter(
       (p) => p.label.trim() && Number(p.months) > 0 && Number(p.price) > 0
     );
     if (validPlans.length === 0)
       return "Add at least one membership plan with a duration and price.";
+
     if (!selectedOwner) return "Please assign an owner.";
     return null;
   };
 
   // ── Save ──────────────────────────────────────────────────────────────────
-  const handleSave = async () => {
+const handleSave = async () => {
     const err = validate();
     if (err) return Alert.alert("Incomplete", err);
 
@@ -222,22 +287,53 @@ export default function AddGym() {
         }))
         .sort((a, b) => a.months - b.months);
 
-      await addDoc(collection(db, "gyms"), {
+      // Build timing object based on split or continuous
+      const timingData = splitSessions
+        ? {
+            splitSessions: true,
+            morningOpen:  Number(morningOpen),
+            morningClose: Number(morningClose),
+            eveningOpen:  Number(eveningOpen),
+            eveningClose: Number(eveningClose),
+            // Legacy fields for compatibility (overall day range)
+            openingTime:  Number(morningOpen),
+            closingTime:  Number(eveningClose),
+          }
+        : {
+            splitSessions: false,
+            openingTime:   Number(openingTime),
+            closingTime:   Number(closingTime),
+          };
+
+      // ✅ CHANGED: Save to "turfs" collection with venueType: "gym"
+      await addDoc(collection(db, "turfs"), {
         name:        name.trim(),
         location:    location.trim(),
         mapLink:     mapLink.trim(),
         rating:      Number(rating) || 0,
-        openingTime: Number(openingTime),
-        closingTime: Number(closingTime),
+
+        // Timing (split or continuous)
+        ...timingData,
+
+        // Contact details
+        gymPhone:    gymPhone.trim(),
+        gymWhatsapp: gymWhatsapp.trim() || gymPhone.trim(), // fallback to phone
+        gymEmail:    gymEmail.trim(),
+
+        // Gym specific
         amenities,
         plans:       finalPlans,
         image:       coverImage.trim() || images[0] || "",
         images,
+
+        // Owner
         ownerId:     selectedOwner!.id,
         ownerName:   selectedOwner!.name  || "",
         ownerEmail:  selectedOwner!.email || "",
+
+        // Meta
         active:      true,
-        venueType:   "gym",
+        venueType:   "gym",   // ✅ This is what makes it a gym in turfs collection
         createdAt:   serverTimestamp(),
       });
 
@@ -294,23 +390,149 @@ export default function AddGym() {
               autoCapitalize="none"
             />
           </Field>
-          <View style={{ flexDirection: "row", gap: 12 }}>
-            <View style={{ flex: 1 }}>
-              <Field label="Opens (hr)">
-                <TextInput style={styles.input} keyboardType="number-pad" value={openingTime} onChangeText={setOpeningTime} />
-              </Field>
-            </View>
-            <View style={{ flex: 1 }}>
-              <Field label="Closes (hr)">
-                <TextInput style={styles.input} keyboardType="number-pad" value={closingTime} onChangeText={setClosingTime} />
-              </Field>
-            </View>
-            <View style={{ flex: 1 }}>
-              <Field label="Rating">
-                <TextInput style={styles.input} keyboardType="decimal-pad" placeholder="4.5" placeholderTextColor="#9CA3AF" value={rating} onChangeText={setRating} />
-              </Field>
-            </View>
-          </View>
+          {/* Rating */}
+<Field label="Rating (Optional)">
+  <TextInput
+    style={styles.input}
+    keyboardType="decimal-pad"
+    placeholder="4.5"
+    placeholderTextColor="#9CA3AF"
+    value={rating}
+    onChangeText={setRating}
+  />
+</Field>
+
+{/* Split sessions toggle */}
+<View style={styles.toggleRow}>
+  <View style={{ flex: 1 }}>
+    <Text style={styles.toggleLabel}>Split Sessions</Text>
+    <Text style={styles.toggleHint}>
+      Most Indian gyms run morning + evening sessions
+    </Text>
+  </View>
+  <Switch
+    value={splitSessions}
+    onValueChange={setSplitSessions}
+    trackColor={{ false: "#E5E7EB", true: ACCENT }}
+    thumbColor="#fff"
+  />
+</View>
+
+{splitSessions ? (
+  <>
+    {/* Morning Session */}
+    <Text style={styles.sessionLabel}>🌅 Morning Session</Text>
+    <View style={{ flexDirection: "row", gap: 12 }}>
+      <View style={{ flex: 1 }}>
+        <Field label="Opens (hr)">
+          <TextInput
+            style={styles.input} keyboardType="number-pad"
+            placeholder="5" placeholderTextColor="#9CA3AF"
+            value={morningOpen} onChangeText={setMorningOpen}
+          />
+        </Field>
+      </View>
+      <View style={{ flex: 1 }}>
+        <Field label="Closes (hr)">
+          <TextInput
+            style={styles.input} keyboardType="number-pad"
+            placeholder="11" placeholderTextColor="#9CA3AF"
+            value={morningClose} onChangeText={setMorningClose}
+          />
+        </Field>
+      </View>
+    </View>
+
+    {/* Evening Session */}
+    <Text style={styles.sessionLabel}>🌆 Evening Session</Text>
+    <View style={{ flexDirection: "row", gap: 12 }}>
+      <View style={{ flex: 1 }}>
+        <Field label="Opens (hr)">
+          <TextInput
+            style={styles.input} keyboardType="number-pad"
+            placeholder="16" placeholderTextColor="#9CA3AF"
+            value={eveningOpen} onChangeText={setEveningOpen}
+          />
+        </Field>
+      </View>
+      <View style={{ flex: 1 }}>
+        <Field label="Closes (hr)">
+          <TextInput
+            style={styles.input} keyboardType="number-pad"
+            placeholder="22" placeholderTextColor="#9CA3AF"
+            value={eveningClose} onChangeText={setEveningClose}
+          />
+        </Field>
+      </View>
+    </View>
+  </>
+) : (
+  <>
+    {/* Continuous timing */}
+    <Text style={styles.sessionLabel}>🕒 Open Hours</Text>
+    <View style={{ flexDirection: "row", gap: 12 }}>
+      <View style={{ flex: 1 }}>
+        <Field label="Opens (hr)">
+          <TextInput
+            style={styles.input} keyboardType="number-pad"
+            value={openingTime} onChangeText={setOpeningTime}
+          />
+        </Field>
+      </View>
+      <View style={{ flex: 1 }}>
+        <Field label="Closes (hr)">
+          <TextInput
+            style={styles.input} keyboardType="number-pad"
+            value={closingTime} onChangeText={setClosingTime}
+          />
+        </Field>
+      </View>
+    </View>
+  </>
+)}
+        </View>
+
+        {/* ── 1b. Gym Contact (for enquiries) ── */}
+        <View style={styles.card}>
+          <SectionHeader
+            number="1b"
+            title="Contact Details"
+            subtitle="Users will call/message here for gym tour & enquiries"
+          />
+
+          <Field label="Phone Number *">
+            <TextInput
+              style={styles.input}
+              placeholder="e.g. +91 98908 44206"
+              placeholderTextColor="#9CA3AF"
+              value={gymPhone}
+              onChangeText={setGymPhone}
+              keyboardType="phone-pad"
+            />
+          </Field>
+
+          <Field label="WhatsApp Number (Optional)">
+            <TextInput
+              style={styles.input}
+              placeholder="If different from phone"
+              placeholderTextColor="#9CA3AF"
+              value={gymWhatsapp}
+              onChangeText={setGymWhatsapp}
+              keyboardType="phone-pad"
+            />
+          </Field>
+
+          <Field label="Email (Optional)">
+            <TextInput
+              style={styles.input}
+              placeholder="gym@example.com"
+              placeholderTextColor="#9CA3AF"
+              value={gymEmail}
+              onChangeText={setGymEmail}
+              keyboardType="email-address"
+              autoCapitalize="none"
+            />
+          </Field>
         </View>
 
         {/* ── 2. Membership plans ── */}
@@ -574,4 +796,32 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.2, shadowRadius: 10, elevation: 6,
   },
   submitText: { color: "#fff", fontSize: 16, fontWeight: "900" },
+  toggleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#F9FAFB",
+    borderRadius: 12,
+    padding: 14,
+    marginTop: 14,
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+  },
+  toggleLabel: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#111827",
+  },
+  toggleHint: {
+    fontSize: 11,
+    color: "#9CA3AF",
+    marginTop: 2,
+    fontWeight: "500",
+  },
+  sessionLabel: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#374151",
+    marginTop: 16,
+    marginBottom: 4,
+  },
 });

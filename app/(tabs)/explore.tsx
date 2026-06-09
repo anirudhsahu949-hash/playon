@@ -20,6 +20,7 @@ import { collection, getDocs, query, where, doc, getDoc } from "firebase/firesto
 import { onAuthStateChanged } from "firebase/auth";
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
+import GymCardGrid from "../../components/screen-gym/gym-card-grid";  // ✅ Grid version for explore
 
 const TODAY_STRING = new Date().toDateString();
 
@@ -445,21 +446,27 @@ export default function Explore() {
     router.push(`/turf/${id}`);
   };
 
-  const sportFilters = useMemo<string[]>(() => {
-    const raw = turfs.flatMap(t =>
-      Array.isArray(t.sport) ? t.sport : t.sport ? [t.sport] : []
-    );
-    const seen = new Set<string>();
-    const unique: string[] = [];
-    for (const s of raw) {
-      const normalized = toTitleCase(s.trim());
-      if (!seen.has(normalized.toLowerCase())) {
-        seen.add(normalized.toLowerCase());
-        unique.push(normalized);
-      }
+const sportFilters = useMemo<string[]>(() => {
+  // Get sports from turfs only (skip gyms — they have no sport field)
+  const raw = turfs
+    .filter((t: any) => t.venueType !== "gym")
+    .flatMap(t => Array.isArray(t.sport) ? t.sport : t.sport ? [t.sport] : []);
+  
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const s of raw) {
+    const normalized = toTitleCase(s.trim());
+    if (!seen.has(normalized.toLowerCase())) {
+      seen.add(normalized.toLowerCase());
+      unique.push(normalized);
     }
-    return ["All", ...unique.sort()];
-  }, [turfs]);
+  }
+
+  // ✅ Check if any gyms exist — if yes, add "Gym" chip at the end
+  const hasGyms = turfs.some((t: any) => t.venueType === "gym");
+  
+  return ["All", ...unique.sort(), ...(hasGyms ? ["Gym"] : [])];
+}, [turfs]);
 
   const likedTurfs = useMemo(() => turfs.filter(t => liked.has(t.id)), [turfs, liked]);
 
@@ -481,21 +488,35 @@ export default function Explore() {
       return a.distanceKm - b.distanceKm;
     });
 
-    return sorted.filter(t => {
-      if (sport !== "All") {
-        const sports = Array.isArray(t.sport) ? t.sport : t.sport ? [t.sport] : [];
-        if (!sports.some(s => s.toLowerCase() === sport.toLowerCase())) return false;
-      }
-      if (!q) return true;
-      const sportStr = Array.isArray(t.sport)
-        ? t.sport.join(" ").toLowerCase()
-        : (t.sport ?? "").toLowerCase();
-      return [
-        (t.name ?? "").toLowerCase(),
-        (t.location ?? "").toLowerCase(),
-        sportStr,
-      ].some(v => v.includes(q));
-    });
+    return sorted.filter((t: any) => {
+  // ✅ Special case: "Gym" filter shows only gyms
+  if (sport === "Gym") {
+    if (t.venueType !== "gym") return false;
+  } else if (sport === "All") {
+    // "All" shows only turfs (not gyms)
+    if (t.venueType === "gym") return false;
+  } else {
+    // Specific sport filter — turfs only with matching sport
+    if (t.venueType === "gym") return false;
+    const sports = Array.isArray(t.sport) ? t.sport : t.sport ? [t.sport] : [];
+    if (!sports.some((s: string) => s.toLowerCase() === sport.toLowerCase())) return false;
+  }
+
+  if (!q) return true;
+
+  const sportStr = Array.isArray(t.sport)
+    ? t.sport.join(" ").toLowerCase()
+    : (t.sport ?? "").toLowerCase();
+  const amenityStr = Array.isArray(t.amenities)
+    ? t.amenities.join(" ").toLowerCase()
+    : "";
+  return [
+    (t.name ?? "").toLowerCase(),
+    (t.location ?? "").toLowerCase(),
+    sportStr,
+    amenityStr,
+  ].some(v => v.includes(q));
+});
   }, [turfs, search, sport, userCoords]);
 
   if (loading) {
@@ -569,9 +590,15 @@ export default function Explore() {
             </View>
 
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.chips}>
-             {sportFilters.map(f => {
+         {sportFilters.map(f => {
   const active = sport === f;
-  const cfg = f === "All" ? { color: "#374151", icon: "grid-outline" as const } : getSportCfg(f);
+  
+  // ✅ Special configs for "All" and "Gym"
+  const cfg = 
+    f === "All" ? { color: "#374151", icon: "grid-outline" as const } :
+    f === "Gym" ? { color: "#7C3AED", icon: "barbell-outline" as const } :
+    getSportCfg(f);
+
   return (
     <TouchableOpacity key={f} style={[s.chip, active && s.chipOn]} onPress={() => setSport(f)} activeOpacity={0.7}>
       <Ionicons name={cfg.icon} size={14} color={active ? "#fff" : cfg.color} />
@@ -581,22 +608,28 @@ export default function Explore() {
 })}
             </ScrollView>
 
-            <View style={s.legendRow}>
-              <View style={s.legendItem}>
-                <View style={[s.legendDot, { backgroundColor: "#F0FDF4", borderColor: "#86EFAC" }]} />
-                <Text style={s.legendTxt}>Available</Text>
-              </View>
-              <View style={s.legendItem}>
-                <View style={[s.legendDot, { backgroundColor: "#FEE2E2", borderColor: "#FECACA" }]} />
-                <Text style={s.legendTxt}>Booked</Text>
-              </View>
-              <View style={s.legendItem}>
-                <View style={[s.legendDot, { backgroundColor: "#FEF3C7", borderColor: "#FDE68A" }]} />
-                <Text style={s.legendTxt}>Blocked</Text>
-              </View>
-              <View style={{ flex: 1 }} />
-              <Text style={s.listCount}>{filtered.length} venues</Text>
-            </View>
+          <View style={s.legendRow}>
+  {sport !== "Gym" && (
+    <>
+      <View style={s.legendItem}>
+        <View style={[s.legendDot, { backgroundColor: "#F0FDF4", borderColor: "#86EFAC" }]} />
+        <Text style={s.legendTxt}>Available</Text>
+      </View>
+      <View style={s.legendItem}>
+        <View style={[s.legendDot, { backgroundColor: "#FEE2E2", borderColor: "#FECACA" }]} />
+        <Text style={s.legendTxt}>Booked</Text>
+      </View>
+      <View style={s.legendItem}>
+        <View style={[s.legendDot, { backgroundColor: "#FEF3C7", borderColor: "#FDE68A" }]} />
+        <Text style={s.legendTxt}>Blocked</Text>
+      </View>
+    </>
+  )}
+  <View style={{ flex: 1 }} />
+  <Text style={s.listCount}>
+    {filtered.length} {sport === "Gym" ? "gyms" : "venues"}
+  </Text>
+</View>
 
             {likedTurfs.length > 0 && (
               <View style={s.likedSection}>
@@ -629,6 +662,30 @@ export default function Explore() {
         }
 
         renderItem={({ item }) => {
+  // ✅ If it's a gym, render the GymCard
+  if ((item as any).venueType === "gym") {
+  return (
+    <View style={{ marginHorizontal: 10, marginBottom: 14 }}>
+      <GymCardGrid
+        item={item}
+        userCoords={userCoords ? { lat: userCoords.lat, lng: userCoords.lng } : null}
+        onPress={() => {
+          if (!auth.currentUser) {
+            Alert.alert("Login required", "Please log in to view memberships.", [
+              { text: "Cancel", style: "cancel" },
+              { text: "Log In", onPress: () => router.push("/(auth)/login") },
+            ]);
+            return;
+          }
+          router.push(`/turf/gym-details/${item.id}`);
+        }}
+      />
+    </View>
+  );
+}
+
+ 
+    
           const img        = getTurfImage(item);
           const basePrice  = getBasePrice(item);
           const sportArray = Array.isArray(item.sport)

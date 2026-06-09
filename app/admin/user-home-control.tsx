@@ -1,9 +1,4 @@
-/**
- * admin/home-control.tsx
- * Admin screen to control the home screen:
- * - Featured Sections (with turf order control)
- * - Highlight Cards (Top Picks)
- */
+
 import {
   View, Text, StyleSheet, SafeAreaView, StatusBar, ScrollView,
   TouchableOpacity, TextInput, Alert, ActivityIndicator,
@@ -33,11 +28,13 @@ type FeaturedSection = {
   title: string;
   subtitle?: string;
   icon: string;
+  venueType: "turf" | "gym";        // ✅ NEW — which venue type this section shows
   type: SectionType;
-  turfIds: string[];
+  turfIds: string[];                  // for turfs (when venueType === "turf")
+  gymIds?: string[];                  // ✅ NEW — for gyms (when venueType === "gym")
   filter?: { sport?: string; location?: string };
-  maxItems?: number;   // ✅ for nearby + all: how many turfs to show
-  highlightIds?: string[]; // ✅ for highlights type: ordered highlight card IDs
+  maxItems?: number;
+  highlightIds?: string[];
   active: boolean;
   order: number;
   style: "horizontal" | "grid";
@@ -66,7 +63,11 @@ const SPORT_OPTS = ["Football","Cricket","Badminton","Basketball","Tennis","Voll
 // ── SECTION EMPTY FORM ─────────────────────────────────────────────────────────
 const EMPTY_SECTION = (): Omit<FeaturedSection,"id"> => ({
   title: "", subtitle: "", icon: "🔥",
-  type: "manual", turfIds: [], filter: {}, 
+  venueType: "turf",              // ✅ NEW — default to turf
+  type: "manual",
+  turfIds: [],
+  gymIds: [],                     // ✅ NEW
+  filter: {}, 
   maxItems: 6,
   highlightIds: [],
   active: true, order: 0, style: "horizontal",
@@ -84,9 +85,10 @@ export default function AdminHomeControl() {
   const router = useRouter();
   const [tab, setTab] = useState<"sections"|"highlights">("sections");
 
-  const [sections,   setSections]   = useState<FeaturedSection[]>([]);
-  const [highlights, setHighlights] = useState<HighlightCard[]>([]);
-  const [turfs,      setTurfs]      = useState<Turf[]>([]);
+const [sections,   setSections]   = useState<FeaturedSection[]>([]);
+const [highlights, setHighlights] = useState<HighlightCard[]>([]);
+const [turfs,      setTurfs]      = useState<Turf[]>([]);
+const [gyms,       setGyms]       = useState<Turf[]>([]);  // ✅ NEW
   const [loading,    setLoading]    = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [saving,     setSaving]     = useState(false);
@@ -103,20 +105,24 @@ export default function AdminHomeControl() {
 
   useEffect(() => { fetchAll(); }, []);
 
-  const fetchAll = async (isRefresh = false) => {
-    isRefresh ? setRefreshing(true) : setLoading(true);
-    try {
-      const [secSnap, hlSnap, turfSnap] = await Promise.all([
-        getDocs(query(collection(db, "featuredSections"), orderBy("order"))),
-        getDocs(query(collection(db, "featuredHighlights"), orderBy("order"))),
-        getDocs(collection(db, "turfs")),
-      ]);
-      setSections(secSnap.docs.map(d => ({ id: d.id, ...d.data() } as FeaturedSection)));
-      setHighlights(hlSnap.docs.map(d => ({ id: d.id, ...d.data() } as HighlightCard)));
-      setTurfs(turfSnap.docs.map(d => ({ id: d.id, ...d.data() } as Turf)));
-    } catch { Alert.alert("Error", "Could not load data."); }
-    finally { setLoading(false); setRefreshing(false); }
-  };
+const fetchAll = async (isRefresh = false) => {
+  isRefresh ? setRefreshing(true) : setLoading(true);
+  try {
+    const [secSnap, hlSnap, venueSnap] = await Promise.all([
+      getDocs(query(collection(db, "featuredSections"), orderBy("order"))),
+      getDocs(query(collection(db, "featuredHighlights"), orderBy("order"))),
+      getDocs(collection(db, "turfs")),  // ✅ all venues live here now
+    ]);
+    setSections(secSnap.docs.map(d => ({ id: d.id, ...d.data() } as FeaturedSection)));
+    setHighlights(hlSnap.docs.map(d => ({ id: d.id, ...d.data() } as HighlightCard)));
+
+    // ✅ Split venues by venueType
+    const allVenues = venueSnap.docs.map(d => ({ id: d.id, ...d.data() } as Turf & { venueType?: string }));
+    setTurfs(allVenues.filter(v => v.venueType !== "gym"));
+    setGyms(allVenues.filter(v => v.venueType === "gym"));
+  } catch { Alert.alert("Error", "Could not load data."); }
+  finally { setLoading(false); setRefreshing(false); }
+};
 
   // ── SECTIONS ─────────────────────────────────────────────────────────────────
   const openCreateSection = () => {
@@ -125,28 +131,35 @@ export default function AdminHomeControl() {
     setSectionModal(true);
   };
 
-  const openEditSection = (s: FeaturedSection) => {
-    setEditingSection(s);
-    setSectionForm({
-      title:    s.title,
-      subtitle: s.subtitle || "",
-      icon:     s.icon,
-      type:     s.type,
-      turfIds:  [...s.turfIds],
-      filter:   { ...s.filter },
-      maxItems:     s.maxItems ?? 6,   // ✅ pre-fill saved value
-      highlightIds: s.highlightIds ? [...s.highlightIds] : [],
-      active:       s.active,
-      order:    s.order,
-      style:    s.style,
-    });
-    setSectionModal(true);
-  };
+ const openEditSection = (s: FeaturedSection) => {
+  setEditingSection(s);
+  setSectionForm({
+    title:    s.title,
+    subtitle: s.subtitle || "",
+    icon:     s.icon,
+    venueType: s.venueType || "turf",       // ✅ NEW — default to turf for old sections
+    type:     s.type,
+    turfIds:  [...(s.turfIds || [])],
+    gymIds:   [...(s.gymIds || [])],         // ✅ NEW
+    filter:   { ...s.filter },
+    maxItems:     s.maxItems ?? 6,
+    highlightIds: s.highlightIds ? [...s.highlightIds] : [],
+    active:       s.active,
+    order:    s.order,
+    style:    s.style,
+  });
+  setSectionModal(true);
+};
 
-  const saveSection = async () => {
-    if (!sectionForm.title.trim()) return Alert.alert("Required", "Title is required.");
-    if (sectionForm.type === "manual" && sectionForm.turfIds.length === 0)
-      return Alert.alert("Required", "Add at least one turf for manual sections.");
+ const saveSection = async () => {
+  if (!sectionForm.title.trim()) return Alert.alert("Required", "Title is required.");
+  if (sectionForm.type === "manual" && getVenueIds().length === 0) {
+    return Alert.alert(
+      "Required", 
+      `Add at least one ${sectionForm.venueType === "gym" ? "gym" : "turf"} for manual sections.`
+    );
+  }
+  
     setSaving(true);
     try {
       if (editingSection) {
@@ -187,21 +200,33 @@ export default function AdminHomeControl() {
   };
 
   // ── Turf order within a section ───────────────────────────────────────────
-  const moveTurf = (index: number, dir: "up" | "down") => {
-    const ids = [...sectionForm.turfIds];
-    const swap = dir === "up" ? index - 1 : index + 1;
-    if (swap < 0 || swap >= ids.length) return;
-    [ids[index], ids[swap]] = [ids[swap], ids[index]];
-    setSectionForm(f => ({ ...f, turfIds: ids }));
-  };
+ // ✅ Use the right ID array based on venueType
+const getVenueIds = () => sectionForm.venueType === "gym" 
+  ? (sectionForm.gymIds || []) 
+  : sectionForm.turfIds;
 
-  const removeTurfFromSection = (turfId: string) =>
-    setSectionForm(f => ({ ...f, turfIds: f.turfIds.filter(id => id !== turfId) }));
+const setVenueIds = (ids: string[]) => {
+  setSectionForm(f => sectionForm.venueType === "gym"
+    ? { ...f, gymIds: ids }
+    : { ...f, turfIds: ids }
+  );
+};
 
-  const addTurfToSection = (turfId: string) => {
-    if (sectionForm.turfIds.includes(turfId)) return;
-    setSectionForm(f => ({ ...f, turfIds: [...f.turfIds, turfId] }));
-  };
+const moveTurf = (index: number, dir: "up" | "down") => {
+  const ids = [...getVenueIds()];
+  const swap = dir === "up" ? index - 1 : index + 1;
+  if (swap < 0 || swap >= ids.length) return;
+  [ids[index], ids[swap]] = [ids[swap], ids[index]];
+  setVenueIds(ids);
+};
+
+const removeTurfFromSection = (id: string) =>
+  setVenueIds(getVenueIds().filter(x => x !== id));
+
+const addTurfToSection = (id: string) => {
+  if (getVenueIds().includes(id)) return;
+  setVenueIds([...getVenueIds(), id]);
+};
 
   // ── HIGHLIGHTS ────────────────────────────────────────────────────────────
   const openCreateCard = () => {
@@ -351,7 +376,25 @@ export default function AdminHomeControl() {
                         </View>
 
                         <View style={s.sectionMeta}>
-                          <View style={[s.metaChip,
+  {/* ✅ NEW: Venue type badge */}
+  <View style={[
+    s.metaChip,
+    (item.venueType || "turf") === "gym" ? { backgroundColor: "#FAE8FF" } : { backgroundColor: "#DBEAFE" }
+  ]}>
+    <Text style={[
+      s.metaChipTxt,
+      { color: (item.venueType || "turf") === "gym" ? "#86198F" : "#0369A1" }
+    ]}>
+      {(item.venueType || "turf") === "gym" ? "🏋️ Gym" : "🏏 Turf"}
+    </Text>
+  </View>
+
+  {/* Existing type chip below — keep as is */}
+  <View style={[s.metaChip,
+    
+
+                        
+                      
                             item.type === "nearby" ? s.metaNearby :
                             item.type === "all"    ? s.metaAll    : {}
                           ]}>
@@ -540,6 +583,38 @@ export default function AdminHomeControl() {
                 </TouchableOpacity>
               </View>
 
+              {/* ✅ NEW: Venue type picker — Turf vs Gym */}
+<Text style={s.fieldLabel}>Venue Type</Text>
+<View style={s.typeRow}>
+  {([
+    { key: "turf", label: "🏏 Turfs", desc: "Show turfs, courts, pools" },
+    { key: "gym",  label: "🏋️ Gyms",  desc: "Show gym listings" },
+  ] as const).map(({ key, label }) => (
+    <TouchableOpacity
+      key={key}
+      style={[s.typeBtn, sectionForm.venueType === key && s.typeBtnActive]}
+      onPress={() => setSectionForm(f => ({
+        ...f,
+        venueType: key,
+        // Reset incompatible types when switching to gym (no "sport" filter for gyms)
+        type: key === "gym" && f.type === "sport" ? "manual" : f.type,
+      }))}
+    >
+      <Text style={[s.typeTxt, sectionForm.venueType === key && s.typeTxtActive]}>
+        {label}
+      </Text>
+    </TouchableOpacity>
+  ))}
+</View>
+<View style={s.typDescBox}>
+  <Ionicons name="information-circle-outline" size={14} color={ACCENT} />
+  <Text style={s.typeDescTxt}>
+    {sectionForm.venueType === "gym"
+      ? "This section will show gym listings only."
+      : "This section will show turfs and courts (not gyms)."}
+  </Text>
+</View>
+
               {/* Title */}
               <Text style={s.fieldLabel}>Section Title *</Text>
               <TextInput style={s.input} placeholder="e.g. Cricket Turfs This Week" placeholderTextColor="#9CA3AF"
@@ -566,15 +641,18 @@ export default function AdminHomeControl() {
               <Text style={s.fieldLabel}>Section Type</Text>
               <View style={s.typeRow}>
                 {([
-                  { key: "nearby",   label: "📍 Near You",    desc: "GPS-sorted, nearest first" },
-                  { key: "all",      label: "🏟 All Venues",  desc: "Every turf, distance sorted" },
-                  { key: "manual",   label: "✋ Manual",      desc: "You pick & order turfs" },
-                  { key: "sport",    label: "⚽ By Sport",    desc: "Auto-filter by sport" },
-                  { key: "location", label: "📌 By Location", desc: "Auto-filter by city" },
-                  { key: "highlights", label: "🎁 Top Picks", desc: "Show highlight cards" },
-                ] as const).map(({ key, label, desc }) => (
-                  <TouchableOpacity
-                    key={key}
+  { key: "nearby",   label: "📍 Near You",    desc: "GPS-sorted, nearest first" },
+  { key: "all",      label: "🏟 All Venues",  desc: "Every venue, distance sorted" },
+  { key: "manual",   label: "✋ Manual",      desc: "You pick & order venues" },
+  { key: "sport",    label: "⚽ By Sport",    desc: "Auto-filter by sport" },
+  { key: "location", label: "📌 By Location", desc: "Auto-filter by city" },
+  { key: "highlights", label: "🎁 Top Picks", desc: "Show highlight cards" },
+] as const)
+  .filter(({ key }) => !(sectionForm.venueType === "gym" && key === "sport"))  // ✅ Hide sport for gyms
+  .map(({ key, label, desc }) => (
+  <TouchableOpacity
+    key={key}
+    
                     style={[s.typeBtn, sectionForm.type === key && s.typeBtnActive]}
                     onPress={() => setSectionForm(f => ({ ...f, type: key as SectionType }))}
                   >
@@ -637,51 +715,60 @@ export default function AdminHomeControl() {
 
               {/* Manual turf picker — only for manual */}
               {sectionForm.type === "manual" && (
-                <View>
-                  <View style={s.turfPickHeader}>
-                    <Text style={s.fieldLabel}>Turfs in this section ({sectionForm.turfIds.length})</Text>
-                    <TouchableOpacity style={s.pickMoreBtn} onPress={() => setTurfPickModal(true)}>
-                      <Ionicons name="add-circle-outline" size={16} color={ACCENT} />
-                      <Text style={s.pickMoreTxt}>Add Turf</Text>
-                    </TouchableOpacity>
-                  </View>
-                  <Text style={s.hint}>Use ↑ ↓ arrows to set the order users see them.</Text>
+  <View>
+    <View style={s.turfPickHeader}>
+      <Text style={s.fieldLabel}>
+        {sectionForm.venueType === "gym" ? "Gyms" : "Turfs"} in this section ({getVenueIds().length})
+      </Text>
+      <TouchableOpacity style={s.pickMoreBtn} onPress={() => setTurfPickModal(true)}>
+        <Ionicons name="add-circle-outline" size={16} color={ACCENT} />
+        <Text style={s.pickMoreTxt}>Add {sectionForm.venueType === "gym" ? "Gym" : "Turf"}</Text>
+      </TouchableOpacity>
+    </View>
+    <Text style={s.hint}>Use ↑ ↓ arrows to set the order users see them.</Text>
 
-                  {sectionForm.turfIds.length === 0 ? (
-                    <TouchableOpacity style={s.emptyTurfPick} onPress={() => setTurfPickModal(true)}>
-                      <Ionicons name="add-circle-outline" size={24} color={ACCENT} />
-                      <Text style={s.emptyTurfPickTxt}>Tap to pick turfs</Text>
-                    </TouchableOpacity>
-                  ) : (
-                    sectionForm.turfIds.map((id, i) => {
-                      const turfObj = turfs.find(t => t.id === id);
-                      const rating  = turfObj?.rating ? `⭐ ${turfObj.rating}` : null;
-                      return (
-                        <View key={id} style={s.turfOrderRow}>
-                          <View style={s.turfOrderNumBadge}>
-                            <Text style={s.turfOrderNumTxt}>{i + 1}</Text>
-                          </View>
-                          <View style={{ flex: 1 }}>
-                            <Text style={s.turfOrderRowName} numberOfLines={1}>{turfName(id)}</Text>
-                            {rating && <Text style={s.turfOrderRating}>{rating}</Text>}
-                          </View>
-                          <View style={s.turfOrderBtns}>
-                            <TouchableOpacity onPress={() => moveTurf(i, "up")} disabled={i === 0} style={[s.orderBtn, i === 0 && { opacity: 0.3 }]}>
-                              <Ionicons name="chevron-up" size={16} color={DARK} />
-                            </TouchableOpacity>
-                            <TouchableOpacity onPress={() => moveTurf(i, "down")} disabled={i === sectionForm.turfIds.length - 1} style={[s.orderBtn, i === sectionForm.turfIds.length - 1 && { opacity: 0.3 }]}>
-                              <Ionicons name="chevron-down" size={16} color={DARK} />
-                            </TouchableOpacity>
-                            <TouchableOpacity onPress={() => removeTurfFromSection(id)} style={[s.orderBtn, { backgroundColor: "#FEF2F2" }]}>
-                              <Ionicons name="close" size={14} color="#DC2626" />
-                            </TouchableOpacity>
-                          </View>
-                        </View>
-                      );
-                    })
-                  )}
-                </View>
-              )}
+    {getVenueIds().length === 0 ? (
+      <TouchableOpacity style={s.emptyTurfPick} onPress={() => setTurfPickModal(true)}>
+        <Ionicons name="add-circle-outline" size={24} color={ACCENT} />
+        <Text style={s.emptyTurfPickTxt}>
+          Tap to pick {sectionForm.venueType === "gym" ? "gyms" : "turfs"}
+        </Text>
+      </TouchableOpacity>
+    ) : (
+      getVenueIds().map((id, i) => {
+        // ✅ Look up from gyms or turfs based on venueType
+        const venueObj = sectionForm.venueType === "gym"
+          ? gyms.find(g => g.id === id)
+          : turfs.find(t => t.id === id);
+        const rating = venueObj?.rating ? `⭐ ${venueObj.rating}` : null;
+        return (
+          <View key={id} style={s.turfOrderRow}>
+            <View style={s.turfOrderNumBadge}>
+              <Text style={s.turfOrderNumTxt}>{i + 1}</Text>
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={s.turfOrderRowName} numberOfLines={1}>
+                {venueObj?.name || id.slice(0, 8) + "…"}
+              </Text>
+              {rating && <Text style={s.turfOrderRating}>{rating}</Text>}
+            </View>
+            <View style={s.turfOrderBtns}>
+              <TouchableOpacity onPress={() => moveTurf(i, "up")} disabled={i === 0} style={[s.orderBtn, i === 0 && { opacity: 0.3 }]}>
+                <Ionicons name="chevron-up" size={16} color={DARK} />
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => moveTurf(i, "down")} disabled={i === getVenueIds().length - 1} style={[s.orderBtn, i === getVenueIds().length - 1 && { opacity: 0.3 }]}>
+                <Ionicons name="chevron-down" size={16} color={DARK} />
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => removeTurfFromSection(id)} style={[s.orderBtn, { backgroundColor: "#FEF2F2" }]}>
+                <Ionicons name="close" size={14} color="#DC2626" />
+              </TouchableOpacity>
+            </View>
+          </View>
+        );
+      })
+    )}
+  </View>
+)}
 
               {/* Sport filter */}
               {sectionForm.type === "sport" && (
@@ -748,32 +835,48 @@ export default function AdminHomeControl() {
                 <Ionicons name="close" size={20} color="#374151" />
               </TouchableOpacity>
             </View>
-            <TextInput style={[s.input, { marginBottom: 10 }]} placeholder="Search turfs..." placeholderTextColor="#9CA3AF"
-              value={turfSearch} onChangeText={setTurfSearch} />
-            <FlatList
-              data={filteredTurfs}
+           <TextInput 
+  style={[s.input, { marginBottom: 10 }]} 
+  placeholder={`Search ${sectionForm.venueType === "gym" ? "gyms" : "turfs"}...`}
+  placeholderTextColor="#9CA3AF"
+  value={turfSearch} 
+  onChangeText={setTurfSearch} 
+/>
+<FlatList
+  data={
+    (sectionForm.venueType === "gym" ? gyms : turfs).filter(t =>
+      !turfSearch.trim() ||
+      (t.name || "").toLowerCase().includes(turfSearch.toLowerCase()) ||
+      (t.location || "").toLowerCase().includes(turfSearch.toLowerCase())
+    )
+  }
+  
               keyExtractor={t => t.id}
               style={{ maxHeight: 400 }}
               renderItem={({ item }) => {
-                const already = sectionForm.turfIds.includes(item.id);
-                return (
-                  <TouchableOpacity style={[s.turfPickRow, already && s.turfPickRowAdded]}
-                    onPress={() => already ? removeTurfFromSection(item.id) : addTurfToSection(item.id)}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={s.turfPickName}>{item.name || "Unnamed"}</Text>
-                      <Text style={s.turfPickMeta}>
-                        {item.sport} · {item.location}
-                        {item.rating ? ` · ⭐ ${item.rating}` : " · No rating"}
-                      </Text>
-                    </View>
-                    <Ionicons name={already ? "checkmark-circle" : "add-circle-outline"} size={22} color={already ? ACCENT : "#9CA3AF"} />
-                  </TouchableOpacity>
-                );
-              }}
+  const already = getVenueIds().includes(item.id);  // ✅ Use helper
+  return (
+    <TouchableOpacity 
+      style={[s.turfPickRow, already && s.turfPickRowAdded]}
+      onPress={() => already ? removeTurfFromSection(item.id) : addTurfToSection(item.id)}
+    >
+      <View style={{ flex: 1 }}>
+        <Text style={s.turfPickName}>{item.name || "Unnamed"}</Text>
+        <Text style={s.turfPickMeta}>
+          {sectionForm.venueType === "gym" 
+            ? `${item.location || "—"}${item.rating ? ` · ⭐ ${item.rating}` : ""}`
+            : `${item.sport} · ${item.location}${item.rating ? ` · ⭐ ${item.rating}` : " · No rating"}`
+          }
+        </Text>
+      </View>
+      <Ionicons name={already ? "checkmark-circle" : "add-circle-outline"} size={22} color={already ? ACCENT : "#9CA3AF"} />
+    </TouchableOpacity>
+  );
+}}
             />
-            <TouchableOpacity style={[s.saveBtn, { marginTop: 12 }]} onPress={() => setTurfPickModal(false)}>
-              <Text style={s.saveBtnTxt}>Done ({sectionForm.turfIds.length} selected)</Text>
-            </TouchableOpacity>
+           <TouchableOpacity style={[s.saveBtn, { marginTop: 12 }]} onPress={() => setTurfPickModal(false)}>
+  <Text style={s.saveBtnTxt}>Done ({getVenueIds().length} selected)</Text>
+</TouchableOpacity>
             <View style={{ height: 24 }} />
           </View>
         </View>

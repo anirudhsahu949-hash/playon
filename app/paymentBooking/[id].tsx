@@ -400,10 +400,27 @@ export default function BookingDetails() {
   const [booking,    setBooking]    = useState<Booking | null>(null);
   const [loading,    setLoading]    = useState(true);
   const [cancelling, setCancelling] = useState(false);
+  const [cancelWindowHours, setCancelWindowHours] = useState<number>(2); // default 2
 
   useEffect(() => {
-    fetchBooking();
-  }, []);
+  fetchBooking();
+  fetchCancelWindow();
+}, []);
+
+const fetchCancelWindow = async () => {
+  try {
+    const snap = await getDoc(doc(db, "appConfig", "booking"));
+    if (snap.exists()) {
+      const hours = Number(snap.data()?.cancellationWindowHours);
+      if (!isNaN(hours) && hours >= 0 && hours <= 24) {
+        setCancelWindowHours(hours);
+      }
+    }
+  } catch (e) {
+    console.log("fetchCancelWindow error:", e);
+    // Falls back to default 2
+  }
+};
 
   const fetchBooking = async () => {
     try {
@@ -454,17 +471,17 @@ export default function BookingDetails() {
     const bookingDateTime = new Date(booking.bookingDate);
     bookingDateTime.setHours(hour, minute, 0, 0);
 
-    const hoursLeft = (bookingDateTime.getTime() - Date.now()) / (1000 * 60 * 60);
-    return hoursLeft >= 2;
-  }, [booking]);
+  const hoursLeft = (bookingDateTime.getTime() - Date.now()) / (1000 * 60 * 60);
+return hoursLeft >= cancelWindowHours;  // ✅ Dynamic now
+}, [booking, cancelWindowHours]);
 
   const cancelBooking = async () => {
-    if (!canCancelBooking) {
-      return Alert.alert(
-        "Cancellation Closed",
-        "Bookings can only be cancelled at least 2 hours before the slot."
-      );
-    }
+  if (!canCancelBooking) {
+    return Alert.alert(
+      "Cancellation Closed",
+      `Bookings can only be cancelled at least ${cancelWindowHours} hours before the slot.`
+    );
+  }
     Alert.alert(
       "Cancel Booking",
       "Are you sure you want to cancel? Refund will be processed according to cancellation policy.",

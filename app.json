@@ -2,7 +2,7 @@
   "expo": {
     "name": "Playon",
     "slug": "bookora",
-    "version": "1.0.9",
+    "version": "1.0.10",
     "orientation": "portrait",
 
     "icon": "./assets/images/playon-icon-v15.png",
@@ -19,7 +19,7 @@
     },
 
     "android": {
-      "versionCode": 12,
+      "versionCode": 13,
       "googleServicesFile": "./google-services.json",
       "package": "com.playonnew.app",
       "softwareKeyboardLayoutMode": "pan",
@@ -48,7 +48,7 @@
       [
         "expo-notifications",
         {
-          "icon": "./assets/images/p-notification-v1.png",
+          "icon": "./assets/images/p-notification-v5.png",
           "color": "#000000",
           "iosDisplayInForeground": true,
           "defaultChannel": "bookora-default"
