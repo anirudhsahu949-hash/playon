@@ -1034,6 +1034,25 @@ export default function OwnerHome() {
           </View>
         )}
 
+        {/* ══ MY CUSTOMERS ════════════════════════════════════ */}
+        <TouchableOpacity
+          style={[ov.card, { backgroundColor: t.card, borderColor: t.border, marginHorizontal: 16, marginTop: 16, flexDirection: "row", alignItems: "center", gap: 14 }]}
+          onPress={() => router.push("/(owner)/customers" as any)}
+          activeOpacity={0.8}
+          accessibilityLabel="Open my customers"
+        >
+          <View style={{ width: 46, height: 46, borderRadius: 14, backgroundColor: "rgba(88,166,255,0.15)", justifyContent: "center", alignItems: "center" }}>
+            <Ionicons name="people-outline" size={22} color="#58A6FF" />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={{ color: t.text, fontSize: 15, fontWeight: "800" }}>My Customers</Text>
+            <Text style={{ color: t.textSub, fontSize: 11, fontWeight: "600", marginTop: 2 }}>
+              Saved customers · add, call or WhatsApp them
+            </Text>
+          </View>
+          <Ionicons name="chevron-forward" size={16} color={t.textMuted} />
+        </TouchableOpacity>
+
         {/* ══ OWNER GUIDE ═════════════════════════════════════ */}
         <TouchableOpacity
           style={[ov.card, { backgroundColor: t.card, borderColor: t.border, marginHorizontal: 16, marginTop: 16, flexDirection: "row", alignItems: "center", gap: 14 }]}

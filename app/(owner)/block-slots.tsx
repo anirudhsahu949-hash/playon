@@ -5,12 +5,17 @@
 // • Offline booking + recurring details: keyboard-safe on iPhone & Android,
 //   Save bar rides on top of the keyboard.
 // • Recurring wizard: 4 steps with progress bar, start-date stepper + calendar.
+// • NEW: after saving an offline booking, WhatsApp opens in the customer's
+//   chat with the booking confirmation typed in (toggle in the form).
+// • NEW: saved customers — recent chips, suggestions while typing, "All
+//   customers" opens the Customers screen to pick one, and a "Save to my
+//   customers" checkbox for new people (offline + recurring forms).
 // All Firestore reads/writes are unchanged from the previous version.
 
 import {
   View, Text, StyleSheet, FlatList, TouchableOpacity, Alert, StatusBar, ActivityIndicator,
   RefreshControl, TextInput, ScrollView, Platform, LayoutAnimation, UIManager, BackHandler,
-  Modal, KeyboardAvoidingView,
+  Modal, KeyboardAvoidingView, Pressable,
 } from "react-native";
 import { useRouter, useFocusEffect, useNavigation, useLocalSearchParams } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -20,6 +25,11 @@ import { auth, db } from "../../firebaseConfig";
 import {
   collection, getDocs, query, where, addDoc, deleteDoc, doc, serverTimestamp, updateDoc, writeBatch,
 } from "firebase/firestore";
+import { waNumber, buildBookingMessage, openWhatsApp } from "../../utils/whatsapp";
+import {
+  Customer, listCustomers, saveCustomer, recordCustomerBooking, findCustomer, searchCustomers,
+  customerMeta, onCustomerPicked,
+} from "../../utils/customers";
 
 // ─── Palette ──────────────────────────────────────────────────────────────────
 const BRAND = "#15803D";
@@ -34,6 +44,7 @@ const SLATE = "#475569";
 const MUTED = "#64748B";
 const FAINT = "#94A3B8";
 const LINE = "#E5E7EB";
+const WA_GREEN = "#25D366";
 
 const TONE = {
   free:    { bg: "#FFFFFF", border: "#E5E7EB", fg: INK },
@@ -198,7 +209,13 @@ export default function BlockSlots() {
   const [custNote, setCustNote] = useState("");
   const [custAmount, setCustAmount] = useState("");
   const [remainingAmount, setRemainingAmount] = useState("");
+  const [sendWA, setSendWA] = useState(false);
+  const [saveCust, setSaveCust] = useState(false);
   const [pendingDocId, setPendingDocId] = useState<string | null>(null);
+
+  // saved customers
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  const refreshCustomers = () => listCustomers().then(setCustomers).catch(() => {});
   const selectedDateKey = useMemo(() => selectedDate.toDateString(), [selectedDate]);
 
   const [showSeries, setShowSeries] = useState(false);
@@ -219,6 +236,7 @@ export default function BlockSlots() {
   const [recurCustPhone, setRecurCustPhone] = useState("");
   const [recurAmountPerSession, setRecurAmountPerSession] = useState("");
   const [recurNote, setRecurNote] = useState("");
+  const [recurSaveCust, setRecurSaveCust] = useState(false);
   const [recurSeriesLabel, setRecurSeriesLabel] = useState("");
   const [recurChecking, setRecurChecking] = useState(false);
   const [recurPreview, setRecurPreview] = useState<RecurPreviewDate[]>([]);
@@ -239,8 +257,10 @@ export default function BlockSlots() {
     (navigation as any).setOptions?.({ gestureEnabled: screen === "main" && !actionOpen });
   }, [navigation, screen, actionOpen]);
 
-  // Android back: step back inside this screen
-  useEffect(() => {
+  // Android back: step back inside this screen.
+  // Only while this screen is in front — otherwise Back on the Customers
+  // screen (opened from the form) would cancel the booking underneath.
+  useFocusEffect(useCallback(() => {
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
       if (actionOpen) { setActionOpen(false); return true; }
       if (screen === "recurring") { recurBack(); return true; }
@@ -248,10 +268,12 @@ export default function BlockSlots() {
       return false;
     });
     return () => sub.remove();
-  }, [screen, recurStep, pendingDocId, actionOpen]);
+  }, [screen, recurStep, pendingDocId, actionOpen]));
 
   // ─── Data ──────────────────────────────────────────────────────────────────
   useEffect(() => { loadTurfs(); fetchSeries(); }, []);
+  // reload saved customers every time this screen comes back into view
+  useFocusEffect(useCallback(() => { refreshCustomers(); }, []));
 
   // Apply turf/date sent from Schedule (also when the screen is already open)
   useEffect(() => {
@@ -418,7 +440,31 @@ export default function BlockSlots() {
   function clearSelection() {
     setSelectedQuickSlots([]); setFlexStart(null); setFlexEnd(null); setActivePanel("from");
   }
-  function clearForm() { setCustName(""); setCustPhone(""); setCustNote(""); setCustAmount(""); setRemainingAmount(""); }
+  function clearForm() {
+    setCustName(""); setCustPhone(""); setCustNote(""); setCustAmount(""); setRemainingAmount(""); setSendWA(false); setSaveCust(false);
+  }
+
+  // ─── Saved customers ───────────────────────────────────────────────────────
+  /** Opens the Customers screen in pick mode; the picked customer fills the form */
+  function openCustomerPicker(target: "offline" | "recur") {
+    onCustomerPicked(c => {
+      if (target === "offline") { setCustName(c.name); setCustPhone(c.phone || ""); }
+      else { setRecurCustName(c.name); setRecurCustPhone(c.phone || ""); }
+      refreshCustomers();
+    });
+    const typed = target === "offline" ? custName : recurCustName;
+    router.push({ pathname: "/(owner)/customers", params: { pick: "1", q: typed.trim() } } as any);
+  }
+
+  /** After a booking is saved: +1 for a saved customer, or save a new one if ticked */
+  async function rememberCustomer(name: string, phone: string, wantSave: boolean) {
+    try {
+      const match = findCustomer(customers, name, phone);
+      if (match) await recordCustomerBooking(match.id);
+      else if (wantSave && name.trim()) await saveCustomer({ name, phone }, { countBooking: true });
+      refreshCustomers();
+    } catch { /* not critical — the booking itself is already saved */ }
+  }
 
   // ─── Save actions ──────────────────────────────────────────────────────────
   async function saveBlock() {
@@ -470,24 +516,60 @@ export default function BlockSlots() {
   async function saveOfflineBooking() {
     if (!pendingDocId) return;
     if (!custName.trim()) return Alert.alert("Name required", "Please enter the customer name.");
+
+    const phone = custPhone.trim();
+    if (phone && !waNumber(phone)) {
+      return Alert.alert("Check phone number", "Enter a valid 10-digit mobile number, or leave it empty.");
+    }
+
+    const total = Number(custAmount.trim()) || 0;
+    const due = Number(remainingAmount.trim()) || 0;
+    const shouldSend = sendWA && !!phone;
+
+    // Build the message now — the selection gets cleared after saving
+    const waText = buildBookingMessage({
+      name: custName.trim(),
+      turfName: selectedTurf?.name,
+      dateTxt: fmtDay(selectedDate),
+      timeTxt: selectedStart !== null && selectedEnd !== null ? rangeShort(selectedStart, selectedEnd) : "",
+      total, paid: Math.max(0, total - due), due,
+    });
+
     setSaving(true);
     try {
       await updateDoc(doc(db, "blockedSlots", pendingDocId), {
         type: "offline", pending: false,
-        customerName: custName.trim(), customerPhone: custPhone.trim(), note: custNote.trim(),
-        amount: Number(custAmount.trim()) || 0, remainingAmount: Number(remainingAmount.trim()) || 0,
+        customerName: custName.trim(), customerPhone: phone, note: custNote.trim(),
+        amount: total, remainingAmount: due,
       });
+      rememberCustomer(custName.trim(), phone, saveCust); // runs in the background
       const savedId = pendingDocId;
       setPendingDocId(null);
       clearForm(); clearSelection(); setScreen("main");
       await fetchDayData();
-      Alert.alert("Booking done", "Offline booking saved.", [
-        { text: "OK", style: "cancel" },
-        {
-          text: "View receipt",
-          onPress: () => router.push({ pathname: "/(owner)/booking-receipt/offline-receipt", params: { id: savedId } } as any),
-        },
-      ]);
+
+      // Open WhatsApp in the customer's chat with the confirmation typed in
+      let opened = false;
+      if (shouldSend) {
+        opened = await openWhatsApp(phone, waText);
+        if (opened) {
+          updateDoc(doc(db, "blockedSlots", savedId), { whatsappSent: true, whatsappSentAt: serverTimestamp() }).catch(() => {});
+        }
+      }
+
+      Alert.alert(
+        "Booking done",
+        !shouldSend ? "Offline booking saved."
+          : opened ? "Offline booking saved. WhatsApp is open — just tap send."
+          : "Booking saved, but WhatsApp couldn't open. You can resend it from Bookings.",
+        [
+          { text: "OK", style: "cancel" },
+          {
+            text: "View receipt",
+            onPress: () => router.push({ pathname: "/(owner)/booking-receipt/offline-receipt", params: { id: savedId } } as any),
+          },
+        ]
+      );
     } catch {
       Alert.alert("Error", "Something went wrong.");
     } finally {
@@ -628,7 +710,7 @@ export default function BlockSlots() {
     setRecurFlexStart(null); setRecurFlexEnd(null); setRecurDays([]); setRecurStart(new Date());
     setRecurCalOpen(true); setRecurOccurrences(4); setRecurType("offline");
     setRecurCustName(""); setRecurCustPhone(""); setRecurAmountPerSession(""); setRecurNote(""); setRecurSeriesLabel("");
-    setRecurPreview([]);
+    setRecurPreview([]); setRecurSaveCust(false);
   }
   function recurBack() {
     if (recurStep > 1) { setRecurStep(s => (s - 1) as RecurStep); return; }
@@ -663,6 +745,7 @@ export default function BlockSlots() {
         });
       });
       await batch.commit();
+      if (recurType === "offline") rememberCustomer(recurCustName.trim(), recurCustPhone.trim(), recurSaveCust);
       const skipped = recurPreview.length - included.length;
       resetRecurWizard();
       await Promise.all([fetchDayData(), fetchSeries()]);
@@ -747,6 +830,8 @@ export default function BlockSlots() {
   if (screen === "offline") {
     const amt = Number(custAmount) || 0, rem = Number(remainingAmount) || 0;
     const paid = amt > 0 ? Math.max(0, amt - rem) : 0;
+    const phoneTyped = !!custPhone.trim();
+    const phoneValid = !!waNumber(custPhone);
     return (
       <KeyboardAvoidingView style={s.safe} behavior={Platform.OS === "ios" ? "padding" : undefined}>
         <StatusBar barStyle="light-content" backgroundColor={BRAND} />
@@ -759,8 +844,26 @@ export default function BlockSlots() {
             <Text style={s.kicker}>CUSTOMER</Text>
             <View style={s.row2}>
               <Field label="Name *" value={custName} onChange={setCustName} placeholder="Customer name" autoCapitalize="words" />
-              <Field label="Phone" value={custPhone} onChange={setCustPhone} placeholder="Optional" keyboardType="phone-pad" />
+              <Field label="Phone or whatsapp" value={custPhone} onChange={setCustPhone} placeholder="(optional)" keyboardType="phone-pad" />
             </View>
+            <CustomerAssist customers={customers} name={custName} phone={custPhone}
+              onPick={c => { setCustName(c.name); setCustPhone(c.phone || ""); }}
+              onBrowse={() => openCustomerPicker("offline")}
+              save={saveCust} onToggleSave={() => setSaveCust(v => !v)} />
+            {phoneTyped && (
+              <TouchableOpacity style={[s.waRow, !sendWA && { backgroundColor: "#F8FAFC", borderColor: LINE }]}
+                onPress={() => setSendWA(v => !v)} activeOpacity={0.8}
+                accessibilityRole="checkbox" accessibilityState={{ checked: sendWA }}>
+                <Ionicons name="logo-whatsapp" size={18} color={WA_GREEN} />
+                <View style={{ flex: 1 }}>
+                  <Text style={s.waTxt}>Send confirmation on WhatsApp</Text>
+                  {!phoneValid && <Text style={s.waWarn}>Enter a valid 10-digit mobile number</Text>}
+                </View>
+                <View style={[s.check, sendWA && s.waCheckOn]}>
+                  {sendWA && <Ionicons name="checkmark" size={15} color="#fff" />}
+                </View>
+              </TouchableOpacity>
+            )}
           </View>
 
           <View style={s.card}>
@@ -790,7 +893,12 @@ export default function BlockSlots() {
             <Text style={s.ghostTxt}>Cancel</Text>
           </TouchableOpacity>
           <TouchableOpacity style={[s.primaryBtn, { flex: 2 }, saving && { opacity: 0.6 }]} onPress={saveOfflineBooking} disabled={saving}>
-            {saving ? <ActivityIndicator color="#fff" /> : (<><Ionicons name="checkmark" size={18} color="#fff" /><Text style={s.primaryTxt}>Save booking</Text></>)}
+            {saving ? <ActivityIndicator color="#fff" /> : (
+              <>
+                <Ionicons name={phoneTyped && sendWA ? "logo-whatsapp" : "checkmark"} size={18} color="#fff" />
+                <Text style={s.primaryTxt}>{phoneTyped && sendWA ? "Save & send" : "Save booking"}</Text>
+              </>
+            )}
           </TouchableOpacity>
         </View>
       </KeyboardAvoidingView>
@@ -998,6 +1106,10 @@ export default function BlockSlots() {
                   <Field label="Name *" value={recurCustName} onChange={setRecurCustName} placeholder="Customer name" autoCapitalize="words" />
                   <Field label="Phone" value={recurCustPhone} onChange={setRecurCustPhone} placeholder="Optional" keyboardType="phone-pad" />
                 </View>
+                <CustomerAssist customers={customers} name={recurCustName} phone={recurCustPhone}
+                  onPick={c => { setRecurCustName(c.name); setRecurCustPhone(c.phone || ""); }}
+                  onBrowse={() => openCustomerPicker("recur")}
+                  save={recurSaveCust} onToggleSave={() => setRecurSaveCust(v => !v)} />
                 <View style={[s.rowEnd, { marginTop: 10 }]}>
                   <View style={{ flex: 1 }}>
                     <Field label="Amount per session" value={recurAmountPerSession} onChange={v => setRecurAmountPerSession(v.replace(/[^0-9]/g, ""))}
@@ -1116,6 +1228,9 @@ export default function BlockSlots() {
             <Text style={s.hKicker}>SLOT PANEL</Text>
             <Text style={s.hTitle}>Block Slots</Text>
           </View>
+          <TouchableOpacity style={s.hIconBtn} onPress={() => router.push("/(owner)/customers" as any)} activeOpacity={0.85} accessibilityLabel="Saved customers">
+            <Ionicons name="people-outline" size={18} color="#fff" />
+          </TouchableOpacity>
           <TouchableOpacity style={s.scheduleBtn} onPress={() => router.push("/(owner)/schedule" as any)} activeOpacity={0.85}>
             <Ionicons name="list" size={15} color="#fff" />
             <Text style={s.scheduleTxt}>Schedule</Text>
@@ -1431,15 +1546,102 @@ function Field({ label, value, onChange, placeholder, keyboardType, prefix, tone
   autoCapitalize?: "none" | "words" | "sentences"; onFocus?: () => void;
 }) {
   const due = tone === "due";
+  const inputRef = useRef<TextInput>(null);
+  const [focused, setFocused] = useState(false);
+  // Tapping anywhere on the label or box (not just the text line) opens the keyboard
+  const focusInput = () => inputRef.current?.focus();
   return (
-    <View style={{ flex: 1, minWidth: 0 }}>
+    <Pressable style={{ flex: 1, minWidth: 0 }} onPress={focusInput} accessible={false}>
       <Text style={s.fieldLabel}>{label}</Text>
-      <View style={[s.inputWrap, due && { backgroundColor: "#FFF7ED", borderColor: "#FED7AA" }]}>
-        {!!prefix && <Text style={[s.prefix, due && { color: "#C2410C" }]}>{prefix}</Text>}
-        <TextInput value={value} onChangeText={onChange} placeholder={placeholder} placeholderTextColor={FAINT}
-          keyboardType={keyboardType || "default"} autoCapitalize={autoCapitalize} onFocus={onFocus}
+      <View style={[s.inputWrap, due && { backgroundColor: "#FFF7ED", borderColor: "#FED7AA" }, focused && s.inputWrapOn]}>
+        {!!prefix && <Text style={[s.prefix, due && { color: "#C2410C" }]} onPress={focusInput}>{prefix}</Text>}
+        <TextInput ref={inputRef} value={value} onChangeText={onChange} placeholder={placeholder} placeholderTextColor={FAINT}
+          keyboardType={keyboardType || "default"} autoCapitalize={autoCapitalize}
+          onFocus={() => { setFocused(true); onFocus?.(); }} onBlur={() => setFocused(false)}
           returnKeyType="done" style={[s.inputInner, due && { color: "#9A3412" }]} />
       </View>
+    </Pressable>
+  );
+}
+
+/**
+ * Saved-customer helper under the Name / Phone fields.
+ * • Nothing typed     → recent customers as chips + "All customers"
+ * • Matches a saved   → "✓ Saved customer · 6 bookings"
+ * • Typing, new person → suggestions, "Find in saved customers", and the
+ *                        "Save to my customers" checkbox (asked every time)
+ */
+function CustomerAssist({ customers, name, phone, onPick, onBrowse, save, onToggleSave }: {
+  customers: Customer[]; name: string; phone: string;
+  onPick: (c: Customer) => void; onBrowse: () => void; save: boolean; onToggleSave: () => void;
+}) {
+  const typedName = name.trim(), typedPhone = phone.trim();
+  const match = findCustomer(customers, name, phone);
+
+  // 1) Already a saved customer
+  if (match) {
+    return (
+      <View style={s.custMatch}>
+        <Ionicons name="checkmark-circle" size={17} color={ACCENT_DARK} />
+        <Text style={s.custMatchTxt} numberOfLines={1}>Saved customer · {customerMeta(match)}</Text>
+      </View>
+    );
+  }
+
+  // 2) Nothing typed yet → recent chips
+  if (!typedName && !typedPhone) {
+    const recent = customers.slice(0, 5);
+    return (
+      <View style={{ marginTop: 10 }}>
+        <Text style={s.custLbl}>{recent.length ? "RECENT CUSTOMERS" : "SAVED CUSTOMERS"}</Text>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} keyboardShouldPersistTaps="handled" contentContainerStyle={{ gap: 6 }}>
+          {recent.map(c => (
+            <TouchableOpacity key={c.id} style={s.custChip} onPress={() => onPick(c)} accessibilityLabel={`Use ${c.name}`}>
+              <Ionicons name="person-circle-outline" size={16} color={ACCENT_DARK} />
+              <Text style={s.custChipTxt} numberOfLines={1}>{c.name.split(" ")[0]}</Text>
+            </TouchableOpacity>
+          ))}
+          <TouchableOpacity style={[s.custChip, s.custChipAll]} onPress={onBrowse}>
+            <Ionicons name="people-outline" size={15} color="#fff" />
+            <Text style={[s.custChipTxt, { color: "#fff" }]}>{recent.length ? "All customers" : "Open customers"}</Text>
+          </TouchableOpacity>
+        </ScrollView>
+      </View>
+    );
+  }
+
+  // 3) Typing someone new → suggestions + save checkbox
+  const q = typedName.length >= 2 ? typedName : typedPhone;
+  const suggestions = q.length >= 2 ? searchCustomers(customers, q, 4) : [];
+  return (
+    <View style={{ marginTop: 10, gap: 6 }}>
+      {suggestions.map(c => (
+        <TouchableOpacity key={c.id} style={s.custSug} onPress={() => onPick(c)} accessibilityLabel={`Use ${c.name}`}>
+          <Ionicons name="person-circle-outline" size={20} color={ACCENT_DARK} />
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={s.custSugName} numberOfLines={1}>{c.name}</Text>
+            <Text style={s.custSugMeta} numberOfLines={1}>{c.phone || "No phone"} · {customerMeta(c)}</Text>
+          </View>
+          <Text style={s.custUse}>Use</Text>
+        </TouchableOpacity>
+      ))}
+      <TouchableOpacity style={s.custBrowse} onPress={onBrowse}>
+        <Ionicons name="search" size={14} color={ACCENT_DARK} />
+        <Text style={s.custBrowseTxt} numberOfLines={1}>
+          {suggestions.length ? "Not them? Find in saved customers" : typedName ? `No saved "${typedName}" · Find in saved customers` : "Find in saved customers"}
+        </Text>
+        <Ionicons name="chevron-forward" size={14} color={ACCENT_DARK} />
+      </TouchableOpacity>
+      {!!typedName && (
+        <TouchableOpacity style={[s.custSave, save && s.custSaveOn]} onPress={onToggleSave} activeOpacity={0.8}
+          accessibilityRole="checkbox" accessibilityState={{ checked: save }}>
+          <Ionicons name="person-add-outline" size={17} color={save ? ACCENT_DARK : MUTED} />
+          <Text style={s.custSaveTxt} numberOfLines={1}>Save {typedName.split(" ")[0]} to my customers</Text>
+          <View style={[s.check, save && s.checkOn]}>
+            {save && <Ionicons name="checkmark" size={15} color="#fff" />}
+          </View>
+        </TouchableOpacity>
+      )}
     </View>
   );
 }
@@ -1584,7 +1786,7 @@ const s = StyleSheet.create({
   monthChipTxt: { fontSize: 12, fontWeight: "800", color: "#374151" },
   calBtn: { height: 34, flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 11, borderRadius: 999, borderWidth: 1, borderColor: ACCENT_BORDER, backgroundColor: "#F0FDF4" },
   calBtnTxt: { fontSize: 12, fontWeight: "800", color: ACCENT_DARK },
-  dateCard: { width: 48, paddingVertical: 7, borderRadius: 12, borderWidth: 1, borderColor: LINE, alignItems: "center", backgroundColor: "#fff" },
+  dateCard: { width: 48,height:55, paddingVertical: 7, borderRadius: 12, borderWidth: 1, borderColor: LINE, alignItems: "center", backgroundColor: "#fff" },
   dateCardOn: { backgroundColor: ACCENT_DARK, borderColor: ACCENT_DARK },
   dateDow: { fontSize: 10, fontWeight: "800", color: MUTED },
   dateNum: { fontSize: 17, fontWeight: "900", color: INK, marginTop: 1 },
@@ -1646,9 +1848,11 @@ const s = StyleSheet.create({
   // forms
   formBody: { padding: 14, gap: 10, paddingBottom: 24 },
   fieldLabel: { fontSize: 12, fontWeight: "800", color: "#334155", marginBottom: 5 },
-  inputWrap: { flexDirection: "row", alignItems: "center", height: 46, borderRadius: 12, borderWidth: 1, borderColor: LINE, backgroundColor: "#F8FAFC", paddingHorizontal: 12, gap: 4 },
-  prefix: { fontSize: 15, fontWeight: "800", color: MUTED },
-  inputInner: { flex: 1, minWidth: 0, fontSize: 15, fontWeight: "700", color: INK, paddingVertical: 0 },
+  inputWrap: { flexDirection: "row", alignItems: "stretch", height: 48, borderRadius: 12, borderWidth: 1, borderColor: LINE, backgroundColor: "#F8FAFC", paddingHorizontal: 12, gap: 4 },
+  inputWrapOn: { borderColor: ACCENT, borderWidth: 1.5, backgroundColor: "#fff" },
+  prefix: { fontSize: 15, fontWeight: "800", color: MUTED, alignSelf: "center" },
+  // fills the whole box height so the full box is the tap area
+  inputInner: { flex: 1, minWidth: 0, height: "100%", fontSize: 15, fontWeight: "700", color: INK, paddingVertical: 0, textAlignVertical: "center" },
   input: { borderRadius: 12, borderWidth: 1, borderColor: LINE, backgroundColor: "#F8FAFC", paddingHorizontal: 12, paddingVertical: 10, fontSize: 14.5, color: INK },
   textArea: { minHeight: 76 },
   payRow: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 10 },
@@ -1659,6 +1863,30 @@ const s = StyleSheet.create({
   totalBox: { height: 46, borderRadius: 12, backgroundColor: "#F0FDF4", paddingHorizontal: 12, justifyContent: "center" },
   totalLbl: { fontSize: 10, fontWeight: "800", color: ACCENT_DARK },
   totalVal: { fontSize: 15, fontWeight: "900", color: ACCENT_DARK },
+
+  // saved customers
+  hIconBtn: { width: 40, height: 40, borderRadius: 12, borderWidth: 1, borderColor: "rgba(255,255,255,0.4)", alignItems: "center", justifyContent: "center" },
+  custLbl: { fontSize: 10.5, letterSpacing: 0.9, fontWeight: "800", color: MUTED, marginBottom: 6 },
+  custChip: { height: 36, flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 12, borderRadius: 999, borderWidth: 1, borderColor: ACCENT_BORDER, backgroundColor: "#F0FDF4", maxWidth: 150 },
+  custChipAll: { backgroundColor: ACCENT_DARK, borderColor: ACCENT_DARK },
+  custChipTxt: { fontSize: 12.5, fontWeight: "800", color: ACCENT_DARK, flexShrink: 1 },
+  custMatch: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 10, paddingHorizontal: 10, paddingVertical: 8, borderRadius: 11, backgroundColor: "#F0FDF4" },
+  custMatchTxt: { flex: 1, fontSize: 12.5, fontWeight: "800", color: ACCENT_DARK },
+  custSug: { flexDirection: "row", alignItems: "center", gap: 10, minHeight: 50, paddingHorizontal: 10, borderRadius: 12, borderWidth: 1, borderColor: LINE, backgroundColor: "#fff" },
+  custSugName: { fontSize: 13.5, fontWeight: "900", color: INK },
+  custSugMeta: { fontSize: 11, fontWeight: "600", color: MUTED },
+  custUse: { fontSize: 12.5, fontWeight: "900", color: ACCENT_DARK, paddingHorizontal: 6 },
+  custBrowse: { flexDirection: "row", alignItems: "center", gap: 6, minHeight: 40, paddingHorizontal: 10, borderRadius: 11, borderWidth: 1, borderStyle: "dashed", borderColor: ACCENT_BORDER },
+  custBrowseTxt: { flex: 1, fontSize: 12.5, fontWeight: "800", color: ACCENT_DARK },
+  custSave: { flexDirection: "row", alignItems: "center", gap: 10, padding: 10, borderRadius: 12, borderWidth: 1, borderColor: LINE, backgroundColor: "#F8FAFC" },
+  custSaveOn: { backgroundColor: "#F0FDF4", borderColor: ACCENT_BORDER },
+  custSaveTxt: { flex: 1, fontSize: 13, fontWeight: "800", color: INK },
+
+  // whatsapp toggle
+  waRow: { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 12, padding: 10, borderRadius: 12, backgroundColor: "#F0FDF4", borderWidth: 1, borderColor: ACCENT_BORDER },
+  waTxt: { fontSize: 13, fontWeight: "800", color: INK },
+  waWarn: { fontSize: 11, fontWeight: "700", color: "#B91C1C", marginTop: 2 },
+  waCheckOn: { backgroundColor: WA_GREEN, borderColor: WA_GREEN },
 
   // recurring
   dayPill: { flex: 1, height: 46, borderRadius: 12, borderWidth: 1, borderColor: LINE, backgroundColor: "#fff", alignItems: "center", justifyContent: "center" },

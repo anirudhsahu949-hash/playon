@@ -6,6 +6,7 @@
  * • Bookings grouped by date; Done & Cancelled show newest first
  * • Cancel + Reschedule flows kept (same server endpoints), reschedule now
  *   has a calendar and supports late-night hours
+ * • NEW: WhatsApp button on walk-in cards (re)sends the booking confirmation
  * Bug fixes: walk-in amounts, half-saved walk-ins hidden, late-night status,
  * reschedule duration, auto-refreshing status, safe areas on iPhone/Android.
  */
@@ -16,9 +17,10 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useEffect, useMemo, useState } from "react";
 import { db, auth } from "../../firebaseConfig";
-import { collection, getDocs, query, where, deleteDoc, updateDoc, doc } from "firebase/firestore";
+import { collection, getDocs, query, where, deleteDoc, updateDoc, doc, serverTimestamp } from "firebase/firestore";
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
+import { buildBookingMessage, openWhatsApp } from "../../utils/whatsapp";
 
 const SERVER_URL = "https://bookora-backend-95u4.onrender.com";
 const DAY_MS = 86400000;
@@ -36,6 +38,7 @@ const FAINT = "#94A3B8";
 const LINE = "#E5E7EB";
 const GREEN_TINT = "#F0FDF4";
 const GREEN_BORDER = "#BBF7D0";
+const WA_GREEN = "#25D366";
 
 const KIND = {
   app:     { label: "Online",  bar: "#3B82F6", tint: "#EFF6FF", text: "#1D4ED8" },
@@ -72,6 +75,7 @@ interface Booking {
   isOffline?: boolean;
   paymentId?: string;
   rescheduled?: boolean;
+  whatsappSent?: boolean;
   createdAt?: any;
 }
 interface Turf { id: string; name?: string; openingTime?: number; closingTime?: number; }
@@ -264,18 +268,19 @@ export default function OwnerBookings() {
       offlineSnap.docs.forEach(d => {
         const raw: any = d.data();
         if (raw.pending === true) return; // FIX: half-saved walk-in (form not finished)
-        const advance = Number(raw.amount || 0);
-        const remaining = Number(raw.remainingAmount || 0);
+        // The walk-in form saves amount = TOTAL and remainingAmount = still to collect
+        const total = Number(raw.amount || 0);
+        const remaining = Math.min(Number(raw.remainingAmount || 0), total || Infinity);
+        const paid = Math.max(total - remaining, 0);
         offline.push({
           id: d.id, source: "offline", isOffline: true,
           turfName: raw.turfName || "", turfId: raw.turfId || "",
           customerName: raw.customerName || "Walk-in", customerPhone: raw.customerPhone || "",
           date: raw.date || raw.dateString || "", dateString: raw.date || raw.dateString || "",
           selectedSlots: Array.isArray(raw.slots) ? raw.slots : raw.slotTime ? [raw.slotTime] : [],
-          // FIX: amount = advance taken, remainingAmount = still to collect
-          totalAmount: advance + remaining, advanceAmount: advance, remainingAmount: remaining,
+          totalAmount: total, advanceAmount: paid, remainingAmount: remaining,
           status: "confirmed", paymentStatus: remaining > 0 ? "partial" : "fully_paid",
-          rescheduled: !!raw.rescheduled, createdAt: raw.createdAt,
+          rescheduled: !!raw.rescheduled, whatsappSent: !!raw.whatsappSent, createdAt: raw.createdAt,
         });
       });
       setBookings([...app, ...offline]);
@@ -377,6 +382,27 @@ export default function OwnerBookings() {
   const openReceipt = (b: Booking) => {
     if (b.source === "offline") router.push({ pathname: "/(owner)/booking-receipt/offline-receipt", params: { id: b.id } } as any);
     else router.push({ pathname: "/(owner)/booking-receipt/[id]", params: { id: b.id } } as any);
+  };
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // WHATSAPP CONFIRMATION (walk-ins)
+  // ══════════════════════════════════════════════════════════════════════════
+  const sendWhatsApp = async (b: Prepared) => {
+    const text = buildBookingMessage({
+      name: b.customerName,
+      turfName: b.turfName,
+      dateTxt: new Date(b._day).toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short" }),
+      timeTxt: rangeM(b._start, b._end),
+      total: getTotal(b), paid: getPaid(b), due: getRemaining(b),
+      updated: b.rescheduled,
+    });
+    const ok = await openWhatsApp(b.customerPhone || "", text);
+    if (ok) {
+      updateDoc(doc(db, "blockedSlots", b.id), { whatsappSent: true, whatsappSentAt: serverTimestamp() }).catch(() => {});
+      setBookings(list => list.map(x => (x.id === b.id && x.source === "offline" ? { ...x, whatsappSent: true } : x)));
+    } else {
+      Alert.alert("Couldn't open WhatsApp", "Check the customer's number, and that WhatsApp is installed on this phone.");
+    }
   };
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -639,6 +665,7 @@ export default function OwnerBookings() {
     const stateTxt = d === "cancelled" ? "Cancelled" : live ? "● LIVE" : d === "completed" ? "Done" : "Upcoming";
     const stateSty = d === "cancelled" ? { bg: "#FEF2F2", fg: "#B91C1C" } : live ? { bg: "#DCFCE7", fg: BRAND } : d === "completed" ? { bg: "#F1F5F9", fg: MUTED } : { bg: "#EFF6FF", fg: "#1D4ED8" };
     const created = fmtCreated(b.createdAt);
+    const canWA = b.source === "offline" && !!b.customerPhone && d !== "cancelled";
     return (
       <TouchableOpacity activeOpacity={0.85} onPress={() => openReceipt(b)}
         style={[st.card, d === "cancelled" && { opacity: 0.7 }, live && st.cardLive]}>
@@ -662,6 +689,12 @@ export default function OwnerBookings() {
                 <View style={[st.pill, { backgroundColor: "#F5F3FF" }]}>
                   <Ionicons name="swap-horizontal" size={10} color="#6D28D9" />
                   <Text style={[st.pillTxt, { color: "#6D28D9" }]}>Rescheduled</Text>
+                </View>
+              )}
+              {b.source === "offline" && b.whatsappSent && (
+                <View style={[st.pill, { backgroundColor: "#ECFDF5" }]}>
+                  <Ionicons name="logo-whatsapp" size={10} color="#047857" />
+                  <Text style={[st.pillTxt, { color: "#047857" }]}>Sent</Text>
                 </View>
               )}
             </View>
@@ -690,6 +723,11 @@ export default function OwnerBookings() {
             <Ionicons name="receipt-outline" size={14} color={INK} />
             <Text style={st.actTxt}>Receipt</Text>
           </TouchableOpacity>
+          {canWA && (
+            <TouchableOpacity style={st.waBtn} onPress={() => sendWhatsApp(b)} accessibilityLabel="Send confirmation on WhatsApp">
+              <Ionicons name="logo-whatsapp" size={18} color="#fff" />
+            </TouchableOpacity>
+          )}
           {d === "upcoming" && (
             <>
               <TouchableOpacity style={[st.actBtn, { backgroundColor: KIND.app.tint, borderColor: "#BFDBFE" }]} onPress={() => openReschedule(b)}>
@@ -1084,6 +1122,7 @@ const st = StyleSheet.create({
   actRow: { flexDirection: "row", gap: 8, marginTop: 12 },
   actBtn: { flex: 1, height: 40, borderRadius: 11, borderWidth: 1, borderColor: "#E2E8F0", backgroundColor: "#fff", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 5 },
   actTxt: { fontSize: 12.5, fontWeight: "800", color: INK },
+  waBtn: { width: 44, height: 40, borderRadius: 11, backgroundColor: WA_GREEN, alignItems: "center", justifyContent: "center" },
   created: { fontSize: 10.5, fontWeight: "600", color: FAINT, marginTop: 8 },
 
   empty: { alignItems: "center", paddingTop: 40, paddingHorizontal: 36 },
