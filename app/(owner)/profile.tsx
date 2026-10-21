@@ -6,7 +6,7 @@ import {
   TouchableOpacity,
   ActivityIndicator,
   ScrollView,
-  SafeAreaView,
+  
   StatusBar,
   RefreshControl,
   Alert,
@@ -14,7 +14,9 @@ import {
   TextInput,
   Platform,
   Switch,
+  KeyboardAvoidingView,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useEffect, useState } from "react";
 import { auth, db } from "../../firebaseConfig";
 import {
@@ -42,6 +44,14 @@ type OwnerUser = {
   businessName?: string;
   location?: string;
   description?: string;
+  banking?: {                    // ← ADD THIS
+    accountNo?: string;
+    ifsc?: string;
+    name?: string;
+    upi?: string | null;
+    verified?: boolean;
+    updatedAt?: any;
+  };
 };
 
 type Operator = {
@@ -69,6 +79,7 @@ function initials(name: string) {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 export default function OwnerProfile() {
+  const insets = useSafeAreaInsets();
   const router = useRouter();
 
   const [user, setUser]             = useState<OwnerUser | null>(null);
@@ -86,6 +97,14 @@ export default function OwnerProfile() {
   const [opTurfId, setOpTurfId]       = useState("");
   const [showOpPw, setShowOpPw]       = useState(false);
   const [opSaving, setOpSaving]       = useState(false);
+
+  // ── Banking Details Modal
+const [showBankModal, setShowBankModal] = useState(false);
+const [bankAccount, setBankAccount] = useState("");
+const [bankIfsc, setBankIfsc] = useState("");
+const [bankName, setBankName] = useState("");
+const [bankUpi, setBankUpi] = useState("");
+const [bankSaving, setBankSaving] = useState(false);
 
   
 
@@ -187,6 +206,77 @@ export default function OwnerProfile() {
     }
   };
 
+
+  // ── Validate Bank Details ─────────────────────────────────────────────
+const validateBankDetails = (): string | null => {
+  const accountNo = bankAccount.trim();
+  const ifsc = bankIfsc.trim().toUpperCase();
+  const name = bankName.trim();
+
+  if (!accountNo || accountNo.length < 9) {
+    return "Account number must be at least 9 digits";
+  }
+
+  if (!/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc)) {
+    return "Invalid IFSC code (e.g., SBIN0001234)";
+  }
+
+  if (!name || name.length < 3) {
+    return "Account holder name required";
+  }
+
+  return null;
+};
+
+// ── Save Bank Details ─────────────────────────────────────────────────
+const handleSaveBankDetails = async () => {
+  const error = validateBankDetails();
+  if (error) {
+    return Alert.alert("Validation Error", error);
+  }
+
+  setBankSaving(true);
+  try {
+    const uid = auth.currentUser?.uid;
+    if (!uid) throw new Error("Not authenticated");
+
+    await updateDoc(doc(db, "users", uid), {
+      banking: {
+        accountNo: bankAccount.trim(),
+        ifsc: bankIfsc.trim().toUpperCase(),
+        name: bankName.trim(),
+        upi: bankUpi.trim() || null,
+        verified: false,
+        updatedAt: new Date(),
+      },
+    });
+
+    setShowBankModal(false);
+    await fetchAll(true);
+    Alert.alert("✅ Saved", "Bank details saved. Admin will verify soon.");
+  } catch (err: any) {
+    Alert.alert("Error", err.message || "Could not save");
+  } finally {
+    setBankSaving(false);
+  }
+};
+
+// ── Open Bank Modal (populate if exists) ───────────────────────────────
+const openBankModal = () => {
+  if (user?.banking) {
+    setBankAccount(user.banking.accountNo || "");
+    setBankIfsc(user.banking.ifsc || "");
+    setBankName(user.banking.name || "");
+    setBankUpi(user.banking.upi || "");
+  } else {
+    setBankAccount("");
+    setBankIfsc("");
+    setBankName("");
+    setBankUpi("");
+  }
+  setShowBankModal(true);
+};
+
   // ── Toggle operator status ────────────────────────────────────────────────
   const toggleOperatorStatus = async (op: Operator) => {
     const next = op.status === "active" ? "inactive" : "active";
@@ -230,12 +320,24 @@ export default function OwnerProfile() {
     );
   };
 
-  const handleLogout = () => {
-    Alert.alert("Logout", "Are you sure?", [
-      { text: "Cancel", style: "cancel" },
-      { text: "Logout", style: "destructive", onPress: () => signOut(auth).then(() => router.replace("/login")) },
-    ]);
-  };
+const handleLogout = async () => {
+  // On web, Alert.alert doesn't work - just logout directly
+  if (Platform.OS === 'web') {
+    try {
+      await signOut(auth);
+      router.replace("/login");
+    } catch (err: any) {
+      Alert.alert("Error", err.message || "Logout failed");
+    }
+    return;
+  }
+
+  // On native, show confirmation
+  Alert.alert("Logout", "Are you sure?", [
+    { text: "Cancel", style: "cancel" },
+    { text: "Logout", style: "destructive", onPress: () => signOut(auth).then(() => router.replace("/login")) },
+  ]);
+};
 
 
 
@@ -249,16 +351,16 @@ export default function OwnerProfile() {
   );
 
   return (
-    <SafeAreaView style={s.safe}>
+    <View style={s.safe}>
       <StatusBar barStyle="light-content" backgroundColor="#081120" />
 
-      <ScrollView
+      <ScrollView keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive" automaticallyAdjustKeyboardInsets
         showsVerticalScrollIndicator={false}
         contentContainerStyle={s.scroll}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchAll(true)} />}
       >
         {/* ── Hero ── */}
-        <View style={s.hero}>
+         <View style={[s.hero, { paddingTop: insets.top + 12 }]}>
           <View style={s.glow1} /><View style={s.glow2} />
 
           <View style={s.heroTop}>
@@ -306,6 +408,83 @@ export default function OwnerProfile() {
               <Text style={s.infoDesc}>{user.description}</Text>
             </View>
           ) : null}
+        </View>
+
+        {/* ── BANK DETAILS CARD ── */}
+        <View style={s.card}>
+          <View style={s.bankCardHeader}>
+            <Text style={s.cardTitle}>Bank Details for Payouts</Text>
+            {user?.banking?.verified && (
+              <View style={s.verifiedBadge}>
+                <Text style={s.verifiedBadgeText}>✓ Verified</Text>
+              </View>
+            )}
+          </View>
+
+          {user?.banking ? (
+            // ── EXISTING BANK DETAILS ──
+            <View style={s.bankDetailsDisplay}>
+              <View style={s.bankInfoRow}>
+                <Text style={s.infoLabel}>Account Holder</Text>
+                <Text style={s.infoValue}>{user.banking.name}</Text>
+              </View>
+              <View style={s.divider} />
+
+              <View style={s.bankInfoRow}>
+                <Text style={s.infoLabel}>Account Number</Text>
+                <Text style={s.infoValue}>****{user.banking.accountNo?.slice(-4)}</Text>
+              </View>
+              <View style={s.divider} />
+
+              <View style={s.bankInfoRow}>
+                <Text style={s.infoLabel}>IFSC Code</Text>
+                <Text style={s.infoValue}>{user.banking.ifsc}</Text>
+              </View>
+
+              {user.banking.upi && (
+                <>
+                  <View style={s.divider} />
+                  <View style={s.bankInfoRow}>
+                    <Text style={s.infoLabel}>UPI</Text>
+                    <Text style={s.infoValue}>{user.banking.upi}</Text>
+                  </View>
+                </>
+              )}
+
+              {!user.banking.verified && (
+                <View style={s.pendingNote}>
+                  <Ionicons name="information-circle-outline" size={16} color="#F59E0B" />
+                  <Text style={s.pendingNoteText}>
+                    ⏳ Admin is verifying your details. You'll be notified when approved.
+                  </Text>
+                </View>
+              )}
+
+              <TouchableOpacity
+                style={s.editBankBtn}
+                onPress={openBankModal}
+              >
+                <Ionicons name="pencil-outline" size={14} color="#fff" />
+                <Text style={s.editBankBtnText}>Edit Bank Details</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            // ── NO BANK DETAILS YET ──
+            <View style={s.bankEmpty}>
+              <Ionicons name="card-outline" size={40} color="#D1D5DB" />
+              <Text style={s.bankEmptyTitle}>No Bank Details Added</Text>
+              <Text style={s.bankEmptySub}>
+                Add your bank account to receive settlement payouts from bookings.
+              </Text>
+              <TouchableOpacity
+                style={s.addBankBtn}
+                onPress={openBankModal}
+              >
+                <Ionicons name="add-outline" size={16} color="#fff" />
+                <Text style={s.addBankBtnText}>Add Bank Details</Text>
+              </TouchableOpacity>
+            </View>
+          )}
         </View>
 
         {/* ── My Turfs (quick list) ── */}
@@ -359,7 +538,7 @@ export default function OwnerProfile() {
 
       {/* ══ ADD OPERATOR MODAL ══════════════════════════════ */}
       <Modal visible={opModal} animationType="slide" transparent onRequestClose={() => setOpModal(false)}>
-        <View style={m.backdrop}>
+        <KeyboardAvoidingView style={m.backdrop} behavior={Platform.OS === "ios" ? "padding" : undefined}>
           <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={() => setOpModal(false)} />
           <View style={m.sheet}>
             <View style={m.handle} />
@@ -367,7 +546,7 @@ export default function OwnerProfile() {
             <Text style={m.title}>Add Operator</Text>
             <Text style={m.sub}>A login account will be created for the operator.</Text>
 
-            <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+            <ScrollView keyboardDismissMode="interactive" showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
               {/* Info banner */}
               <View style={m.banner}>
                 <Ionicons name="information-circle-outline" size={16} color="#3B82F6" />
@@ -452,9 +631,101 @@ export default function OwnerProfile() {
               <View style={{ height: 24 }} />
             </ScrollView>
           </View>
-        </View>
+        </KeyboardAvoidingView>
       </Modal>
-    </SafeAreaView>
+
+      {/* ══ BANK DETAILS MODAL ════════════════════════════════ */}
+      <Modal visible={showBankModal} transparent animationType="slide" onRequestClose={() => setShowBankModal(false)}>
+        <KeyboardAvoidingView style={m.backdrop} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+          <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={() => setShowBankModal(false)} />
+          <View style={m.sheet}>
+            <View style={m.handle} />
+
+            <Text style={m.title}>Bank Account Details</Text>
+            <Text style={m.sub}>Enter your bank account for receiving payouts</Text>
+
+            <ScrollView keyboardDismissMode="interactive" showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+              {/* Account Holder Name */}
+              <Text style={m.fieldLabel}>Account Holder Name *</Text>
+              <TextInput
+                style={m.input}
+                placeholder="Your name as per bank records"
+                placeholderTextColor="#9CA3AF"
+                value={bankName}
+                onChangeText={setBankName}
+                autoCapitalize="words"
+              />
+
+              {/* Account Number */}
+              <Text style={m.fieldLabel}>Account Number *</Text>
+              <TextInput
+                style={m.input}
+                placeholder="123456789012"
+                placeholderTextColor="#9CA3AF"
+                value={bankAccount}
+                onChangeText={setBankAccount}
+                keyboardType="number-pad"
+              />
+              <Text style={m.hint}>9-18 digits without spaces</Text>
+
+              {/* IFSC Code */}
+              <Text style={m.fieldLabel}>IFSC Code *</Text>
+              <TextInput
+                style={m.input}
+                placeholder="SBIN0001234"
+                placeholderTextColor="#9CA3AF"
+                value={bankIfsc}
+                onChangeText={(v) => setBankIfsc(v.toUpperCase())}
+                autoCapitalize="characters"
+                maxLength={11}
+              />
+              <Text style={m.hint}>Format: 4 letters + 0 + 6 alphanumeric</Text>
+
+              {/* UPI (Optional) */}
+              <Text style={m.fieldLabel}>UPI Address (Optional)</Text>
+              <TextInput
+                style={m.input}
+                placeholder="yourname@bankname"
+                placeholderTextColor="#9CA3AF"
+                value={bankUpi}
+                onChangeText={setBankUpi}
+                autoCapitalize="none"
+              />
+
+              {/* Save Button */}
+              <TouchableOpacity
+                style={[m.saveBtn, bankSaving && { opacity: 0.6 }]}
+                onPress={handleSaveBankDetails}
+                disabled={bankSaving}
+              >
+                <Text style={m.saveBtnText}>
+                  {bankSaving ? "Saving..." : "Save Bank Details"}
+                </Text>
+              </TouchableOpacity>
+
+              {/* Cancel Button */}
+              <TouchableOpacity
+                style={m.cancelBtn}
+                onPress={() => setShowBankModal(false)}
+                disabled={bankSaving}
+              >
+                <Text style={m.cancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+
+              {/* Important Note */}
+              <View style={m.bankNoteBox}>
+                <Ionicons name="shield-checkmark-outline" size={16} color="#059669" />
+                <Text style={m.bankNoteText}>
+                  Your bank details are secure and will be used only for settlements. Admin will verify before processing payouts.
+                </Text>
+              </View>
+
+              <View style={{ height: 20 }} />
+            </ScrollView>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+    </View>
   );
 }
 
@@ -472,7 +743,7 @@ const s = StyleSheet.create({
   hero: {
     backgroundColor: DARK,
     paddingHorizontal: 20,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 20,
+  
     paddingBottom: 36,
     borderBottomLeftRadius: 28, borderBottomRightRadius: 28,
     alignItems: "center", overflow: "hidden",
@@ -542,6 +813,27 @@ const s = StyleSheet.create({
   primaryBtnText: { color: "#fff", fontWeight: "700", fontSize: 15 },
   dangerBtn:      { flexDirection: "row", alignItems: "center", justifyContent: "center", backgroundColor: "#FEF2F2", paddingVertical: 14, borderRadius: 14, marginTop: 10, borderWidth: 1, borderColor: "#FECACA" },
   dangerBtnText:  { color: "#B42318", fontWeight: "700", fontSize: 15 },
+
+  // Bank Details
+  bankCardHeader:      { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 14 },
+  verifiedBadge:       { backgroundColor: "#D1FAE5", paddingHorizontal: 10, paddingVertical: 4, borderRadius: 999 },
+  verifiedBadgeText:   { color: "#059669", fontSize: 11, fontWeight: "700" },
+  
+  bankDetailsDisplay:  { borderTopWidth: 1, borderTopColor: "#F3F4F6", paddingTop: 12 },
+  bankInfoRow:         { paddingVertical: 10 },
+  
+  bankEmpty:           { alignItems: "center", paddingVertical: 30, gap: 12 },
+  bankEmptyTitle:      { fontSize: 15, fontWeight: "800", color: "#111827" },
+  bankEmptySub:        { fontSize: 12, color: "#9CA3AF", textAlign: "center", lineHeight: 18 },
+  
+  addBankBtn:          { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, backgroundColor: DARK, borderRadius: 12, paddingVertical: 12, marginTop: 12 },
+  addBankBtnText:      { color: "#FFFFFF", fontWeight: "800", fontSize: 13 },
+  
+  editBankBtn:         { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, backgroundColor: "#F3F4F6", borderRadius: 12, padding: 12, marginTop: 12 },
+  editBankBtnText:     { fontSize: 13, fontWeight: "700", color: "#0A0F1E" },
+  
+  pendingNote:         { flexDirection: "row", alignItems: "flex-start", gap: 8, backgroundColor: "#FFFBEB", borderRadius: 10, padding: 10, marginTop: 12, marginBottom: 12 },
+  pendingNoteText:     { flex: 1, fontSize: 11, color: "#92400E", fontWeight: "600", lineHeight: 16 },
 });
 
 // ── Modal styles ──────────────────────────────────────────────────────────────
@@ -566,4 +858,6 @@ const m = StyleSheet.create({
   saveBtnText: { color: "#fff", fontWeight: "800", fontSize: 15 },
   cancelBtn:   { backgroundColor: "#F3F4F6", paddingVertical: 14, borderRadius: 16, alignItems: "center", marginTop: 10 },
   cancelBtnText:{ color: "#374151", fontWeight: "700", fontSize: 15 },
+  bankNoteBox:        { flexDirection: "row", alignItems: "flex-start", gap: 8, backgroundColor: "#F0FDF4", borderRadius: 12, padding: 12, marginTop: 16, gap: 8 },
+  bankNoteText:       { flex: 1, fontSize: 11, color: "#166534", fontWeight: "600", lineHeight: 16 },
 });

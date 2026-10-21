@@ -12,10 +12,12 @@
  *  ✅ TO chips auto-reset when FROM changes to a later time
  */
 import {
-  View, Text, StyleSheet, SafeAreaView, StatusBar, FlatList,
+  View, Text, StyleSheet, StatusBar, FlatList,
   TouchableOpacity, TextInput, Alert, ActivityIndicator,
   RefreshControl, Modal, ScrollView, Switch, Platform,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
 import { useEffect, useMemo, useState } from "react";
 import { db } from "../../firebaseConfig";
 import {
@@ -111,6 +113,7 @@ const DAY_LABELS = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
 // =============================================================================
 
 export default function AdminPromoCodes() {
+  const insets = useSafeAreaInsets();
   const [promos,     setPromos]     = useState<PromoCode[]>([]);
   const [turfs,      setTurfs]      = useState<Turf[]>([]);
   const [loading,    setLoading]    = useState(true);
@@ -350,7 +353,7 @@ export default function AdminPromoCodes() {
   // ── Render ─────────────────────────────────────────────────────────────────
   // ==========================================================================
   return (
-    <SafeAreaView style={s.safe}>
+    <View style={s.safe}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
       <FlatList
         data={filtered} keyExtractor={i => i.id} renderItem={renderPromo}
@@ -358,7 +361,7 @@ export default function AdminPromoCodes() {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchAll(true)} tintColor={ACCENT} />}
         ListHeaderComponent={
           <View>
-            <View style={s.hero}>
+             <View style={[s.hero, { paddingTop: insets.top + 12 }]}>
               <View style={s.heroGlow} />
               <Text style={s.heroTag}>Admin · Promotions</Text>
               <Text style={s.heroTitle}>Promo Codes</Text>
@@ -778,7 +781,7 @@ export default function AdminPromoCodes() {
           </View>
         </View>
       </Modal>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -790,7 +793,7 @@ const s = StyleSheet.create({
   loadWrap:{ flex: 1, justifyContent: "center", alignItems: "center" },
   list:    { paddingBottom: 100 },
 
-  hero:        { backgroundColor: DARK, paddingHorizontal: 20, paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 18, paddingBottom: 28, overflow: "hidden" },
+  hero:        { backgroundColor: DARK, paddingHorizontal: 20, paddingBottom: 28, overflow: "hidden" },
   heroGlow:    { position: "absolute", top: -40, right: -40, width: 200, height: 200, borderRadius: 100, backgroundColor: "rgba(14,165,164,0.15)" },
   heroTag:     { color: "#6EE7B7", fontSize: 11, fontWeight: "800", letterSpacing: 1.5, textTransform: "uppercase" },
   heroTitle:   { color: "#fff", fontSize: 28, fontWeight: "900", marginTop: 4 },

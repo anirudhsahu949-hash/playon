@@ -1,8 +1,10 @@
 import {
-  View, Text, StyleSheet, SafeAreaView, StatusBar,
+  View, Text, StyleSheet, StatusBar,
   ScrollView, TouchableOpacity, ActivityIndicator,
   RefreshControl, Alert, Platform, Image, Dimensions,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
 import { useEffect, useState, useCallback } from "react";
 import { db, auth } from "../../firebaseConfig";
 import {
@@ -174,6 +176,8 @@ function DonutChart({ data }: { data: TurfRevenue[] }) {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 export default function AdminDashboard() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
+
   const [adminName, setAdminName]   = useState("Admin");
   const [adminPhoto, setAdminPhoto] = useState<string | null>(null);
   const [loading, setLoading]       = useState(true);
@@ -268,11 +272,11 @@ export default function AdminDashboard() {
   );
 
   return (
-    <SafeAreaView style={s.safe}>
+    <View style={s.safe}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
       {/* Header */}
-      <View style={s.header}>
+       <View style={[s.header, { paddingTop: insets.top + 12 }]}>
         <TouchableOpacity style={s.menuBtn} onPress={() =>
   navigation.dispatch(DrawerActions.openDrawer())
 }>
@@ -455,7 +459,7 @@ export default function AdminDashboard() {
       </ScrollView>
 
       <AdminNavBar />
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -469,7 +473,7 @@ const s = StyleSheet.create({
   header: {
     backgroundColor: DARK, flexDirection: "row", alignItems: "center",
     paddingHorizontal: 16, gap: 10,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 10 : 10,
+    
     paddingBottom: 16,
   },
   menuBtn: { width: 36, height: 36, justifyContent: "center", alignItems: "center" },

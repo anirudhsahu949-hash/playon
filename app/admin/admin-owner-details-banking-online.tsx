@@ -8,10 +8,11 @@
  * - Full history of past settlements
  */
 import {
-  View, Text, StyleSheet, SafeAreaView, StatusBar, FlatList,
+  View, Text, StyleSheet, StatusBar, FlatList,
   TouchableOpacity, TextInput, Alert, ActivityIndicator,
   RefreshControl, Modal, ScrollView, Switch, Platform,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useEffect, useMemo, useState } from "react";
 import { db, auth } from "../../firebaseConfig";
 import {
@@ -109,6 +110,7 @@ function DatePicker({ label, value, onChange }: { label: string; value: Date; on
 
 // ── Main Screen ───────────────────────────────────────────────────────────────
 export default function AdminOwnerPayouts() {
+  const insets = useSafeAreaInsets();
   const [owners,      setOwners]      = useState<Owner[]>([]);
   const [turfs,       setTurfs]       = useState<Turf[]>([]);
   const [bookings,    setBookings]    = useState<Booking[]>([]);
@@ -354,7 +356,7 @@ export default function AdminOwnerPayouts() {
   );
 
   return (
-    <SafeAreaView style={s.safe}>
+    <View style={s.safe}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
       <FlatList
@@ -367,7 +369,7 @@ export default function AdminOwnerPayouts() {
         ListHeaderComponent={
           <View>
             {/* Hero */}
-            <View style={s.hero}>
+             <View style={[s.hero, { paddingTop: insets.top + 12 }]}>
               <View style={s.heroGlow1} /><View style={s.heroGlow2} />
               <Text style={s.heroTag}>Admin · Payouts</Text>
               <Text style={s.heroTitle}>Owner Payouts</Text>
@@ -683,7 +685,7 @@ export default function AdminOwnerPayouts() {
           </View>
         </View>
       </Modal>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -693,7 +695,7 @@ const s = StyleSheet.create({
   loadWrap: { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: DARK },
   loadTxt:  { color: "#9CA3AF", marginTop: 12, fontSize: 15, fontWeight: "600" },
   list:     { paddingBottom: 100 },
-  hero:     { backgroundColor: DARK, paddingHorizontal: 20, paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight||0)+14 : 18, paddingBottom: 28, overflow: "hidden" },
+  hero:     { backgroundColor: DARK, paddingHorizontal: 20, paddingBottom: 28, overflow: "hidden" },
   heroGlow1:{ position: "absolute", top: -40, right: -40, width: 200, height: 200, borderRadius: 100, backgroundColor: "rgba(14,165,164,0.15)" },
   heroGlow2:{ position: "absolute", bottom: -60, left: -40, width: 180, height: 180, borderRadius: 90, backgroundColor: "rgba(124,58,237,0.12)" },
   heroTag:  { color: "#6EE7B7", fontSize: 11, fontWeight: "800", letterSpacing: 1.5, textTransform: "uppercase" },

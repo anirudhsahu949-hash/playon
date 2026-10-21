@@ -6,19 +6,20 @@ import {
   TouchableOpacity,
   Image,
   StyleSheet,
-  SafeAreaView,
   StatusBar,
   ActivityIndicator,
   Platform,
   ScrollView,
   Alert,
-  RefreshControl
+    RefreshControl,
+  Modal,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { db, auth } from "../../firebaseConfig";
 import { collection, getDocs, query, where, doc, getDoc } from "firebase/firestore";
 import { onAuthStateChanged } from "firebase/auth";
-import { useRouter } from "expo-router";
+import { useRouter, useLocalSearchParams } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import GymCardGrid from "../../components/screen-gym/gym-card-grid";  // ✅ Grid version for explore
 
@@ -88,12 +89,18 @@ type Turf = {
   images?: string[];
   openingTime?: number;
   closingTime?: number;
+    lateCutoffHours?: number;
   slots?: Slot[];
   slotsLoading?: boolean;
   latitude?: number | null;
   longitude?: number | null;
-  distanceKm?: number | null;
+    distanceKm?: number | null;
+  bookingMode?: "online" | "phone" | "both";
+  bookingPhone?: string;
+
+  
 };
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MODULE-LEVEL CACHE
@@ -130,12 +137,35 @@ function isSlotsFresh(): boolean {
   return !!_slotsCache && Date.now() - _slotsCache.fetchedAt < SLOTS_TTL;
 }
 
+// ── Offer badges ────────────────────────────────────────────────────────────
+// Same module-level pattern as _turfsCache / _slotsCache, so badges survive a
+// tab switch. 5 minutes matches the slot cache; the server holds its own 60s
+// cache behind this, so a pause by an owner shows up within ~6 minutes worst
+// case — and immediately on pull-to-refresh.
+type OfferBadge = {
+  offerId:    string;
+  title:      string;
+  type:       "flat" | "percent";
+  badge:      string;   // "20% OFF" | "₹150 OFF"
+  qualifier:  string;   // "6 AM–10 AM · min ₹500", or "" when unrestricted
+  offerCount: number;
+};
+
+const OFFERS_TTL = 5 * 60 * 1000;
+
+type OffersCache = { data: Record<string, OfferBadge>; fetchedAt: number } | null;
+let _offersCache: OffersCache = null;
+
+function isOffersFresh(): boolean {
+  return !!_offersCache && Date.now() - _offersCache.fetchedAt < OFFERS_TTL;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 function pad(n: number) { return String(n).padStart(2, "0"); }
 
 function formatTime(v: number): string {
-  if (v >= 24) v = 0;
+  if (v >= 24) v -= 24;                 // 24.5 → 12:30 AM, 25 → 1:00 AM
   const h = Math.floor(v);
   const m = Math.round((v % 1) * 60);
   const suffix = h >= 12 ? "PM" : "AM";
@@ -144,6 +174,7 @@ function formatTime(v: number): string {
 }
 
 function shortLabel(v: number): string {
+  if (v >= 24) v -= 24;                 // 26 → "2 AM"
   const h = Math.floor(v);
   const m = Math.round((v % 1) * 60);
   const suffix = h >= 12 ? "PM" : "AM";
@@ -171,12 +202,14 @@ function rangesOverlap(aS: number, aE: number, bS: number, bE: number) {
   return aS < bE && bS < aE;
 }
 
-function parseSlotRange(s: string): { start: number; end: number } | null {
+function parseSlotRange(s: string, open = 0, late = false): { start: number; end: number } | null {
   try {
     const parts = s.split(" - ");
     if (parts.length < 2) return null;
-    const start = parseTime(parts[0].trim());
-    let end = parseTime(parts[1].trim());
+    let start = parseTime(parts[0].trim());
+    let end   = parseTime(parts[1].trim());
+    if (late && start < open) start += 24;   // "12:30 AM" on a late turf → 24.5
+    if (late && end   < open) end   += 24;
     if (end <= start) end = 24;
     return { start, end };
   } catch { return null; }
@@ -188,8 +221,11 @@ function buildSlots(
   blockedStrings: string[]
 ): Slot[] {
   const open  = turf.openingTime ?? 6;
-  const close = turf.closingTime ?? 24;
+  const close = turf.closingTime === 0 ? 24 : (turf.closingTime ?? 24);
   const now   = nowDecimal();
+  const late  = close > 24;
+  const cutoff = Number(turf.lateCutoffHours || 0);
+  const lateShut = late && cutoff > 0 && now >= 24 - cutoff;   // owner's late-night cutoff passed
   const day   = turf.dayPrice   || turf.price || 0;
   const night = turf.nightPrice || turf.price || 0;
   const slots: Slot[] = [];
@@ -200,15 +236,15 @@ function buildSlots(
     const price   = t >= 6 && t < 18 ? day : night;
     let status: SlotStatus = "available";
 
-    if (t < now) {
+    if (t < now || (t >= 24 && lateShut)) {
       status = "past";
     } else {
       const isBooked = bookedStrings.some(s => {
-        const r = parseSlotRange(s.trim());
+        const r = parseSlotRange(s.trim(), open, late)
         return r ? rangesOverlap(t, next, r.start, r.end) : s.trim() === timeStr.trim();
       });
       const isBlocked = blockedStrings.some(s => {
-        const r = parseSlotRange(s.trim());
+        const r = parseSlotRange(s.trim(), open, late)
         return r ? rangesOverlap(t, next, r.start, r.end) : s.trim() === timeStr.trim();
       });
       if (isBooked)       status = "booked";
@@ -224,6 +260,41 @@ const getTurfImage = (t: Turf) =>
   "https://images.unsplash.com/photo-1575361204480-aadea25e6e68?auto=format&fit=crop&w=800&q=80";
 
 const getBasePrice = (t: Turf) => t.dayPrice || t.nightPrice || t.price || 0;
+// ── Admin-set booking mode (missing = old turf = online) ──
+const isPhoneOnly = (t: Turf) => t.bookingMode === "phone" && !!t.bookingPhone;
+const hasCallOption = (t: Turf) => (t.bookingMode === "phone" || t.bookingMode === "both") && !!t.bookingPhone;
+
+// ── Time filter helpers ──────────────────────────────────────────────────────
+const FILTER_HOURS = Array.from({ length: 23 }, (_, i) => i + 5); // 5 AM … 3 AM (late night)
+
+function hourLabel(h: number): string {
+  if (h >= 24) h -= 24;                 // 25 → "1 AM"
+  if (h === 0) return "12 AM";
+  if (h === 12) return "12 PM";
+  return h < 12 ? `${h} AM` : `${h - 12} PM`;
+}
+
+// True only if EVERY half-hour slot in [start, end) is available today
+function isFreeAt(t: Turf, start: number, end: number): boolean {
+  if (isPhoneOnly(t)) return false;
+  const close = t.closingTime === 0 ? 24 : (t.closingTime ?? 24);
+  if (start < (t.openingTime ?? 6) || end > close) return false;
+  const slots = t.slots ?? [];
+  for (let x = start; x < end; x += 0.5) {
+    const sl = slots.find(s => Math.abs(s.start - x) < 0.01);
+    if (!sl || sl.status !== "available") return false;
+  }
+  return true;
+}
+
+// Price for the chosen window (sum of half-hour slot prices)
+function windowPrice(t: Turf, start: number, end: number): number {
+  return Math.round(
+    (t.slots ?? [])
+      .filter(s => s.start >= start && s.start < end)
+      .reduce((sum, s) => sum + s.price * 0.5, 0)
+  );
+}
 
 function SlotChip({ slot }: { slot: Slot }) {
   const bk = slot.status === "booked";
@@ -266,6 +337,7 @@ function applySlotCache(turfs: Turf[]): Turf[] {
 }
 
 export default function Explore() {
+  const insets = useSafeAreaInsets(); 
   const [turfs,      setTurfs]      = useState<Turf[]>([]);
   const [turfsBase,  setTurfsBase]  = useState<Turf[]>([]);
   const [search,     setSearch]     = useState("");
@@ -273,10 +345,41 @@ export default function Explore() {
   const [liked,      setLiked]      = useState<Set<string>>(new Set());
   const [loading,    setLoading]    = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [userCoords, setUserCoords] = useState<{ lat: number; lng: number } | null>(null);
+    const [userCoords, setUserCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const [offersByTurf, setOffersByTurf] = useState<Record<string, OfferBadge>>(
+    _offersCache?.data ?? {}
+  );
 
   const router    = useRouter();
   const searchRef = useRef<TextInput>(null);
+
+  // Home "See all" / highlight cards can open Explore on a filter (e.g. Offers)
+  const params = useLocalSearchParams<{ sport?: string }>();
+  useEffect(() => {
+    if (params.sport) setSport(String(params.sport));
+  }, [params.sport]);
+
+    // ── Time filter ──
+  const [timeFilter,    setTimeFilter]    = useState<{ start: number; end: number } | null>(null);
+  const [showTimeSheet, setShowTimeSheet] = useState(false);
+  const [draftStart,    setDraftStart]    = useState<number | null>(null);
+  const [draftHours,    setDraftHours]    = useState<number>(1);
+
+  const openTimeSheet = () => {
+    setDraftStart(timeFilter?.start ?? null);
+    setDraftHours(timeFilter ? timeFilter.end - timeFilter.start : 1);
+    setShowTimeSheet(true);
+  };
+  const applyTimeFilter = () => {
+    if (draftStart == null) return;
+    setTimeFilter({ start: draftStart, end: Math.min(draftStart + draftHours, 28) });
+    setShowTimeSheet(false);
+  };
+  const clearTimeFilter = () => {
+    setTimeFilter(null);
+    setDraftStart(null);
+    setShowTimeSheet(false);
+  };
 
   useEffect(() => {
     const unsubAuth = onAuthStateChanged(auth, async (u) => {
@@ -379,6 +482,37 @@ export default function Explore() {
     }
   };
 
+    // ─── fetchOffers ─────────────────────────────────────────────────────────
+  // Fire-and-forget. Never awaited by the render path, never throws upward.
+  // Explore worked before offers existed and must keep working if this fails.
+  const fetchOffers = async (forceRefresh = false) => {
+    if (!forceRefresh && isOffersFresh()) {
+      setOffersByTurf(_offersCache!.data);
+      return;
+    }
+    try {
+      const controller = new AbortController();
+      // Render free tier cold-starts at ~30s. We are not waiting that long for
+      // a decoration — bail at 8s and try again on the next visit.
+      const timer = setTimeout(() => controller.abort(), 8000);
+
+      const res = await fetch("https://bookora-backend-95u4.onrender.com/turf-offers", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({}),   // {} = every turf with an offer today
+        signal:  controller.signal,
+      });
+      clearTimeout(timer);
+
+      const data = await res.json();
+      const map  = (data?.offers ?? {}) as Record<string, OfferBadge>;
+      _offersCache = { data: map, fetchedAt: Date.now() };
+      setOffersByTurf(map);
+    } catch {
+      // Silent on purpose — a missing badge is invisible, an error toast is not.
+    }
+  };
+
   // ─── fetchAll ────────────────────────────────────────────────────────────
   // BEFORE: getDocs("turfs") on every mount — re-fetches every tab switch
   // AFTER:
@@ -402,7 +536,10 @@ export default function Explore() {
         _turfsCache = { data: raw, fetchedAt: Date.now() };
       }
 
-      setTurfsBase(raw);
+          setTurfsBase(raw);
+
+      // Not awaited — badges land whenever they land.
+      fetchOffers(isRefresh);
 
       // If slot cache is still fresh, apply it immediately (0 reads)
       // Otherwise fetch fresh slots from Firestore
@@ -463,10 +600,19 @@ const sportFilters = useMemo<string[]>(() => {
   }
 
   // ✅ Check if any gyms exist — if yes, add "Gym" chip at the end
-  const hasGyms = turfs.some((t: any) => t.venueType === "gym");
-  
-  return ["All", ...unique.sort(), ...(hasGyms ? ["Gym"] : [])];
-}, [turfs]);
+    const hasGyms = turfs.some((t: any) => t.venueType === "gym");
+
+  // Only offer the filter when there is something behind it. A chip that leads
+  // to an empty list reads as a broken app, not as "no deals today".
+    const hasOffers = turfs.some(t => !!offersByTurf[t.id] && !isPhoneOnly(t));
+
+  return [
+    "All",
+    ...(hasOffers ? ["Offers"] : []),
+    ...unique.sort(),
+    ...(hasGyms ? ["Gym"] : []),
+  ];
+}, [turfs, offersByTurf]);
 
   const likedTurfs = useMemo(() => turfs.filter(t => liked.has(t.id)), [turfs, liked]);
 
@@ -488,9 +634,18 @@ const sportFilters = useMemo<string[]>(() => {
       return a.distanceKm - b.distanceKm;
     });
 
-    return sorted.filter((t: any) => {
-  // ✅ Special case: "Gym" filter shows only gyms
-  if (sport === "Gym") {
+           return sorted.filter((t: any) => {
+  // ── Time filter: only turfs free for the whole window ──
+  if (timeFilter) {
+    if (t.venueType === "gym") return false;
+    if (t.slotsLoading) return false;
+    if (!isFreeAt(t, timeFilter.start, timeFilter.end)) return false;
+  }
+
+  // Offers filter — turfs and gyms both, since an offer is an offer.
+   if (sport === "Offers") {
+    if (!offersByTurf[t.id] || isPhoneOnly(t)) return false;
+  } else if (sport === "Gym") {
     if (t.venueType !== "gym") return false;
   } else if (sport === "All") {
     // "All" shows only turfs (not gyms)
@@ -517,7 +672,7 @@ const sportFilters = useMemo<string[]>(() => {
     amenityStr,
   ].some(v => v.includes(q));
 });
-  }, [turfs, search, sport, userCoords]);
+   }, [turfs, search, sport, userCoords, offersByTurf, timeFilter]);
 
   if (loading) {
     return (
@@ -530,7 +685,7 @@ const sportFilters = useMemo<string[]>(() => {
   }
 
   return (
-    <SafeAreaView style={s.root}>
+    <View style={s.root}>
       <StatusBar barStyle="dark-content" backgroundColor="#fff" />
 
       <FlatList
@@ -546,11 +701,13 @@ const sportFilters = useMemo<string[]>(() => {
             tintColor="#0B1220"
             colors={["#0B1220"]}
           />
+          
         }
+            
 
         ListHeaderComponent={
           <View>
-            <View style={s.header}>
+            <View style={[s.header, { paddingTop: insets.top + 12 }]}>
               <View>
                 <Text style={s.title}>Explore</Text>
                 <Text style={s.sub}>
@@ -581,10 +738,14 @@ const sportFilters = useMemo<string[]>(() => {
                   <TouchableOpacity onPress={() => setSearch("")} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
                     <Ionicons name="close-circle" size={18} color="#9CA3AF" />
                   </TouchableOpacity>
-                ) : (
-                  <View style={s.searchFilter}>
-                    <Ionicons name="options-outline" size={16} color="#374151" />
-                  </View>
+                                ) : (
+                  <TouchableOpacity
+                    style={[s.searchFilter, timeFilter && s.searchFilterOn]}
+                    onPress={openTimeSheet}
+                    activeOpacity={0.8}
+                  >
+                    <Ionicons name="time-outline" size={17} color={timeFilter ? "#fff" : "#374151"} />
+                  </TouchableOpacity>
                 )}
               </View>
             </View>
@@ -607,7 +768,19 @@ const sportFilters = useMemo<string[]>(() => {
   );
 })}
             </ScrollView>
-
+                           {timeFilter && (
+              <View style={s.timePillRow}>
+                <TouchableOpacity style={s.timePill} onPress={openTimeSheet} activeOpacity={0.85}>
+                  <Ionicons name="time" size={13} color="#15803D" />
+                  <Text style={s.timePillTxt}>
+                    Free today {hourLabel(timeFilter.start)} – {hourLabel(timeFilter.end)}
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={clearTimeFilter} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                  <Ionicons name="close-circle" size={20} color="#9CA3AF" />
+                </TouchableOpacity>
+              </View>
+            )}
           <View style={s.legendRow}>
   {sport !== "Gym" && (
     <>
@@ -627,7 +800,7 @@ const sportFilters = useMemo<string[]>(() => {
   )}
   <View style={{ flex: 1 }} />
   <Text style={s.listCount}>
-    {filtered.length} {sport === "Gym" ? "gyms" : "venues"}
+        {filtered.length} {sport === "Gym" ? "gyms" : sport === "Offers" ? "with offers" : "venues"}
   </Text>
 </View>
 
@@ -653,10 +826,19 @@ const sportFilters = useMemo<string[]>(() => {
         ListEmptyComponent={
           <View style={s.empty}>
             <Ionicons name="search-outline" size={48} color="#D1D5DB" />
-            <Text style={s.emptyTitle}>No venues found</Text>
-            <Text style={s.emptySub}>Try a different sport or clear your search.</Text>
-            <TouchableOpacity style={s.emptyBtn} onPress={() => { setSearch(""); setSport("All"); }}>
-              <Text style={s.emptyBtnTxt}>Show all</Text>
+                       <Text style={s.emptyTitle}>
+              {timeFilter ? "No free turfs at that time" : "No venues found"}
+            </Text>
+            <Text style={s.emptySub}>
+              {timeFilter
+                ? "Try a different time, or a shorter duration."
+                : "Try a different sport or clear your search."}
+            </Text>
+            <TouchableOpacity
+              style={s.emptyBtn}
+              onPress={() => timeFilter ? openTimeSheet() : (setSearch(""), setSport("All"))}
+            >
+              <Text style={s.emptyBtnTxt}>{timeFilter ? "Change time" : "Show all"}</Text>
             </TouchableOpacity>
           </View>
         }
@@ -696,10 +878,15 @@ const sportFilters = useMemo<string[]>(() => {
          const firstSport    = sportArray[0] ?? "";
 const firstSportCfg = firstSport ? getSportCfg(firstSport) : SPORT_FALLBACK;
 const isLiked       = liked.has(item.id);
+const phoneOnly = isPhoneOnly(item);
+const callToo   = hasCallOption(item) && !phoneOnly;
+const offer     = phoneOnly ? undefined : offersByTurf[item.id];   // offers are online-only
 
-          const slotPreview = (item.slots ?? [])
+                   const slotPreview = (item.slots ?? [])
             .filter(sl => sl.status !== "past")
+            .filter(sl => !timeFilter || sl.start >= timeFilter.start)   // start the row at the chosen time
             .slice(0, 10);
+          const winPrice = timeFilter ? windowPrice(item, timeFilter.start, timeFilter.end) : 0;
 
           return (
             <View style={s.card}>
@@ -714,14 +901,31 @@ const isLiked       = liked.has(item.id);
                 <TouchableOpacity style={s.heart} onPress={() => toggleLike(item.id)} activeOpacity={0.8} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
                   <Ionicons name={isLiked ? "star" : "star-outline"} size={18} color={isLiked ? "#000000" : "#fff"} />
                 </TouchableOpacity>
-                <View style={s.imgPrice}>
-                  <Text style={s.imgPriceTxt}>₹{basePrice}/hr</Text>
+                                <View style={s.imgPrice}>
+                                   <Text style={s.imgPriceTxt}>
+                    {timeFilter
+                      ? `₹${winPrice} · ${hourLabel(timeFilter.start)}–${hourLabel(timeFilter.end)}`
+                      : `₹${basePrice}/hr`}
+                  </Text>
                 </View>
+                                {!!offer && (
+                  <View style={s.offerBadge}>
+                    <Ionicons name="pricetag" size={11} color="#fff" />
+                    <Text style={s.offerBadgeTxt}>{offer.badge}</Text>
+                  </View>
+                )}
               </TouchableOpacity>
 
               <View style={s.infoRow}>
                 <View style={{ flex: 1, marginRight: 10 }}>
-                  <Text numberOfLines={1} style={s.turfName}>{item.name ?? "Turf"}</Text>
+                                    <Text numberOfLines={1} style={s.turfName}>{item.name ?? "Turf"}</Text>
+                                   {!!offer && (
+                    <Text numberOfLines={1} style={s.offerLine}>
+                      {offer.title}
+                      {offer.qualifier ? ` · ${offer.qualifier}` : ""}
+                      {offer.offerCount > 1 ? ` · +${offer.offerCount - 1} more` : ""}
+                    </Text>
+                  )}
                   <View style={s.locRow}>
                     <Ionicons name="location-outline" size={12} color="#9CA3AF" />
                     <Text numberOfLines={1} style={s.locTxt}> {item.location ?? "—"}</Text>
@@ -729,12 +933,34 @@ const isLiked       = liked.has(item.id);
                       <Text style={s.distInline}> · {fmtDist(item.distanceKm)} away</Text>
                     )}
                   </View>
+
+                                    {callToo && (
+                    <View style={s.callLine}>
+                      <Ionicons name="call" size={11} color="#15803D" />
+                      <Text style={s.callLineTxt}>Also bookable by call</Text>
+                    </View>
+                  )}
                 </View>
-                <TouchableOpacity style={s.bookBtn} onPress={() => handleBook(item.id)} activeOpacity={0.85}>
-                  <Text style={s.bookBtnTxt}>Book Now</Text>
+                               <TouchableOpacity style={[s.bookBtn, phoneOnly && s.bookBtnPhone]} onPress={() => handleBook(item.id)} activeOpacity={0.85}>
+                  {phoneOnly && <Ionicons name="call" size={12} color="#fff" />}
+                  <Text style={s.bookBtnTxt}>{phoneOnly ? "Call to Book" : "Book Now"}</Text>
                 </TouchableOpacity>
               </View>
 
+                            {phoneOnly ? (
+                <TouchableOpacity style={s.phoneStrip} onPress={() => handleBook(item.id)} activeOpacity={0.85}>
+                  <View style={s.phoneStripIcon}>
+                    <Ionicons name="call-outline" size={15} color="#15803D" />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.phoneStripTitle}>Bookings by phone</Text>
+                    <Text style={s.phoneStripSub}>
+                      Open {shortLabel(item.openingTime ?? 6)} – {shortLabel(item.closingTime ?? 24)} · Tap to see number
+                    </Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={16} color="#9CA3AF" />
+                </TouchableOpacity>
+              ) : (
               <View style={s.slotSection}>
                 <Text style={s.slotLabel}>Today's slots</Text>
                 {item.slotsLoading ? (
@@ -750,11 +976,79 @@ const isLiked       = liked.has(item.id);
                   </ScrollView>
                 )}
               </View>
+              )}
             </View>
           );
         }}
       />
-    </SafeAreaView>
+            {/* ── Time filter sheet ── */}
+      <Modal visible={showTimeSheet} transparent animationType="slide" onRequestClose={() => setShowTimeSheet(false)}>
+        <View style={s.sheetBackdrop}>
+          <View style={[s.sheet, { paddingBottom: insets.bottom + 16 }]}>
+            <View style={s.sheetHandle} />
+            <Text style={s.sheetTitle}>Find a free turf</Text>
+            <Text style={s.sheetSub}>Today · pick when you want to play</Text>
+
+            <Text style={s.sheetLabel}>START TIME</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingVertical: 4 }}>
+              {FILTER_HOURS.map(h => {
+                const past = h < nowDecimal();
+                const on   = draftStart === h;
+                return (
+                  <TouchableOpacity
+                    key={h}
+                    disabled={past}
+                    style={[s.hourChip, on && s.hourChipOn, past && s.hourChipPast]}
+                    onPress={() => setDraftStart(h)}
+                  >
+                    <Text style={[s.hourChipTxt, on && s.hourChipTxtOn, past && s.hourChipTxtPast]}>
+                      {hourLabel(h)}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+
+            <Text style={s.sheetLabel}>HOW LONG</Text>
+            <View style={{ flexDirection: "row", gap: 8 }}>
+              {[1, 2, 3].map(d => {
+                const on = draftHours === d;
+                const tooLate = draftStart != null && draftStart + d > 28;
+                return (
+                  <TouchableOpacity
+                    key={d}
+                    disabled={tooLate}
+                    style={[s.durChip, on && s.hourChipOn, tooLate && s.hourChipPast]}
+                    onPress={() => setDraftHours(d)}
+                  >
+                    <Text style={[s.hourChipTxt, on && s.hourChipTxtOn]}>{d} hr</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
+            {draftStart != null && (
+              <Text style={s.sheetPreview}>
+                {hourLabel(draftStart)} – {hourLabel(Math.min(draftStart + draftHours, 28))}
+              </Text>
+            )}
+
+            <View style={{ flexDirection: "row", gap: 10, marginTop: 16 }}>
+              <TouchableOpacity style={s.sheetClearBtn} onPress={clearTimeFilter}>
+                <Text style={s.sheetClearTxt}>Clear</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[s.sheetApplyBtn, draftStart == null && { opacity: 0.45 }]}
+                disabled={draftStart == null}
+                onPress={applyTimeFilter}
+              >
+                <Text style={s.sheetApplyTxt}>Show free turfs</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    </View>
   );
 }
 
@@ -767,7 +1061,7 @@ const s = StyleSheet.create({
   header: {
     flexDirection: "row", justifyContent: "space-between", alignItems: "center",
     backgroundColor: "#fff", paddingHorizontal: 16,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) + 10 : 12,
+      
     paddingBottom: 8,
   },
   title: { fontSize: 22, fontWeight: "800", color: "#0B1220", letterSpacing: -0.3 },
@@ -810,7 +1104,11 @@ const s = StyleSheet.create({
   sportBadgeTxt:{ fontSize: 11, fontWeight: "700", color: "#fff" },
   heart:        { position: "absolute", top: 10, right: 10, width: 30, height: 30, borderRadius: 15, backgroundColor: "rgba(0,0,0,0.3)", alignItems: "center", justifyContent: "center" },
   imgPrice:     { position: "absolute", bottom: 10, right: 10, backgroundColor: "#0B1220", paddingHorizontal: 9, paddingVertical: 4, borderRadius: 20 },
-  imgPriceTxt:  { fontSize: 12, fontWeight: "800", color: "#fff" },
+    imgPriceTxt:  { fontSize: 12, fontWeight: "800", color: "#fff" },
+
+  offerBadge:    { position: "absolute", bottom: 10, left: 10, flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: "#16A34A", paddingHorizontal: 9, paddingVertical: 4, borderRadius: 20 },
+  offerBadgeTxt: { fontSize: 11, fontWeight: "800", color: "#fff", letterSpacing: 0.2 },
+  offerLine:     { fontSize: 11, fontWeight: "700", color: "#16A34A", marginTop: 3 },
 
   distBadge:    { position: "absolute", bottom: 10, left: 10, flexDirection: "row", alignItems: "center", gap: 3, backgroundColor: "rgba(11,18,32,0.75)", paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999 },
   distBadgeTxt: { fontSize: 11, fontWeight: "700", color: "#fff" },
@@ -834,4 +1132,36 @@ const s = StyleSheet.create({
   emptySub:   { fontSize: 13, color: "#9CA3AF", textAlign: "center", marginTop: 6, lineHeight: 20 },
   emptyBtn:   { marginTop: 18, backgroundColor: "#0B1220", paddingHorizontal: 22, paddingVertical: 10, borderRadius: 10 },
   emptyBtnTxt:{ fontSize: 13, fontWeight: "700", color: "#fff" },
+    // phone booking
+  bookBtnPhone:    { flexDirection: "row", alignItems: "center", gap: 5 },
+  callLine:        { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 3 },
+  callLineTxt:     { fontSize: 11, fontWeight: "700", color: "#15803D" },
+  phoneStrip:      { flexDirection: "row", alignItems: "center", gap: 10, borderTopWidth: 1, borderTopColor: "#F3F4F6", paddingHorizontal: 12, paddingVertical: 10 },
+  phoneStripIcon:  { width: 30, height: 30, borderRadius: 9, backgroundColor: "#DCFCE7", alignItems: "center", justifyContent: "center" },
+  phoneStripTitle: { fontSize: 12.5, fontWeight: "800", color: "#0B1220" },
+  phoneStripSub:   { fontSize: 11, fontWeight: "600", color: "#6B7280", marginTop: 1 },
+
+    // time filter
+  searchFilterOn:  { backgroundColor: "#16A34A" },
+  timePillRow:     { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingBottom: 8, backgroundColor: "#fff" },
+  timePill:        { flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: "#F0FDF4", borderWidth: 1, borderColor: "#86EFAC", paddingHorizontal: 12, paddingVertical: 6, borderRadius: 999 },
+  timePillTxt:     { fontSize: 12, fontWeight: "700", color: "#15803D" },
+  sheetBackdrop:   { flex: 1, backgroundColor: "rgba(0,0,0,0.45)", justifyContent: "flex-end" },
+  sheet:           { backgroundColor: "#fff", borderTopLeftRadius: 24, borderTopRightRadius: 24, paddingHorizontal: 20, paddingTop: 10 },
+  sheetHandle:     { width: 40, height: 4, borderRadius: 2, backgroundColor: "#E5E7EB", alignSelf: "center", marginBottom: 14 },
+  sheetTitle:      { fontSize: 19, fontWeight: "800", color: "#0B1220" },
+  sheetSub:        { fontSize: 12.5, color: "#6B7280", fontWeight: "600", marginTop: 2 },
+  sheetLabel:      { fontSize: 11, fontWeight: "800", color: "#6B7280", letterSpacing: 0.5, marginTop: 18, marginBottom: 8 },
+  hourChip:        { paddingHorizontal: 14, paddingVertical: 10, borderRadius: 12, backgroundColor: "#F3F4F6", borderWidth: 1, borderColor: "#E5E7EB" },
+  durChip:         { flex: 1, alignItems: "center", paddingVertical: 11, borderRadius: 12, backgroundColor: "#F3F4F6", borderWidth: 1, borderColor: "#E5E7EB" },
+  hourChipOn:      { backgroundColor: "#0B1220", borderColor: "#0B1220" },
+  hourChipPast:    { opacity: 0.35 },
+  hourChipTxt:     { fontSize: 13, fontWeight: "700", color: "#374151" },
+  hourChipTxtOn:   { color: "#fff" },
+  hourChipTxtPast: { color: "#9CA3AF" },
+  sheetPreview:    { marginTop: 14, fontSize: 15, fontWeight: "800", color: "#15803D", textAlign: "center" },
+  sheetClearBtn:   { flex: 1, height: 48, borderRadius: 14, backgroundColor: "#F3F4F6", alignItems: "center", justifyContent: "center" },
+  sheetClearTxt:   { fontSize: 14, fontWeight: "800", color: "#374151" },
+  sheetApplyBtn:   { flex: 2, height: 48, borderRadius: 14, backgroundColor: "#16A34A", alignItems: "center", justifyContent: "center" },
+  sheetApplyTxt:   { fontSize: 14, fontWeight: "800", color: "#fff" },
 });

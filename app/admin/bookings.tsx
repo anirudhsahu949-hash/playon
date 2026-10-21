@@ -1,8 +1,10 @@
 import {
-  View, Text, StyleSheet, SafeAreaView, StatusBar, FlatList,
+  View, Text, StyleSheet, StatusBar, FlatList,
   TouchableOpacity, Alert, ActivityIndicator, TextInput,
   RefreshControl, Modal, ScrollView, Platform,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
 import { useEffect, useMemo, useState } from "react";
 import { db } from "../../firebaseConfig";
 import { collection, query, where, orderBy, limit, getDocs } from "firebase/firestore";
@@ -258,6 +260,8 @@ function BookingCard({ item, onPress }: { item: Booking; onPress: () => void }) 
 
 // ─── Main Screen ──────────────────────────────────────────────────────────────
 export default function AdminBookings() {
+  const insets = useSafeAreaInsets();
+
   const [bookings,   setBookings]   = useState<Booking[]>([]);
   const [loading,    setLoading]    = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -412,7 +416,7 @@ const [cancelling,   setCancelling]   = useState(false);
 };
 
   return (
-    <SafeAreaView style={s.root}>
+    <View style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
       <FlatList
@@ -426,7 +430,7 @@ const [cancelling,   setCancelling]   = useState(false);
         ListHeaderComponent={
           <View>
             {/* ── Dark header ── */}
-            <View style={s.header}>
+             <View style={[s.header, { paddingTop: insets.top + 12 }]}>
               <View>
                 <Text style={s.headerTag}>Admin · Bookings</Text>
                 <Text style={s.headerTitle}>Bookings</Text>
@@ -746,7 +750,7 @@ const [cancelling,   setCancelling]   = useState(false);
       </Modal>
 
       <AdminNavBar />
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -786,7 +790,6 @@ const s = StyleSheet.create({
   header: {
     backgroundColor: DARK,
     paddingHorizontal: 20,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 18,
     paddingBottom: 20,
     flexDirection: "row",
     alignItems: "flex-end",

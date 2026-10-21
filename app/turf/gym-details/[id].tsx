@@ -4,7 +4,6 @@ import {
   StyleSheet,
   ScrollView,
   TouchableOpacity,
-  SafeAreaView,
   StatusBar,
   ActivityIndicator,
   Platform,
@@ -18,13 +17,17 @@ import {
   Keyboard,
   Pressable,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useMemo, useState } from "react";
 import { doc, getDoc } from "firebase/firestore";
 import { db, auth } from "../../../firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
-import RazorpayCheckout from "react-native-razorpay";
+
+const RazorpayCheckout = !__DEV__
+  ? require("react-native-razorpay").default
+  : { open: () => Promise.reject({ error: { description: "Razorpay not available in Expo Go" } }) };
 
 const SERVER_URL = "https://bookora-backend-95u4.onrender.com";
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get("window");
@@ -111,6 +114,7 @@ const savingsPct = (p: any): number | null =>
 
 // ─── Screen ───────────────────────────────────────────────────────────────────
 export default function GymDetailScreen() {
+  
   const { id } = useLocalSearchParams();
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -441,7 +445,7 @@ export default function GymDetailScreen() {
   const barBottomPad = Math.max(insets.bottom, 12) + 6;
 
   return (
-    <SafeAreaView style={styles.container} edges={["top"]}>
+    <View style={styles.container} edges={["top"]}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
       <ScrollView
@@ -449,7 +453,7 @@ export default function GymDetailScreen() {
         contentContainerStyle={{ paddingBottom: 150 + insets.bottom }}
       >
         {/* ── Hero carousel ── */}
-        <View style={styles.hero}>
+     <View style={[styles.hero, { paddingTop: insets.top + 12 }]}>
           <ScrollView
             horizontal pagingEnabled showsHorizontalScrollIndicator={false}
             onMomentumScrollEnd={onHeroScroll}
@@ -904,7 +908,7 @@ export default function GymDetailScreen() {
           )}
         </View>
       </Modal>
-    </SafeAreaView>
+    </View>
   );
 }
 

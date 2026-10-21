@@ -6,12 +6,12 @@ import {
   StyleSheet,
   Alert,
   ScrollView,
-  SafeAreaView,
   StatusBar,
   ActivityIndicator,
   Platform,
   Switch,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useState, useEffect } from "react";
 import { db,auth } from "../../firebaseConfig";
 import {
@@ -23,6 +23,7 @@ import {
   updateDoc,   // ✅ BUG FIX #3: needed to write turfId back to operator's user doc
   doc,         // ✅ BUG FIX #3: needed for updateDoc reference
   serverTimestamp,
+  
 } from "firebase/firestore";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
@@ -57,13 +58,22 @@ const SPORTS = [
 ];
 
 const VENUE_TYPES = [
-  { key: "turf",     label: "Turf",  emoji: "🏏,⚽" },
-  { key: "court",    label: "Indoor Court",  emoji: "🏸" },
-  { key: "gym",      label: "Gym / Fitness", emoji: "🏋️" },
-  { key: "swimming", label: "Swimming Pool", emoji: "🏊" },
-  { key: "club",     label: "Club / Arena",  emoji: "🏟️" },
+  { key: "turf",         label: "Turf",  emoji: "🏏,⚽" },
+  { key: "court",        label: "Indoor Court",  emoji: "🏸" },
+  { key: "gym",          label: "Gym / Fitness", emoji: "🏋️" },
+  { key: "swimming",     label: "Swimming Pool", emoji: "🏊" },
+  { key: "club",         label: "Club / Arena",  emoji: "🏟️" },
+  { key: "ball_machine", label: "Ball Machine Only", emoji: "🎯" },
     { key: "other",    label: "Other",         emoji: "➕" },
 ];
+
+// ── Booking modes (admin-only control) ───────────────────────────────────────
+const BOOKING_MODES = [
+  { key: "online", label: "Online",     icon: "phone-portrait-outline" },
+  { key: "phone",  label: "Phone Only", icon: "call-outline" },
+  { key: "both",   label: "Both",       icon: "swap-horizontal-outline" },
+] as const;
+type BookingMode = "online" | "phone" | "both";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 type Owner = {
@@ -106,6 +116,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 // ── Main component ────────────────────────────────────────────────────────────
 export default function AddTurf() {
+  const insets = useSafeAreaInsets();
   const router = useRouter();
 
   const [venueType, setVenueType] = useState("turf");
@@ -128,7 +139,30 @@ export default function AddTurf() {
   const [closingTime,  setClosingTime]  = useState("23");
   const [slotDuration, setSlotDuration] = useState("60");
 
-  // ── Section 2: Facilities ────────────────────────────────────────────────
+    // ── Booking mode (admin decides; owner cannot change) ───────────────────
+  const [bookingMode,  setBookingMode]  = useState<BookingMode>("online");
+  const [bookingPhone, setBookingPhone] = useState("");
+
+  const needsAdvance = bookingMode !== "phone"; // phone-only = no online payment
+
+  // ── Section 2: Ball Machine (optional add-on or standalone venue) ────────
+  type BallMachinePackage = {
+    id: string;
+    label: string;
+    overs: number;
+    durationMinutes: number;
+    price: number;
+  };
+  const [ballMachineEnabled,      setBallMachineEnabled]      = useState(false);
+  const [ballMachineCount,        setBallMachineCount]        = useState("1");
+  const [ballMachineOpeningTime,  setBallMachineOpeningTime]  = useState("");
+  const [ballMachineClosingTime,  setBallMachineClosingTime]  = useState("");
+  const [ballMachinePackages,     setBallMachinePackages]     = useState<BallMachinePackage[]>([]);
+  const [pkgOvers,                setPkgOvers]                = useState("");
+  const [pkgDurationMinutes,      setPkgDurationMinutes]      = useState("");
+  const [pkgPrice,                setPkgPrice]                = useState("");
+
+  // ── Section 3: Facilities ────────────────────────────────────────────────
   const [selectedFacilities, setSelectedFacilities] = useState<string[]>([]);
 
   // ── Section 3: Images ────────────────────────────────────────────────────
@@ -167,9 +201,17 @@ export default function AddTurf() {
   const [opPhone,          setOpPhone]          = useState("");
   const [showOpPassword,   setShowOpPassword]   = useState(false);
 
+  // ── Ball Machine Only venue: no regular slot booking at all, so sport,
+  // day/night pricing, advance price, and slot duration don't apply — Ball
+  // Machine packages ARE the venue's entire offering, not an add-on.
+  const isBallMachineOnly = venueType === "ball_machine";
+
   // ── Fetch on mount ───────────────────────────────────────────────────────
   useEffect(() => { fetchOwners(); }, []);
   useEffect(() => { if (addOperator) fetchOperators(); }, [addOperator]);
+  useEffect(() => {
+    if (isBallMachineOnly) setBallMachineEnabled(true);
+  }, [isBallMachineOnly]);
 
   const fetchOwners = async () => {
     try {
@@ -230,6 +272,30 @@ export default function AddTurf() {
     if (selectedSport === "Other") setCustomSport("");
   };
 
+  // ── Ball Machine package helpers ────────────────────────────────────────
+  const addBallMachinePackage = () => {
+    const overs    = Number(pkgOvers);
+    const duration = Number(pkgDurationMinutes);
+    const price    = Number(pkgPrice);
+
+    if (!overs || overs <= 0)    return Alert.alert("Invalid Package", "Enter a valid number of overs.");
+    if (!duration || duration <= 0) return Alert.alert("Invalid Package", "Enter a valid session duration in minutes.");
+    if (!price || price <= 0)    return Alert.alert("Invalid Package", "Enter a valid price.");
+
+    const newPkg: BallMachinePackage = {
+      id: `pkg_${Date.now()}`,
+      label: `${overs} Overs`,
+      overs,
+      durationMinutes: duration,
+      price,
+    };
+    setBallMachinePackages((prev) => [...prev, newPkg]);
+    setPkgOvers(""); setPkgDurationMinutes(""); setPkgPrice("");
+  };
+
+  const removeBallMachinePackage = (id: string) =>
+    setBallMachinePackages((prev) => prev.filter((p) => p.id !== id));
+
   const filteredOwners = owners.filter((o) => {
     const q = ownerSearch.toLowerCase();
     return !q || (o.name || "").toLowerCase().includes(q) || (o.email || "").toLowerCase().includes(q);
@@ -245,6 +311,9 @@ export default function AddTurf() {
     setName(""); setLocation(""); setSports([]); setCustomSport(""); setMapLink("");
     setDayPrice(""); setNightPrice(""); setBookingPrice("");
     setOpeningTime("6"); setClosingTime("23"); setSlotDuration("60");
+    setBallMachineEnabled(false); setBallMachineCount("1");
+    setBallMachineOpeningTime(""); setBallMachineClosingTime("");
+    setBallMachinePackages([]); setPkgOvers(""); setPkgDurationMinutes(""); setPkgPrice("");
     setSelectedFacilities([]);
     setImageInput(""); setImages([]); setCoverImage("");
     setSelectedOwner(null); setOwnerMode("existing"); setOwnerSearch("");
@@ -254,6 +323,7 @@ export default function AddTurf() {
     setAddOperator(false); setSelectedOperator(null); setOperatorMode("existing");
     setOperatorSearch(""); setOpName(""); setOpEmail(""); setOpPassword("");
     setOpPhone(""); setShowOpPassword(false);setVenueType("turf");setCustomVenueType("");
+        setBookingMode("online"); setBookingPhone("");
   };
 
   // ── Validate ──────────────────────────────────────────────────────────────
@@ -267,26 +337,48 @@ export default function AddTurf() {
     // ✅ BUG FIX #2 — sports[] can contain "Other" if user toggled it but
     // never typed a custom name. Filter it out before checking length.
     const finalSports = sports.filter((s) => s !== "Other");
-    if (finalSports.length === 0) return "Select at least one sport.";
+    if (!isBallMachineOnly && finalSports.length === 0) return "Select at least one sport.";
 
-    if (!dayPrice.trim()     || Number(dayPrice)     <= 0) return "Enter a valid day price.";
-    if (!nightPrice.trim()   || Number(nightPrice)   <= 0) return "Enter a valid night price.";
-    if (!bookingPrice.trim() || Number(bookingPrice) <= 0) return "Enter a valid advance booking price.";
-
-    // ✅ BUG FIX #2b — original check used && which means BOTH had to be exceeded.
-    // Correct logic: advance must not exceed EITHER day or night price.
-    if (
-      Number(bookingPrice) > Number(dayPrice) ||
-      Number(bookingPrice) > Number(nightPrice)
-    ) return "Advance booking price cannot exceed the slot price.";
+    if (!isBallMachineOnly) {
+      if (!dayPrice.trim()     || Number(dayPrice)     <= 0) return "Enter a valid day price.";
+      if (!nightPrice.trim()   || Number(nightPrice)   <= 0) return "Enter a valid night price.";
+        if (needsAdvance) {
+        if (!bookingPrice.trim() || Number(bookingPrice) <= 0) return "Enter a valid advance booking price.";
+        if (
+          Number(bookingPrice) > Number(dayPrice) ||
+          Number(bookingPrice) > Number(nightPrice)
+        ) return "Advance booking price cannot exceed the slot price.";
+      }
+    }
 
     if (Number(openingTime) < 0  || Number(openingTime) > 23)
       return "Opening time must be 0–23.";
-    if (Number(closingTime) < 1  || Number(closingTime) > 24)
-      return "Closing time must be 1–24.";
+        if (Number(closingTime) < 1  || Number(closingTime) > 28)
+      return "Closing time must be 1–28 (25 = 1 AM, 26 = 2 AM, 27 = 3 AM, 28 = 4 AM next day).";
     if (Number(closingTime) <= Number(openingTime))
       return "Closing time must be after opening time.";
-    if (Number(slotDuration) <= 0) return "Enter a valid slot duration.";
+    if (Number(closingTime) > 24 && Number(openingTime) < Number(closingTime) - 24)
+      return `Late-night turfs must open at ${Number(closingTime) - 24} AM or later (so night slots don't overlap the next morning).`;
+    if (!isBallMachineOnly && Number(slotDuration) <= 0) return "Enter a valid slot duration.";
+
+    if (ballMachineEnabled) {
+      if (!ballMachineCount.trim() || Number(ballMachineCount) < 1)
+        return "Enter how many Ball Machines this venue has (at least 1).";
+      if (ballMachinePackages.length === 0)
+        return "Add at least one Ball Machine package (e.g. 6 Overs — ₹150).";
+      if (ballMachineOpeningTime.trim()) {
+        if (Number(ballMachineOpeningTime) < 0 || Number(ballMachineOpeningTime) > 23)
+          return "Ball Machine opening hour must be 0–23.";
+      }
+      if (ballMachineClosingTime.trim()) {
+        if (Number(ballMachineClosingTime) < 1 || Number(ballMachineClosingTime) > 24)
+          return "Ball Machine closing hour must be 1–24.";
+      }
+      if (
+        ballMachineOpeningTime.trim() && ballMachineClosingTime.trim() &&
+        Number(ballMachineClosingTime) <= Number(ballMachineOpeningTime)
+      ) return "Ball Machine closing hour must be after its opening hour.";
+    }
 
     if (ownerMode === "existing" && !selectedOwner) return "Please select an owner.";
     if (ownerMode === "new") {
@@ -316,6 +408,12 @@ export default function AddTurf() {
       }
     }
 
+    
+      if (bookingMode !== "online") {
+      const digits = bookingPhone.replace(/\D/g, "").slice(-10);
+      if (!/^[6-9]\d{9}$/.test(digits))
+        return "Enter a valid 10-digit booking phone number.";
+    }
     return null;
   };
 
@@ -445,15 +543,23 @@ export default function AddTurf() {
       const turfRef = await addDoc(collection(db, "turfs"), {
         name:         name.trim(),
         location:     location.trim(),
-        sport:        finalSports,     // ✅ BUG FIX #2: no stray "Other" string
+        // Ball Machine Only venues are cricket practice by definition — no
+        // sport picker is shown for them, so don't rely on finalSports (empty).
+        sport:        isBallMachineOnly ? ["Cricket"] : finalSports,     // ✅ BUG FIX #2: no stray "Other" string
         mapLink:      mapLink.trim(),
-        dayPrice:     Number(dayPrice),
-        nightPrice:   Number(nightPrice),
-        bookingPrice: Number(bookingPrice),
-        price:        Number(dayPrice), // legacy field kept for backwards compat
+        // Regular slot pricing doesn't apply when this venue has no slot
+        // booking at all — stored as 0 rather than left undefined, so any
+        // screen reading these fields gets a safe number instead of NaN.
+        dayPrice:     isBallMachineOnly ? 0 : Number(dayPrice),
+        nightPrice:   isBallMachineOnly ? 0 : Number(nightPrice),
+       
+        price:        isBallMachineOnly ? 0 : Number(dayPrice), // legacy field kept for backwards compat
         openingTime:  Number(openingTime),
         closingTime:  Number(closingTime),
-        slotDuration: Number(slotDuration),
+        slotDuration: isBallMachineOnly ? 0 : Number(slotDuration),
+        // ✅ Lets any customer/admin screen know this venue has no regular
+        // turf-slot booking flow at all — Ball Machine is its only offering.
+        slotBookingEnabled: !isBallMachineOnly,
         image:        coverImage.trim() || images[0] || "",
         images,
         facilities:   selectedFacilities,
@@ -465,10 +571,26 @@ export default function AddTurf() {
         operatorEmail,
         active:       true,
         createdAt:    serverTimestamp(),
+                     bookingPrice: isBallMachineOnly || !needsAdvance ? 0 : Number(bookingPrice),
+
+        // ✅ Offline/phone booking — set by admin only
+        bookingMode,
+        bookingPhone: bookingMode === "online"
+          ? ""
+          : bookingPhone.replace(/\D/g, "").slice(-10),
 
         venueType: venueType === "other"
   ? customVenueType.trim() || "other"
   : venueType,
+
+        // ✅ Ball Machine — optional add-on (or the venue's whole offering)
+        ballMachineEnabled,
+        ...(ballMachineEnabled ? {
+          ballMachineCount: Number(ballMachineCount),
+          ...(ballMachineOpeningTime.trim() ? { ballMachineOpeningTime: Number(ballMachineOpeningTime) } : {}),
+          ...(ballMachineClosingTime.trim() ? { ballMachineClosingTime: Number(ballMachineClosingTime) } : {}),
+          ballMachinePackages,
+        } : {}),
       });
 
       // ✅ BUG FIX #3 — write turfId + turfName back to operator's user doc
@@ -497,7 +619,7 @@ export default function AddTurf() {
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <SafeAreaView style={styles.safe}>
+    <View style={styles.safe}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
       <ScrollView
@@ -506,7 +628,8 @@ export default function AddTurf() {
         keyboardShouldPersistTaps="handled"
       >
         {/* ── Hero ── */}
-        <View style={styles.hero}>
+        {/* ── Hero ── */}
+<View style={[styles.hero, { paddingTop: insets.top + 14 }]}>
           <View style={styles.glow1} />
           <View style={styles.glow2} />
           <TouchableOpacity style={styles.backBtn} onPress={() => router.back()}>
@@ -608,7 +731,8 @@ export default function AddTurf() {
             />
           </Field>
 
-          {/* Sport chips */}
+          {/* Sport chips — not shown for Ball Machine Only venues (always Cricket) */}
+          {!isBallMachineOnly && (
           <Field label="Sport *">
             {/* ✅ BUG FIX #1 — sport chips now show a "selected" summary so
                 the user can see what they picked even before scrolling */}
@@ -687,6 +811,16 @@ export default function AddTurf() {
               </View>
             )}
           </Field>
+          )}
+
+          {isBallMachineOnly && (
+            <View style={[styles.newOwnerBanner, { marginTop: 14 }]}>
+              <Ionicons name="information-circle-outline" size={16} color="#1D4ED8" />
+              <Text style={styles.newOwnerBannerText}>
+                Ball Machine Only venues are cricket practice by default — no sport selection needed.
+              </Text>
+            </View>
+          )}
 
           <Field label="Google Maps Link">
             <TextInput
@@ -696,7 +830,8 @@ export default function AddTurf() {
             />
           </Field>
 
-          {/* Pricing */}
+          {/* Pricing — not applicable when there's no regular slot booking */}
+          {!isBallMachineOnly && (
           <Field label="Pricing *">
             <View style={styles.priceRow}>
               <View style={{ flex: 1 }}>
@@ -717,20 +852,81 @@ export default function AddTurf() {
                 />
               </View>
             </View>
-            <Text style={styles.priceLabel}>Advance Booking Amount</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="Amount user pays online to lock the slot"
-              placeholderTextColor="#9CA3AF" keyboardType="numeric"
-              value={bookingPrice} onChangeText={setBookingPrice}
-            />
+                        {needsAdvance && (
+              <>
+                <Text style={styles.priceLabel}>Advance Booking Amount</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Amount user pays online to lock the slot"
+                  placeholderTextColor="#9CA3AF" keyboardType="numeric"
+                  value={bookingPrice} onChangeText={setBookingPrice}
+                />
+                <Text style={styles.hint}>
+                  This is the advance the user pays via Razorpay. Rest is collected at venue.
+                </Text>
+              </>
+            )}
+          </Field>
+          )}
+
+                    {/* ── Booking Mode (admin only) ── */}
+          <Field label="Booking Mode *">
+            <View style={styles.modeRow}>
+              {BOOKING_MODES.map((m) => {
+                const active = bookingMode === m.key;
+                return (
+                  <TouchableOpacity
+                    key={m.key}
+                    style={[styles.modeBtn, active && styles.modeBtnActive]}
+                    onPress={() => setBookingMode(m.key)}
+                  >
+                    <Ionicons
+                      name={m.icon as any} size={14}
+                      color={active ? "#fff" : "#6B7280"}
+                      style={{ marginRight: 6 }}
+                    />
+                    <Text style={[styles.modeBtnText, active && styles.modeBtnTextActive]}>
+                      {m.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
             <Text style={styles.hint}>
-              This is the advance the user pays via Razorpay. Rest is collected at venue.
+              {bookingMode === "online" && "Users book and pay the advance in the app."}
+              {bookingMode === "phone"  && "No online booking. Users see facilities and call this number to book."}
+              {bookingMode === "both"   && "Users can book online or call this number."}
             </Text>
+
+            {bookingMode !== "online" && (
+              <View style={{ marginTop: 10 }}>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Turf booking number (10 digits)"
+                  placeholderTextColor="#9CA3AF"
+                  keyboardType="phone-pad"
+                  maxLength={13}
+                  value={bookingPhone}
+                  onChangeText={setBookingPhone}
+                />
+                {(selectedOwner?.phone || ownerPhone) ? (
+                  <TouchableOpacity
+                    onPress={() => setBookingPhone(selectedOwner?.phone || ownerPhone)}
+                  >
+                    <Text style={[styles.hint, { color: ACCENT, fontWeight: "700" }]}>
+                      Use owner's number ({selectedOwner?.phone || ownerPhone})
+                    </Text>
+                  </TouchableOpacity>
+                ) : null}
+              </View>
+            )}
           </Field>
 
-          {/* Timings */}
-          <Field label="Timings *">
+          {/* Timings — opening/closing hour always required (general venue
+              hours, and the default source for Ball Machine's own hours);
+              Slot Duration only applies when there's regular slot booking. */}
+          <Field label={isBallMachineOnly ? "Venue Hours *" : "Timings *"}>
             <View style={styles.priceRow}>
               <View style={{ flex: 1 }}>
                 <Text style={styles.priceLabel}>Opening Hour (0–23)</Text>
@@ -742,7 +938,7 @@ export default function AddTurf() {
               </View>
               <View style={{ width: 12 }} />
               <View style={{ flex: 1 }}>
-                <Text style={styles.priceLabel}>Closing Hour (1–24)</Text>
+                <Text style={styles.priceLabel}>Closing Hour (1–28)</Text>
                 <TextInput
                   style={styles.input} placeholder="23"
                   placeholderTextColor="#9CA3AF" keyboardType="numeric"
@@ -750,28 +946,168 @@ export default function AddTurf() {
                 />
               </View>
             </View>
-            <Text style={styles.priceLabel}>Slot Duration (minutes)</Text>
-            <View style={styles.chipRow}>
-              {["30", "60", "90", "120"].map((d) => (
-                <TouchableOpacity
-                  key={d}
-                  style={[styles.chip, slotDuration === d && styles.chipActive]}
-                  onPress={() => setSlotDuration(d)}
-                >
-                  <Text style={[styles.chipText, slotDuration === d && styles.chipTextActive]}>
-                    {d} min
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
+            {Number(closingTime) > 24 && (
+              <Text style={styles.hint}>
+                🌙 Closes at {Number(closingTime) - 24}:00 AM next day. Owner can set the late-night booking cutoff in My Turfs.
+              </Text>
+            )}
+            {!isBallMachineOnly && (
+              <>
+                <Text style={styles.priceLabel}>Slot Duration (minutes)</Text>
+                <View style={styles.chipRow}>
+                  {["30", "60", "90", "120"].map((d) => (
+                    <TouchableOpacity
+                      key={d}
+                      style={[styles.chip, slotDuration === d && styles.chipActive]}
+                      onPress={() => setSlotDuration(d)}
+                    >
+                      <Text style={[styles.chipText, slotDuration === d && styles.chipTextActive]}>
+                        {d} min
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </>
+            )}
+            {isBallMachineOnly && (
+              <Text style={styles.hint}>
+                Used as this venue's default Ball Machine hours below (unless overridden there).
+              </Text>
+            )}
           </Field>
         </View>
 
         {/* ══════════════════════════════════════════
-            SECTION 2 — FACILITIES
+            SECTION 2 — BALL MACHINE (optional)
         ══════════════════════════════════════════ */}
         <View style={styles.card}>
-          <SectionHeader number="2" title="Facilities" subtitle="Tap to select what's available" />
+          <SectionHeader
+            number="2" title="Ball Machine"
+            subtitle={isBallMachineOnly
+              ? "This venue's only offering — required"
+              : "Optional — pay-per-over bowling machine practice"}
+          />
+
+          {isBallMachineOnly ? (
+            <View style={styles.bmToggleRow}>
+              <Ionicons name="lock-closed" size={16} color={ACCENT} style={{ marginRight: 10 }} />
+              <Text style={[styles.hint, { flex: 1 }]}>
+                Ball Machine is always on for a "Ball Machine Only" venue — set its details below.
+              </Text>
+            </View>
+          ) : (
+            <View style={styles.bmToggleRow}>
+              <View style={{ flex: 1, marginRight: 12 }}>
+                <Text style={styles.bmToggleTitle}>Offer Ball Machine at this venue</Text>
+                <Text style={styles.hint}>
+                  Short, pre-booked practice sessions (e.g. 6 overs / ₹150) — separate from regular slot bookings above.
+                </Text>
+              </View>
+              <Switch
+                value={ballMachineEnabled}
+                onValueChange={setBallMachineEnabled}
+                trackColor={{ false: "#E5E7EB", true: ACCENT }}
+                thumbColor="#fff"
+              />
+            </View>
+          )}
+
+          {ballMachineEnabled && (
+            <>
+              <Field label="Number of Machines *">
+                <TextInput
+                  style={styles.input} placeholder="e.g. 1"
+                  placeholderTextColor="#9CA3AF" keyboardType="numeric"
+                  value={ballMachineCount} onChangeText={setBallMachineCount}
+                />
+                <Text style={styles.hint}>How many bays/machines can run bookings in parallel.</Text>
+              </Field>
+
+              <Field label="Operating Hours (optional)">
+                <View style={styles.priceRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.priceLabel}>Opening Hour (0–23)</Text>
+                    <TextInput
+                      style={styles.input} placeholder={`Default: ${openingTime || "6"}`}
+                      placeholderTextColor="#9CA3AF" keyboardType="numeric"
+                      value={ballMachineOpeningTime} onChangeText={setBallMachineOpeningTime}
+                    />
+                  </View>
+                  <View style={{ width: 12 }} />
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.priceLabel}>Closing Hour (1–24)</Text>
+                    <TextInput
+                      style={styles.input} placeholder={`Default: ${closingTime || "23"}`}
+                      placeholderTextColor="#9CA3AF" keyboardType="numeric"
+                      value={ballMachineClosingTime} onChangeText={setBallMachineClosingTime}
+                    />
+                  </View>
+                </View>
+                <Text style={styles.hint}>Leave blank to use the turf's regular timings above.</Text>
+              </Field>
+
+              <Field label="Packages *">
+                {ballMachinePackages.length > 0 && (
+                  <View style={{ gap: 8, marginBottom: 12 }}>
+                    {ballMachinePackages.map((p) => (
+                      <View key={p.id} style={styles.bmPkgRow}>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.bmPkgLabel}>{p.label}</Text>
+                          <Text style={styles.bmPkgMeta}>{p.durationMinutes} min · ₹{p.price}</Text>
+                        </View>
+                        <TouchableOpacity onPress={() => removeBallMachinePackage(p.id)}>
+                          <Ionicons name="close-circle" size={20} color="#DC2626" />
+                        </TouchableOpacity>
+                      </View>
+                    ))}
+                  </View>
+                )}
+
+                <View style={styles.bmPkgForm}>
+                  <View style={{ flexDirection: "row", gap: 8 }}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.priceLabel}>Overs</Text>
+                      <TextInput
+                        style={styles.input} placeholder="6"
+                        placeholderTextColor="#9CA3AF" keyboardType="numeric"
+                        value={pkgOvers} onChangeText={setPkgOvers}
+                      />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.priceLabel}>Duration (min)</Text>
+                      <TextInput
+                        style={styles.input} placeholder="15"
+                        placeholderTextColor="#9CA3AF" keyboardType="numeric"
+                        value={pkgDurationMinutes} onChangeText={setPkgDurationMinutes}
+                      />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.priceLabel}>Price (₹)</Text>
+                      <TextInput
+                        style={styles.input} placeholder="150"
+                        placeholderTextColor="#9CA3AF" keyboardType="numeric"
+                        value={pkgPrice} onChangeText={setPkgPrice}
+                      />
+                    </View>
+                  </View>
+                  <TouchableOpacity style={styles.bmAddPkgBtn} onPress={addBallMachinePackage} activeOpacity={0.85}>
+                    <Ionicons name="add" size={16} color="#fff" />
+                    <Text style={styles.bmAddPkgText}>Add Package</Text>
+                  </TouchableOpacity>
+                </View>
+                <Text style={styles.hint}>
+                  e.g. 6 overs / 15 min / ₹150, and 12 overs / 30 min / ₹300. Add as many tiers as this venue offers.
+                </Text>
+              </Field>
+            </>
+          )}
+        </View>
+
+        {/* ══════════════════════════════════════════
+            SECTION 3 — FACILITIES
+        ══════════════════════════════════════════ */}
+        <View style={styles.card}>
+          <SectionHeader number="3" title="Facilities" subtitle="Tap to select what's available" />
           {selectedFacilities.length > 0 && (
             <View style={styles.selectedFacRow}>
               <Text style={styles.selectedFacText}>{selectedFacilities.length} selected</Text>
@@ -809,7 +1145,7 @@ export default function AddTurf() {
             SECTION 3 — IMAGES
         ══════════════════════════════════════════ */}
         <View style={styles.card}>
-          <SectionHeader number="3" title="Images" subtitle="Cover image + gallery" />
+          <SectionHeader number="4" title="Images" subtitle="Cover image + gallery" />
 
           <Field label="Cover Image URL">
             <TextInput
@@ -852,7 +1188,7 @@ export default function AddTurf() {
         ══════════════════════════════════════════ */}
         <View style={styles.card}>
           <SectionHeader
-            number="4" title="Owner"
+            number="5" title="Owner"
             subtitle="Assign to an existing owner or create a new one"
           />
 
@@ -1002,7 +1338,7 @@ export default function AddTurf() {
         {ownerMode === "new" && (
           <View style={styles.card}>
             <SectionHeader
-              number="4b"
+              number="5b"
               title="Banking Details"
               subtitle="For settlements and payouts to the owner"
             />
@@ -1072,7 +1408,7 @@ export default function AddTurf() {
           <View style={styles.operatorToggleRow}>
             <View style={{ flex: 1 }}>
               <SectionHeader
-                number="5" title="Turf Operator"
+                number="6" title="Turf Operator"
                 subtitle="Person present at turf to manage daily ops"
               />
             </View>
@@ -1257,7 +1593,7 @@ export default function AddTurf() {
 
         <View style={{ height: 48 }} />
       </ScrollView>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -1269,7 +1605,7 @@ const styles = StyleSheet.create({
   hero: {
     backgroundColor: DARK,
     paddingHorizontal: 20,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 20,
+   
     paddingBottom: 28,
     overflow: "hidden",
   },
@@ -1368,6 +1704,16 @@ const styles = StyleSheet.create({
   // ✅ Banking section
   bankBanner:     { flexDirection: "row", alignItems: "flex-start", gap: 8, backgroundColor: "#F0FDFA", borderRadius: 12, padding: 12, marginBottom: 4, borderWidth: 1, borderColor: "#99F6E4" },
   bankBannerText: { fontSize: 12, color: "#0F766E", fontWeight: "600", flex: 1, lineHeight: 18 },
+
+  // ✅ Ball Machine section
+  bmToggleRow:   { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 4 },
+  bmToggleTitle: { fontSize: 14, fontWeight: "800", color: "#111827", marginBottom: 4 },
+  bmPkgRow:      { flexDirection: "row", alignItems: "center", backgroundColor: "#F9FAFB", borderRadius: 12, padding: 12, borderWidth: 1, borderColor: "#E5E7EB" },
+  bmPkgLabel:    { fontSize: 14, fontWeight: "800", color: "#111827" },
+  bmPkgMeta:     { fontSize: 12, color: "#6B7280", marginTop: 2, fontWeight: "600" },
+  bmPkgForm:     { backgroundColor: "#F9FAFB", borderRadius: 14, padding: 12, borderWidth: 1, borderColor: "#E5E7EB" },
+  bmAddPkgBtn:   { flexDirection: "row", alignItems: "center", justifyContent: "center", backgroundColor: DARK, borderRadius: 10, paddingVertical: 10, marginTop: 10, gap: 6 },
+  bmAddPkgText:  { color: "#fff", fontSize: 13, fontWeight: "800" },
 
   venueChip:          { alignItems: "center", paddingHorizontal: 14, paddingVertical: 10, borderRadius: 14, backgroundColor: "#F3F4F6", borderWidth: 1.5, borderColor: "#E5E7EB", minWidth: 90 },
 venueChipActive:    { backgroundColor: DARK, borderColor: DARK },

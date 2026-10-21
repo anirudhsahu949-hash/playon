@@ -1,9 +1,11 @@
 import {
-  View, Text, StyleSheet, SafeAreaView, StatusBar, ScrollView,
+  View, Text, StyleSheet, StatusBar, ScrollView,
   TouchableOpacity, TextInput, Alert, ActivityIndicator,
   RefreshControl, Image, Switch, Modal, FlatList, Platform,
   Linking,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
 import { useEffect, useState } from "react";
 import { db, auth } from "../../firebaseConfig";
 import {
@@ -26,6 +28,7 @@ type Banner = {
 };
 
 export default function AdminSettings() {
+  const insets = useSafeAreaInsets();
   const router = useRouter();
   const [banners, setBanners] = useState<Banner[]>([]);
   const [loading, setLoading] = useState(true);
@@ -97,7 +100,7 @@ export default function AdminSettings() {
   };
 
   return (
-    <SafeAreaView style={s.safe}>
+    <View style={s.safe}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
       <ScrollView
         showsVerticalScrollIndicator={false}
@@ -105,7 +108,7 @@ export default function AdminSettings() {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchBanners(true)} tintColor={ACCENT} />}
       >
         {/* Hero */}
-        <View style={s.hero}>
+         <View style={[s.hero, { paddingTop: insets.top + 12 }]}>
           <View style={s.heroGlow1} /><View style={s.heroGlow2} />
           <Text style={s.heroTag}>Admin Controls</Text>
           <Text style={s.heroTitle}>Settings</Text>
@@ -226,7 +229,7 @@ export default function AdminSettings() {
 
         <View style={{ height: 40 }} />
       </ScrollView>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -234,7 +237,7 @@ const s = StyleSheet.create({
   safe: { flex: 1, backgroundColor: "#F0F4F8" },
   scroll: { paddingBottom: 20 },
 
-  hero: { backgroundColor: DARK, paddingHorizontal: 20, paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 18, paddingBottom: 28, overflow: "hidden" },
+  hero: { backgroundColor: DARK, paddingHorizontal: 20, paddingBottom: 28, overflow: "hidden" },
   heroGlow1: { position: "absolute", top: -40, right: -40, width: 200, height: 200, borderRadius: 100, backgroundColor: "rgba(14,165,164,0.13)" },
   heroGlow2: { position: "absolute", bottom: -60, left: -40, width: 180, height: 180, borderRadius: 90, backgroundColor: "rgba(124,58,237,0.10)" },
   heroTag: { color: "#6EE7B7", fontSize: 11, fontWeight: "800", letterSpacing: 1.5, textTransform: "uppercase" },

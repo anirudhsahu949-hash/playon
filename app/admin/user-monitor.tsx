@@ -1,9 +1,10 @@
 import React, { useEffect, useState, useMemo, useRef, useCallback } from "react";
 import {
-  View, Text, StyleSheet, SafeAreaView, ScrollView, FlatList, TouchableOpacity,
+  View, Text, StyleSheet, ScrollView, FlatList, TouchableOpacity,
   TextInput, Alert, ActivityIndicator, RefreshControl, StatusBar,
   Platform, Modal, Linking, Dimensions, Animated,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import {
@@ -391,6 +392,7 @@ function UserDetailModal({ user, visible, onClose, onUpdated, onDeleted, allBook
   onDeleted: (id: string) => void;
   allBookings: any[];   // ✅ from cache — 0 reads
 }) {
+  const insets = useSafeAreaInsets();
   const [updating, setUpdating] = useState(false);
 
   // ✅ Filter from cache — 0 Firestore reads
@@ -465,7 +467,7 @@ function UserDetailModal({ user, visible, onClose, onUpdated, onDeleted, allBook
         <StatusBar barStyle="dark-content" />
 
         {/* Header */}
-        <View style={dm.header}>
+        <View style={[dm.header, Platform.OS === "android" && { paddingTop: insets.top + 12 }]}>
           <TouchableOpacity style={dm.closeBtn} onPress={onClose}>
             <Ionicons name="close" size={20} color={GRAY5} />
           </TouchableOpacity>
@@ -629,6 +631,7 @@ function UserDetailModal({ user, visible, onClose, onUpdated, onDeleted, allBook
 
 // ─── Main Screen ──────────────────────────────────────────────────────────────
 export default function AdminUsers() {
+  const insets = useSafeAreaInsets();
   const router = useRouter();
 
   const [users,        setUsers]        = useState<AppUser[]>([]);
@@ -781,7 +784,7 @@ export default function AdminUsers() {
   );
 
   return (
-    <SafeAreaView style={s.root}>
+    <View style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
       {/* ── Everything in one FlatList — header + list scroll together ── */}
@@ -798,7 +801,7 @@ export default function AdminUsers() {
         ListHeaderComponent={
           <View>
             {/* ── Dark header ── */}
-            <View style={s.header}>
+            <View style={[s.header, { paddingTop: insets.top + 14 }]}>
               <View>
                 <Text style={s.headerTag}>Admin · Users</Text>
                 <Text style={s.headerTitle}>User Management</Text>
@@ -947,7 +950,7 @@ export default function AdminUsers() {
         onDeleted={onDeleted}
         allBookings={allBookings}
       />
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -961,7 +964,7 @@ const s = StyleSheet.create({
   header: {
     backgroundColor: DARK,
     paddingHorizontal: 20,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 14,
+   
     paddingBottom: 16,
     flexDirection: "row",
     alignItems: "flex-end",
@@ -1071,8 +1074,8 @@ const uc = StyleSheet.create({
 // ─── Detail modal styles ──────────────────────────────────────────────────────
 const dm = StyleSheet.create({
   root:    { flex: 1, backgroundColor: BODY_BG },
-  header:  { marginTop:20,  flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: GRAY2, backgroundColor: WHITE, gap: 10 },
-  closeBtn:{ marginTop:10,  width: 32, height: 32, borderRadius: 9, backgroundColor: GRAY1, justifyContent: "center", alignItems: "center" },
+  header:  {  flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: GRAY2, backgroundColor: WHITE, gap: 10 },
+  closeBtn:{ width: 32, height: 32, borderRadius: 9, backgroundColor: GRAY1, justifyContent: "center", alignItems: "center" },
   headerTitle: { flex: 1, fontSize: 16, fontWeight: "800", color: DARK },
   badge:   { flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 9, paddingVertical: 4, borderRadius: 20 },
   badgeTxt:{ fontSize: 10, fontWeight: "800" },

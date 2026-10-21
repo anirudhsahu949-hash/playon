@@ -1,10 +1,12 @@
-import { Tabs, Redirect } from "expo-router";
+import { Tabs, Redirect, useRouter } from "expo-router";
 import { useEffect, useState } from "react";
-import { ActivityIndicator, View, Platform } from "react-native";
+import { ActivityIndicator, View, Platform, TouchableOpacity, Text, StyleSheet } from "react-native";
 import { onAuthStateChanged } from "firebase/auth";
 import { doc, getDoc } from "firebase/firestore";
 import { auth, db } from "../../firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
+
+
 
 
 
@@ -14,6 +16,34 @@ const INACTIVE = "#9CA3AF";  // inactive tab icon / label
 const TAB_BG = "#FFFFFF";    // tab bar background
 const BORDER = "#E5E7EB";    // top border
 
+// ─── Center "Leagues" button → enters the league world ──────────────────────
+function LeagueTabButton() {
+  const router = useRouter();
+  return (
+    <TouchableOpacity
+      style={ctr.wrap}
+      activeOpacity={0.85}
+      onPress={() => router.push("/(playon-pro)")}
+    >
+      <View style={ctr.circle}>
+        <Ionicons name="trophy" size={22} color="#fff" />
+      </View>
+      <Text style={ctr.label}>Leagues</Text>
+    </TouchableOpacity>
+  );
+}
+
+const ctr = StyleSheet.create({
+  wrap: { flex: 1, alignItems: "center", justifyContent: "center", paddingBottom:30 },
+  circle: {
+    width: 44, height: 44, borderRadius: 22, backgroundColor: "#16A34A",
+    alignItems: "center", justifyContent: "center",
+    shadowColor: "#16A34A", shadowOpacity: 0.3, shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 }, elevation: 4,
+  },
+  label: { fontSize: 11, fontWeight: "600", color: "#15803D", marginTop: 2 },
+});
+
 // ─── Splash / loading screen while Firebase resolves ─────────────────────────
 function LoadingScreen() {
   return (
@@ -22,6 +52,8 @@ function LoadingScreen() {
     </View>
   );
 }
+
+
 
 
 
@@ -69,9 +101,7 @@ export default function UserTabLayout() {
   }
 
   // ── Not logged in → go to login ───────────────────────────────────────────
-  if (!user) {
-    return <Redirect href="/(auth)/login" />;
-  }
+ 
 
   // ── Wrong role → redirect to their correct app section ────────────────────
   if (role === "admin") {
@@ -83,6 +113,9 @@ export default function UserTabLayout() {
   if (role === "turf-operator") {
     return <Redirect href="/(turf-operator)" />;
   }
+ if (role === "league-owner") {
+  return <Redirect href="/(league-owner)" />;
+}
 
   // ── Correct role (user) → show the tab bar ────────────────────────────────
   return (
@@ -144,6 +177,42 @@ export default function UserTabLayout() {
         }}
       />
 
+      {/* ── Leagues (center action — navigates to the league world) ───────── */}
+<Tabs.Screen
+  name="leagues"
+  options={{
+    href: null,
+    headerShown: false,
+    tabBarStyle: { display: "none" },
+    tabBarItemStyle: { display: "none" },
+    
+  }}
+/>
+
+<Tabs.Screen
+  name="ai"
+  options={{
+    href: null,
+    headerShown: false,
+    tabBarStyle: { display: "none" },
+    tabBarItemStyle: { display: "none" },
+    
+  }}
+/>
+
+<Tabs.Screen
+  name="refer-venue"
+  options={{
+    href: null,
+    headerShown: false,
+    tabBarStyle: { display: "none" },
+    tabBarItemStyle: { display: "none" },
+    
+  }}
+/>
+
+<Tabs.Screen name="refer-earn-user" options={{ href: null }} />
+
       {/* ── My Bookings ──────────────────────────────────────────────────── */}
       <Tabs.Screen
         name="booking-users"
@@ -173,6 +242,36 @@ export default function UserTabLayout() {
           ),
         }}
       />
+
+      <Tabs.Screen
+  name="wallet"
+  options={{
+    href: null,
+    headerShown: false,
+    tabBarStyle: { display: "none" },
+    tabBarItemStyle: { display: "none" },
+  }}
+/>
+
+<Tabs.Screen
+  name="toss"
+  options={{
+    href: null,
+    headerShown: false,
+    tabBarStyle: { display: "none" },
+    tabBarItemStyle: { display: "none" },
+  }}
+/>
+
+<Tabs.Screen
+  name="GullyScorer"
+  options={{
+    href: null,
+    headerShown: false,
+    tabBarStyle: { display: "none" },
+    tabBarItemStyle: { display: "none" },
+  }}
+/>
     </Tabs>
   );
 }

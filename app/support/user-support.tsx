@@ -2,7 +2,6 @@ import {
   View,
   Text,
   StyleSheet,
-  SafeAreaView,
   StatusBar,
   ScrollView,
   TouchableOpacity,
@@ -14,6 +13,8 @@ import {
   LayoutAnimation,
   UIManager,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
 import { useEffect, useRef, useState } from "react";
 import { auth, db } from "../../firebaseConfig";
 import { doc, getDoc, addDoc, collection, serverTimestamp } from "firebase/firestore";
@@ -158,6 +159,7 @@ function FaqItem({ q, a, isLast }: { q: string; a: string; isLast: boolean }) {
 
 // ─── Main screen ──────────────────────────────────────────────────────────────
 export default function UserSupport() {
+  const insets = useSafeAreaInsets();
   const router = useRouter();
 
   const [userName,  setUserName]  = useState("");
@@ -225,13 +227,13 @@ export default function UserSupport() {
   };
 
   return (
-    <SafeAreaView style={s.root}>
+    <View style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={BRAND} />
 
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={s.scroll}>
+      <ScrollView keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive" automaticallyAdjustKeyboardInsets showsVerticalScrollIndicator={false} contentContainerStyle={s.scroll}>
 
         {/* ── Header ──────────────────────────────────────────────────── */}
-        <View style={s.header}>
+         <View style={[s.header, { paddingTop: insets.top + 12 }]}>
           <TouchableOpacity style={s.backBtn} onPress={() => router.back()} activeOpacity={0.7}>
             <Ionicons name="arrow-back" size={20} color="#fff" />
           </TouchableOpacity>
@@ -402,7 +404,7 @@ export default function UserSupport() {
         </View>
 
       </ScrollView>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -414,7 +416,6 @@ const s = StyleSheet.create({
   header: {
     backgroundColor: BRAND,
     paddingHorizontal: 20,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) + 12 : 16,
     paddingBottom: 32,
   },
   backBtn: {

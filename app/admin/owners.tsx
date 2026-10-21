@@ -1,9 +1,11 @@
 import {
-  View, Text, StyleSheet, SafeAreaView, StatusBar, FlatList,
+  View, Text, StyleSheet, StatusBar, FlatList,
   TouchableOpacity, TextInput, Alert, ActivityIndicator,
   RefreshControl, Modal, ScrollView, Switch, Platform,
   KeyboardAvoidingView,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
 import { useEffect, useMemo, useState } from "react";
 import { db, auth } from "../../firebaseConfig";
 import {
@@ -88,6 +90,8 @@ async function getAuthToken(): Promise<string | null> {
 }
 
 export default function AdminOwners() {
+  const insets = useSafeAreaInsets();
+
   const [owners,       setOwners]       = useState<Owner[]>([]);
   const [turfs,        setTurfs]        = useState<Turf[]>([]);
   const [loading,      setLoading]      = useState(true);
@@ -533,7 +537,7 @@ export default function AdminOwners() {
   );
 
   return (
-    <SafeAreaView style={s.safe}>
+    <View style={s.safe}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
       <FlatList
@@ -545,7 +549,7 @@ export default function AdminOwners() {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchAll(true)} tintColor={ACCENT} />}
         ListHeaderComponent={
           <View>
-            <View style={s.hero}>
+             <View style={[s.hero, { paddingTop: insets.top + 12 }]}>
               <View style={s.heroGlow1} /><View style={s.heroGlow2} />
               <Text style={s.heroTag}>Owner Management</Text>
               <Text style={s.heroTitle}>Owners</Text>
@@ -1076,7 +1080,7 @@ export default function AdminOwners() {
           </View>
         </KeyboardAvoidingView>
       </Modal>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -1086,7 +1090,7 @@ const s = StyleSheet.create({
   loadText: { marginTop: 12, color: "#9CA3AF", fontSize: 15, fontWeight: "600" },
   list:     { paddingBottom: 100 },
 
-  hero: { backgroundColor: DARK, paddingHorizontal: 20, paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 18, paddingBottom: 24, overflow: "hidden" },
+  hero: { backgroundColor: DARK, paddingHorizontal: 20, paddingBottom: 24, overflow: "hidden" },
   heroGlow1:     { position: "absolute", top: -40, right: -40, width: 200, height: 200, borderRadius: 100, backgroundColor: "rgba(124,58,237,0.14)" },
   heroGlow2:     { position: "absolute", bottom: -60, left: -40, width: 180, height: 180, borderRadius: 90, backgroundColor: "rgba(14,165,164,0.10)" },
   heroTag:       { color: "#C4B5FD", fontSize: 11, fontWeight: "800", letterSpacing: 1.5, textTransform: "uppercase" },

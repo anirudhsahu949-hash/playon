@@ -4,7 +4,6 @@ import {
   FlatList,
   TouchableOpacity,
   StyleSheet,
-  SafeAreaView,
   StatusBar,
   Platform,
   Animated,
@@ -13,6 +12,8 @@ import {
 import { useEffect, useState, useRef } from "react";
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
 import {
   getNotifications,
   markAllRead,
@@ -144,6 +145,7 @@ function EmptyState() {
 
 // ── Main screen ───────────────────────────────────────────────────────────────
 export default function NotificationsScreen() {
+  const insets = useSafeAreaInsets();
   const router = useRouter();
   const [notifs, setNotifs] = useState(getNotifications());
   const headerFade = useRef(new Animated.Value(0)).current;
@@ -158,11 +160,11 @@ export default function NotificationsScreen() {
   const unreadCount = notifs.filter((n) => !n.read).length;
 
   return (
-    <SafeAreaView style={s.root}>
+    <View style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={HEADER_BG} />
 
       {/* ── Dark header ── */}
-      <Animated.View style={[s.header, { opacity: headerFade }]}>
+      <Animated.View style={[s.header, { opacity: headerFade ,paddingTop: insets.top + 12 }]}>
         {/* Back */}
         <TouchableOpacity onPress={() => router.back()} style={s.backBtn} activeOpacity={0.7}>
           <Ionicons name="arrow-back" size={18} color={WHITE} />
@@ -230,7 +232,7 @@ export default function NotificationsScreen() {
           ListFooterComponent={<View style={{ height: 40 }} />}
         />
       )}
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -244,7 +246,6 @@ const s = StyleSheet.create({
     alignItems:       "center",
     backgroundColor:  HEADER_BG,
     paddingHorizontal: 16,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) + 14 : 14,
     paddingBottom:    18,
     gap: 12,
   },

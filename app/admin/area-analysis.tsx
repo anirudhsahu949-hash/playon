@@ -4,10 +4,11 @@
  * Shows which areas generate most bookings, revenue, and users
  */
 import {
-  View, Text, StyleSheet, SafeAreaView, StatusBar,
+  View, Text, StyleSheet,  StatusBar,
   ScrollView, TouchableOpacity, ActivityIndicator,
   Platform, RefreshControl, Dimensions,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useEffect, useState, useMemo } from "react";
 import { db } from "../../firebaseConfig";
 import { collection, getDocs } from "firebase/firestore";
@@ -90,6 +91,7 @@ function getHeatLabel(ratio: number): string {
 
 // ─────────────────────────────────────────────────────────────────────────────
 export default function AreaAnalytics() {
+  const insets = useSafeAreaInsets();
   const router = useRouter();
 
   const [loading,    setLoading]    = useState(true);
@@ -269,7 +271,7 @@ export default function AreaAnalytics() {
   );
 
   return (
-    <SafeAreaView style={s.safe}>
+    <View style={s.safe}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
       <ScrollView
@@ -278,7 +280,7 @@ export default function AreaAnalytics() {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchAll(true)} tintColor={ACCENT} />}
       >
         {/* ── Hero ── */}
-        <View style={s.hero}>
+         <View style={[s.hero, { paddingTop: insets.top + 12 }]}>
           <TouchableOpacity style={s.backBtn} onPress={() => router.back()}>
             <Ionicons name="arrow-back" size={20} color="#fff" />
           </TouchableOpacity>
@@ -498,7 +500,7 @@ export default function AreaAnalytics() {
           </View>
         )}
       </ScrollView>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -522,7 +524,6 @@ const s = StyleSheet.create({
   hero: {
     backgroundColor: DARK,
     paddingHorizontal: 20,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 18,
     paddingBottom: 24,
     overflow: "hidden",
   },

@@ -4,7 +4,6 @@ import {
   StyleSheet,
   FlatList,
   TouchableOpacity,
-  SafeAreaView,
   StatusBar,
   ActivityIndicator,
   Alert,
@@ -13,6 +12,8 @@ import {
   Platform,
   Modal,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
 import { useEffect, useState, useMemo, useRef } from "react";
 import { db, auth } from "../../firebaseConfig";
 import {
@@ -215,6 +216,8 @@ function getStatusLabel(b: Booking): { label: string; color: string; bg: string 
 
 // ── Main Component ────────────────────────────────────────────────────────────
 export default function TurfOperatorScreen() {
+  const insets = useSafeAreaInsets();
+
   const router = useRouter();
 
   const [profile,       setProfile]       = useState<OperatorProfile>({});
@@ -630,7 +633,7 @@ const updated: Booking = {
 
   // ── Main render ───────────────────────────────────────────────────────────
   return (
-    <SafeAreaView style={styles.safe}>
+    <View style={styles.safe}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
       <FlatList
@@ -643,7 +646,7 @@ const updated: Booking = {
         ListHeaderComponent={
           <View>
             {/* Hero */}
-            <View style={styles.hero}>
+             <View style={[styles.hero, { paddingTop: insets.top + 12 }]}>
               <View style={styles.glow1} />
               <View style={styles.glow2} />
               <View style={styles.heroTop}>
@@ -867,7 +870,7 @@ const updated: Booking = {
           </View>
         </View>
       </Modal>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -878,7 +881,7 @@ const styles = StyleSheet.create({
   loadText: { color: "#9CA3AF", marginTop: 12, fontSize: 15, fontWeight: "600" },
   list:     { paddingBottom: 100 },
 
-  hero:     { backgroundColor: DARK, paddingHorizontal: 20, paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 18, paddingBottom: 24, overflow: "hidden" },
+  hero:     { backgroundColor: DARK, paddingHorizontal: 20, paddingBottom: 24, overflow: "hidden" },
  // glow1:    { position: "absolute", top: -40,  right: -30, width: 180, height: 180, borderRadius: 90, backgroundColor: "rgba(14,165,164,0.15)" },//
   //glow2:    { position: "absolute", bottom: -60, left: -40, width: 160, height: 160, borderRadius: 80, backgroundColor: "rgba(255,255,255,0.06)" },//
   heroTop:  { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20 },

@@ -5,7 +5,7 @@
  * pick a status + write a note for each assigned turf.
  */
 import {
-  View, Text, StyleSheet, SafeAreaView, StatusBar,
+  View, Text, StyleSheet, StatusBar,
   ScrollView, TouchableOpacity, TextInput, Alert,
   ActivityIndicator, Platform, RefreshControl,
 } from "react-native";
@@ -17,6 +17,8 @@ import {
 } from "firebase/firestore";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
 
 const DARK   = "#081120";
 const ACCENT = "#0EA5A4";
@@ -43,6 +45,7 @@ type TurfInfo = {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 export default function OperatorTurfStatus() {
+  const insets = useSafeAreaInsets();
   const router = useRouter();
 
   const [turfs,      setTurfs]      = useState<TurfInfo[]>([]);
@@ -154,11 +157,11 @@ export default function OperatorTurfStatus() {
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <SafeAreaView style={s.safe}>
+    <View style={s.safe}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
       {/* Header */}
-      <View style={s.header}>
+       <View style={[s.header, { paddingTop: insets.top + 12 }]}>
         <TouchableOpacity style={s.backBtn} onPress={() => router.back()}>
           <Ionicons name="arrow-back" size={20} color="#fff" />
         </TouchableOpacity>
@@ -168,7 +171,7 @@ export default function OperatorTurfStatus() {
         </View>
       </View>
 
-      <ScrollView
+      <ScrollView keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive" automaticallyAdjustKeyboardInsets
         showsVerticalScrollIndicator={false}
         contentContainerStyle={s.scroll}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchTurfs(true)} tintColor={ACCENT} />}
@@ -324,7 +327,7 @@ export default function OperatorTurfStatus() {
 
         <View style={{ height: 40 }} />
       </ScrollView>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -335,7 +338,7 @@ const s = StyleSheet.create({
   loadText: { color: "#9CA3AF", marginTop: 12, fontSize: 15, fontWeight: "600" },
   scroll:   { padding: 16, paddingBottom: 40 },
 
-  header:      { backgroundColor: DARK, flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 14, paddingBottom: 18 },
+  header:      { backgroundColor: DARK, flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingBottom: 18 },
   backBtn:     { width: 38, height: 38, borderRadius: 12, backgroundColor: "rgba(255,255,255,0.08)", justifyContent: "center", alignItems: "center" },
   headerTitle: { color: "#fff", fontSize: 18, fontWeight: "900" },
   headerSub:   { color: "#9CA3AF", fontSize: 12, marginTop: 2 },

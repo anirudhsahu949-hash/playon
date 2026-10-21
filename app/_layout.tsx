@@ -53,7 +53,10 @@ export default function RootLayout() {
       console.log("USER:", user?.uid);
       try {
         if (!user) {
-          if (segments[0] !== '(auth)') {
+          // Guest mode: only block role-restricted sections.
+          // Everyone else (tabs, playon-pro, auth screens) is allowed through.
+          const protectedSections = ['admin', '(owner)', '(turf-operator)', '(league-owner)'];
+          if (protectedSections.includes(segments[0] as string)) {
             router.replace('/(auth)/login');
           }
           return;
@@ -91,13 +94,15 @@ export default function RootLayout() {
           router.replace('/(owner)');
         } else if ((role === 'turf-operator' || role === 'operator') && segments[0] !== '(turf-operator)') {
           router.replace('/(turf-operator)');
-        } else if (role === 'user' && segments[0] !== '(tabs)') {
+        } else if (role === 'league-owner' && segments[0] !== '(league-owner)') {
+          router.replace('/(league-owner)');
+        } else if (role === 'user' && segments[0] !== '(tabs)' && segments[0] !== '(playon-pro)') {
           router.replace('/(tabs)');
         }
 
       } catch (err) {
         console.log('Auth error:', err);
-        router.replace('/(auth)/login');
+        // don't force login on error either — just stop loading, let them stay as guest
       } finally {
         setLoading(false);
       }
@@ -148,8 +153,9 @@ export default function RootLayout() {
     <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
       <AppThemeProvider>
         <Stack screenOptions={{ headerShown: false }}>
-          <Stack.Screen name="(auth)" />
+         
           <Stack.Screen name="(tabs)" />
+           <Stack.Screen name="(auth)" />
           <Stack.Screen name="(owner)" />
           <Stack.Screen name="admin" />
           <Stack.Screen name="(turf-operator)" />

@@ -4,7 +4,6 @@ import {
   TextInput,
   TouchableOpacity,
   StyleSheet,
-  SafeAreaView,
   StatusBar,
   Alert,
   ActivityIndicator,
@@ -12,6 +11,7 @@ import {
   ScrollView,
 } from "react-native";
 import { useEffect, useState } from "react";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
 import { db, auth } from "../../firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
@@ -21,6 +21,7 @@ const BRAND = "#0B1220";
 const GREEN = "#16A34A";
 
 export default function BookingRulesAdmin() {
+  const insets = useSafeAreaInsets();
   const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -115,11 +116,11 @@ export default function BookingRulesAdmin() {
   const hasChanges = parseFloat(cancelHours) !== currentValue;
 
   return (
-    <SafeAreaView style={s.root}>
+    <View style={s.root}>
       <StatusBar barStyle="dark-content" backgroundColor="#fff" />
 
       {/* Top bar */}
-      <View style={s.topBar}>
+       <View style={[s.topBar, { paddingTop: insets.top + 12 }]}>
         <TouchableOpacity style={s.backBtn} onPress={() => router.back()}>
           <Ionicons name="arrow-back" size={20} color={BRAND} />
         </TouchableOpacity>
@@ -263,7 +264,7 @@ export default function BookingRulesAdmin() {
         </TouchableOpacity>
 
       </ScrollView>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -274,7 +275,7 @@ const s = StyleSheet.create({
 
   topBar: {
     flexDirection: "row", alignItems: "center", justifyContent: "space-between",
-    paddingHorizontal: 16, paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) + 8 : 8,
+    paddingHorizontal: 16, 
     paddingBottom: 12, backgroundColor: "#fff", borderBottomWidth: 1, borderBottomColor: "#F3F4F6",
   },
   backBtn: { width: 40, height: 40, borderRadius: 20, backgroundColor: "#F3F4F6", alignItems: "center", justifyContent: "center" },

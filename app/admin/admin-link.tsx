@@ -1,8 +1,9 @@
 import {
   View, Text, TextInput, TouchableOpacity,
   StyleSheet, Alert, ActivityIndicator,
-  SafeAreaView, StatusBar, Platform,
+   StatusBar, Platform,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useState, useEffect } from "react";
 import { db } from "../../firebaseConfig";
 import { doc, getDoc, setDoc } from "firebase/firestore";
@@ -13,6 +14,7 @@ const DARK  = "#0A0F1E";
 const ACCENT = "#0EA5A4";
 
 export default function AppConfig() {
+  const insets = useSafeAreaInsets();
   const router = useRouter();
   const [shareLink, setShareLink] = useState("");
   const [loading,   setLoading]   = useState(true);
@@ -57,11 +59,11 @@ export default function AppConfig() {
   };
 
   return (
-    <SafeAreaView style={s.safe}>
+    <View style={s.safe}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
       {/* Header */}
-      <View style={s.header}>
+       <View style={[s.header, { paddingTop: insets.top + 12 }]}>
         <TouchableOpacity style={s.backBtn} onPress={() => router.back()}>
           <Ionicons name="arrow-back" size={20} color="#fff" />
         </TouchableOpacity>
@@ -156,7 +158,7 @@ export default function AppConfig() {
           </View>
         </View>
       )}
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -169,7 +171,7 @@ const s = StyleSheet.create({
     alignItems: "center",
     gap: 14,
     paddingHorizontal: 16,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 14,
+    
     paddingBottom: 18,
   },
   backBtn:    { width: 38, height: 38, borderRadius: 12, backgroundColor: "rgba(255,255,255,0.08)", justifyContent: "center", alignItems: "center" },

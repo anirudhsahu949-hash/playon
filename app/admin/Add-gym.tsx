@@ -6,12 +6,13 @@ import {
   StyleSheet,
   Alert,
   ScrollView,
-  SafeAreaView,
   StatusBar,
   ActivityIndicator,
   Platform,
   Switch,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
 import { useState, useEffect } from "react";
 import { db } from "../../firebaseConfig";
 import {
@@ -137,6 +138,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 // ── Main component ────────────────────────────────────────────────────────────
 export default function AddGym() {
+  const insets = useSafeAreaInsets();
   const router = useRouter();
 
   // Section 1 — basics
@@ -350,11 +352,11 @@ const handleSave = async () => {
 
   // ── UI ────────────────────────────────────────────────────────────────────
   return (
-    <SafeAreaView style={styles.safe}>
+    <View style={styles.safe}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
       <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
         {/* ── Hero ── */}
-        <View style={styles.hero}>
+         <View style={[styles.hero, { paddingTop: insets.top + 12 }]}>
           <View style={styles.glow1} />
           <View style={styles.glow2} />
           <TouchableOpacity style={styles.backBtn} onPress={() => router.back()}>
@@ -709,7 +711,7 @@ const handleSave = async () => {
 
         <View style={{ height: 48 }} />
       </ScrollView>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -721,7 +723,6 @@ const styles = StyleSheet.create({
   hero: {
     backgroundColor: DARK,
     paddingHorizontal: 20,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 20,
     paddingBottom: 28,
     overflow: "hidden",
   },

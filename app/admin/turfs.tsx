@@ -7,11 +7,13 @@
  *  ✅ GPS badge on every card shows coords status
  */
 import {
-  View, Text, StyleSheet, SafeAreaView, StatusBar, FlatList,
+  View, Text, StyleSheet,  StatusBar, FlatList,
   TouchableOpacity, TextInput, Alert, ActivityIndicator,
   RefreshControl, Modal, ScrollView, Image, Switch, Platform,
   KeyboardAvoidingView,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
 import { useEffect, useMemo, useState } from "react";
 import { db } from "../../firebaseConfig";
 import {
@@ -34,6 +36,41 @@ const VENUE_TYPES = [
   { key: "club",     label: "Club / Arena",  emoji: "🏟️" },
   { key: "other",    label: "Other",         emoji: "➕" },
 ];
+// ── Booking modes (admin-only control) ───────────────────────────────────────
+const BOOKING_MODES = [
+  { key: "online", label: "Online",     icon: "phone-portrait-outline" },
+  { key: "phone",  label: "Phone Only", icon: "call-outline" },
+  { key: "both",   label: "Both",       icon: "swap-horizontal-outline" },
+] as const;
+type BookingMode = "online" | "phone" | "both";
+
+// ── Advance Pricing: one time-block with its own hourly rate ──────────────────
+type PriceSlab = { start: number; end: number; rate: number };
+type DayType = "weekday" | "weekend";
+
+function fmtHour(h: number): string {
+  if (h === 0 || h === 24) return "12:00 AM";
+  if (h === 12) return "12:00 PM";
+  return h < 12 ? `${h}:00 AM` : `${h - 12}:00 PM`;
+}
+
+// Validates one day-type's slab list: no bad ranges, no negative rates, no overlaps.
+function validateSlabs(slabs: PriceSlab[], label: string): string | null {
+  if (slabs.length === 0) return `Add at least one ${label} time slot.`;
+  for (const slab of slabs) {
+    if (isNaN(slab.start) || slab.start < 0 || slab.start > 23) return `${label}: start hour must be 0–23.`;
+    if (isNaN(slab.end) || slab.end < 1 || slab.end > 24) return `${label}: end hour must be 1–24.`;
+    if (slab.end <= slab.start) return `${label}: end time must be after start time.`;
+    if (isNaN(slab.rate) || slab.rate < 0) return `${label}: rate can't be negative.`;
+  }
+  const sorted = [...slabs].sort((a, b) => a.start - b.start);
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i].start < sorted[i - 1].end) {
+      return `${label}: time slots overlap (${fmtHour(sorted[i - 1].start)}–${fmtHour(sorted[i - 1].end)} and ${fmtHour(sorted[i].start)}–${fmtHour(sorted[i].end)}).`;
+    }
+  }
+  return null;
+}
 
 type Turf = {
   id: string;
@@ -58,12 +95,17 @@ type Turf = {
   longitude?: number | null;
   rating?: number | string;
     venueType?: string;
-  
+  // ── Advance Pricing (opt-in per turf; falls back to dayPrice/nightPrice when OFF) ──
+  advancePricingEnabled?: boolean;
+   priceSlabs?: { weekday?: PriceSlab[]; weekend?: PriceSlab[] };
+  bookingMode?: BookingMode;
+  bookingPhone?: string;
 };
 
 type Owner = { id: string; name?: string; email?: string };
 
 export default function AdminTurfs() {
+  const insets = useSafeAreaInsets();
   const router = useRouter();
   const [turfs,      setTurfs]      = useState<Turf[]>([]);
   const [owners,     setOwners]     = useState<Owner[]>([]);
@@ -86,7 +128,13 @@ export default function AdminTurfs() {
     images: [] as string[], imageInput: "", active: true,
     latitude: "", longitude: "", rating: "", venueType: "turf",
   customVenueType: "",
+  advancePricingEnabled: false,
+  priceSlabsWeekday: [] as PriceSlab[],
+  priceSlabsWeekend: [] as PriceSlab[],
+  bookingMode: "online" as BookingMode,
+  bookingPhone: "",
   });
+  const [slabDayTab, setSlabDayTab] = useState<DayType>("weekday");
 
   useEffect(() => { fetchAll(); }, []);
 
@@ -163,8 +211,42 @@ export default function AdminTurfs() {
 
     venueType:       turf.venueType || "turf",
     customVenueType: "", // always reset custom input on open
+    advancePricingEnabled: !!(turf as any).advancePricingEnabled,
+    priceSlabsWeekday: (Array.isArray((turf as any).priceSlabs?.weekday) && (turf as any).priceSlabs.weekday.length > 0)
+      ? (turf as any).priceSlabs.weekday
+      : [{ start: 6, end: 18, rate: Number(turf.dayPrice) || 0 }],
+    priceSlabsWeekend: (Array.isArray((turf as any).priceSlabs?.weekend) && (turf as any).priceSlabs.weekend.length > 0)
+      ? (turf as any).priceSlabs.weekend
+           : [{ start: 6, end: 18, rate: Number(turf.dayPrice) || 0 }],
+    bookingMode:  turf.bookingMode || "online",   // old turfs = online
+    bookingPhone: turf.bookingPhone || "",
     });
+    setSlabDayTab("weekday");
     setEditModal(true);
+  };
+
+  // ── Advance Pricing row editors ──────────────────────────────────────────
+  const addSlab = (dayType: DayType) => {
+    const field = dayType === "weekday" ? "priceSlabsWeekday" : "priceSlabsWeekend";
+    setForm((f) => {
+      const current = (f as any)[field] as PriceSlab[];
+      const lastEnd = current.length > 0 ? current[current.length - 1].end : 6;
+      return { ...f, [field]: [...current, { start: Math.min(lastEnd, 23), end: Math.min(lastEnd + 1, 24), rate: 0 }] };
+    });
+  };
+
+  const removeSlab = (dayType: DayType, index: number) => {
+    const field = dayType === "weekday" ? "priceSlabsWeekday" : "priceSlabsWeekend";
+    setForm((f) => ({ ...f, [field]: ((f as any)[field] as PriceSlab[]).filter((_: PriceSlab, i: number) => i !== index) }));
+  };
+
+  const updateSlab = (dayType: DayType, index: number, key: "start" | "end" | "rate", value: string) => {
+    const field = dayType === "weekday" ? "priceSlabsWeekday" : "priceSlabsWeekend";
+    const num = value === "" ? 0 : Number(value.replace(/[^0-9]/g, ""));
+    setForm((f) => ({
+      ...f,
+      [field]: ((f as any)[field] as PriceSlab[]).map((slab: PriceSlab, i: number) => (i === index ? { ...slab, [key]: num } : slab)),
+    }));
   };
 
   // ✅ Called when user confirms a pin on the map
@@ -207,6 +289,37 @@ const handleSaveEdit = async () => {
     return Alert.alert("Required", "Name and location are required.");
   }
 
+  // Advance Pricing is only validated when the toggle is ON — if it's OFF,
+  // whatever is in the editor is saved as-is (inert) so it doesn't block a
+  // routine save, and the slabs are preserved for next time it's re-enabled.
+  if (form.advancePricingEnabled) {
+    const wdErr = validateSlabs(form.priceSlabsWeekday, "Weekday");
+    if (wdErr) return Alert.alert("Invalid", wdErr);
+    const weErr = validateSlabs(form.priceSlabsWeekend, "Weekend");
+    if (weErr) return Alert.alert("Invalid", weErr);
+  }
+
+    // Phone / Both need a valid booking number
+  const cleanPhone = form.bookingPhone.replace(/\D/g, "").slice(-10);
+  if (form.bookingMode !== "online" && !/^[6-9]\d{9}$/.test(cleanPhone)) {
+    return Alert.alert("Invalid", "Enter a valid 10-digit booking phone number.");
+  }
+
+    // Hours: closing can go past 12 AM (25 = 1 AM … 28 = 4 AM next day)
+  const openH  = Number(form.openingTime);
+  const closeH = Number(form.closingTime) === 0 ? 24 : Number(form.closingTime);   // old turfs: 0 = midnight
+  if (isNaN(openH) || openH < 0 || openH > 23) {
+    return Alert.alert("Invalid", "Opening time must be 0–23.");
+  }
+  if (isNaN(closeH) || closeH < 1 || closeH > 28) {
+    return Alert.alert("Invalid", "Closing time must be 1–28 (25 = 1 AM, 26 = 2 AM, 27 = 3 AM, 28 = 4 AM next day).");
+  }
+  if (closeH <= openH) {
+    return Alert.alert("Invalid", "Closing time must be after opening time.");
+  }
+  if (closeH > 24 && openH < closeH - 24) {
+    return Alert.alert("Invalid", `Late-night turfs must open at ${closeH - 24} AM or later.`);
+  }
   let latitude:  number | null = null;
   let longitude: number | null = null;
   const parsedLat = parseFloat(form.latitude);
@@ -251,11 +364,17 @@ const handleSaveEdit = async () => {
        venueType:  form.venueType === "other"
     ? form.customVenueType.trim() || "other"
     : form.venueType,
+      advancePricingEnabled: form.advancePricingEnabled,
+      priceSlabs: { weekday: form.priceSlabsWeekday, weekend: form.priceSlabsWeekend },
+            bookingMode:  form.bookingMode,
+      bookingPhone: form.bookingMode === "online" ? "" : cleanPhone,
       updatedAt:     serverTimestamp(),
       
     });
     setTurfs((prev) =>
-      prev.map((t) => t.id === editTurf.id ? { ...t, ...form, latitude, longitude } : t)
+          prev.map((t) => t.id === editTurf.id
+        ? { ...t, ...form, bookingPhone: form.bookingMode === "online" ? "" : cleanPhone, latitude, longitude }
+        : t)
     );
     setEditModal(false);
     Alert.alert("Saved ✓", latitude ? `Coords: ${latitude.toFixed(4)}, ${longitude?.toFixed(4)}` : "Turf updated.");
@@ -356,6 +475,18 @@ const handleSaveEdit = async () => {
               </View>
             ))}
           </View>
+                    {item.bookingMode && item.bookingMode !== "online" && (
+            <View style={[s.sportBadge, { backgroundColor: "#F0FDF4", marginTop: -4, marginBottom: 10, alignSelf: "flex-start" }]}>
+              <Text style={[s.sportText, { color: "#15803D" }]}>
+                {item.bookingMode === "phone" ? "📞 Phone Only" : "📞 Online + Phone"} · {item.bookingPhone}
+              </Text>
+            </View>
+          )}
+          {item.advancePricingEnabled && (
+            <View style={[s.sportBadge, { backgroundColor: "#EDE9FE", marginTop: -4, marginBottom: 10, alignSelf: "flex-start" }]}>
+              <Text style={[s.sportText, { color: "#7C3AED" }]}>🏷️ Advance Pricing ON</Text>
+            </View>
+          )}
 
           <View style={s.ownerRow}>
             <Ionicons name="person-outline" size={13} color="#6B7280" />
@@ -403,7 +534,7 @@ const handleSaveEdit = async () => {
   const parsedLng = parseFloat(form.longitude);
 
   return (
-    <SafeAreaView style={s.safe}>
+    <View style={s.safe}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
       <FlatList
@@ -415,7 +546,7 @@ const handleSaveEdit = async () => {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchAll(true)} tintColor={ACCENT} />}
         ListHeaderComponent={
           <View>
-            <View style={s.hero}>
+             <View style={[s.hero, { paddingTop: insets.top + 12 }]}>
               <View style={s.heroGlow1} /><View style={s.heroGlow2} />
               <View style={s.heroTop}>
                 <View>
@@ -540,7 +671,8 @@ const handleSaveEdit = async () => {
     { label: "Night Price (₹/hr)",   key: "nightPrice",    placeholder: "6 PM – 6 AM",        numeric: true },
     { label: "Advance Booking (₹)",  key: "bookingPrice",  placeholder: "Amount to lock slot", numeric: true },
     { label: "Opening Time (24hr)",  key: "openingTime",   placeholder: "6",                  numeric: true },
-    { label: "Closing Time (24hr)",  key: "closingTime",   placeholder: "24",                 numeric: true },
+  
+        { label: "Closing Time (24hr · 26 = 2 AM)", key: "closingTime", placeholder: "24",        numeric: true },
     { label: "Slot Duration (mins)", key: "slotDuration",  placeholder: "30 or 60",           numeric: true },
     { label: "Operator Email",       key: "operatorEmail", placeholder: "turf@playon.app" },
   ].map(({ label, key, placeholder, numeric }) => (
@@ -554,7 +686,156 @@ const handleSaveEdit = async () => {
         autoCapitalize="none"
       />
     </View>
-  ))}
+   ))}
+  {Number(form.closingTime) > 24 && (
+    <Text style={s.modeHint}>
+      🌙 Closes at {Number(form.closingTime) - 24}:00 AM next day. Owner sets the late-night booking cutoff in My Turfs.
+    </Text>
+  )}
+    {/* ══ Booking Mode (admin only) ══════ */}
+  <Text style={s.fieldLabel}>Booking Mode</Text>
+  <View style={{ flexDirection: "row", gap: 8 }}>
+    {BOOKING_MODES.map((m) => {
+      const active = form.bookingMode === m.key;
+      return (
+        <TouchableOpacity
+          key={m.key}
+          style={[s.modeChip, active && s.modeChipActive]}
+          onPress={() => setForm((f) => ({ ...f, bookingMode: m.key }))}
+        >
+          <Ionicons name={m.icon as any} size={14} color={active ? "#fff" : "#6B7280"} />
+          <Text style={[s.modeChipText, active && s.modeChipTextActive]}>{m.label}</Text>
+        </TouchableOpacity>
+      );
+    })}
+  </View>
+  <Text style={s.modeHint}>
+    {form.bookingMode === "online" && "Users book and pay in the app. No number shown."}
+    {form.bookingMode === "phone"  && "No online booking. Users see facilities and call to book."}
+    {form.bookingMode === "both"   && "Users can book online or call this number."}
+  </Text>
+
+  {form.bookingMode !== "online" && (
+    <>
+      <Text style={s.fieldLabel}>Booking Phone Number</Text>
+      <TextInput
+        style={s.input}
+        placeholder="10-digit mobile number"
+        placeholderTextColor="#9CA3AF"
+        keyboardType="phone-pad"
+        maxLength={13}
+        value={form.bookingPhone}
+        onChangeText={(v) => setForm((f) => ({ ...f, bookingPhone: v }))}
+      />
+    </>
+  )}
+  {/* ══ Advance Pricing (weekday/weekend + time slots) ══════ */}
+  <View style={{
+    backgroundColor: form.advancePricingEnabled ? "#F5F3FF" : "#F9FAFB",
+    borderRadius: 14, borderWidth: 1.5,
+    borderColor: form.advancePricingEnabled ? "#DDD6FE" : "#E5E7EB",
+    padding: 14, marginTop: 16,
+  }}>
+    <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8, flex: 1 }}>
+        <Text style={{ fontSize: 20 }}>🏷️</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={{ fontSize: 14, fontWeight: "800", color: "#111827" }}>Advance Pricing</Text>
+          <Text style={{ fontSize: 11, color: "#9CA3AF", fontWeight: "600", marginTop: 1 }}>
+            Different rates by time slot + weekday/weekend
+          </Text>
+        </View>
+      </View>
+      <Switch
+        value={form.advancePricingEnabled}
+        onValueChange={(v) => setForm((f) => ({ ...f, advancePricingEnabled: v }))}
+        trackColor={{ false: "#E5E7EB", true: "#DDD6FE" }}
+        thumbColor={form.advancePricingEnabled ? "#7C3AED" : "#fff"}
+      />
+    </View>
+
+    {form.advancePricingEnabled ? (
+      <>
+        {/* Weekday / Weekend tabs */}
+        <View style={{ flexDirection: "row", backgroundColor: "#fff", borderRadius: 10, padding: 3, marginTop: 8, marginBottom: 12, borderWidth: 1, borderColor: "#DDD6FE" }}>
+          {(["weekday", "weekend"] as DayType[]).map((tab) => (
+            <TouchableOpacity
+              key={tab}
+              onPress={() => setSlabDayTab(tab)}
+              style={{
+                flex: 1, paddingVertical: 8, borderRadius: 8, alignItems: "center",
+                backgroundColor: slabDayTab === tab ? "#7C3AED" : "transparent",
+              }}
+            >
+              <Text style={{ fontSize: 12, fontWeight: "800", color: slabDayTab === tab ? "#fff" : "#6B7280" }}>
+                {tab === "weekday" ? "Mon – Fri" : "Sat – Sun"}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        {/* Slab rows for the active tab */}
+        {(slabDayTab === "weekday" ? form.priceSlabsWeekday : form.priceSlabsWeekend).map((slab, idx) => (
+          <View key={idx} style={{
+            flexDirection: "row", alignItems: "center", gap: 8,
+            backgroundColor: "#fff", borderRadius: 10, borderWidth: 1, borderColor: "#DDD6FE",
+            padding: 10, marginBottom: 8,
+          }}>
+            <View style={{ flex: 1 }}>
+              <Text style={{ fontSize: 9, color: "#9CA3AF", fontWeight: "700", marginBottom: 3 }}>FROM (h)</Text>
+              <TextInput
+                style={{ backgroundColor: "#F9FAFB", borderRadius: 8, borderWidth: 1, borderColor: "#E5E7EB", paddingHorizontal: 8, paddingVertical: 8, fontSize: 13, fontWeight: "700", color: "#111827" }}
+                value={String(slab.start)} keyboardType="number-pad" maxLength={2}
+                onChangeText={(v) => updateSlab(slabDayTab, idx, "start", v)}
+              />
+            </View>
+            <Text style={{ color: "#9CA3AF", marginTop: 14 }}>–</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={{ fontSize: 9, color: "#9CA3AF", fontWeight: "700", marginBottom: 3 }}>TO (h)</Text>
+              <TextInput
+                style={{ backgroundColor: "#F9FAFB", borderRadius: 8, borderWidth: 1, borderColor: "#E5E7EB", paddingHorizontal: 8, paddingVertical: 8, fontSize: 13, fontWeight: "700", color: "#111827" }}
+                value={String(slab.end)} keyboardType="number-pad" maxLength={2}
+                onChangeText={(v) => updateSlab(slabDayTab, idx, "end", v)}
+              />
+            </View>
+            <View style={{ flex: 1.3 }}>
+              <Text style={{ fontSize: 9, color: "#9CA3AF", fontWeight: "700", marginBottom: 3 }}>₹ / HOUR</Text>
+              <TextInput
+                style={{ backgroundColor: "#F9FAFB", borderRadius: 8, borderWidth: 1, borderColor: "#E5E7EB", paddingHorizontal: 8, paddingVertical: 8, fontSize: 13, fontWeight: "700", color: "#111827" }}
+                value={String(slab.rate)} keyboardType="number-pad" maxLength={5}
+                onChangeText={(v) => updateSlab(slabDayTab, idx, "rate", v)}
+              />
+            </View>
+            <TouchableOpacity
+              onPress={() => removeSlab(slabDayTab, idx)}
+              style={{ marginTop: 14, width: 28, height: 28, borderRadius: 8, backgroundColor: "#FEF2F2", justifyContent: "center", alignItems: "center" }}
+            >
+              <Ionicons name="trash-outline" size={14} color="#DC2626" />
+            </TouchableOpacity>
+          </View>
+        ))}
+
+        <TouchableOpacity
+          onPress={() => addSlab(slabDayTab)}
+          style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, backgroundColor: "#fff", borderWidth: 1.5, borderColor: "#DDD6FE", borderStyle: "dashed", borderRadius: 10, paddingVertical: 10, marginBottom: 4 }}
+        >
+          <Ionicons name="add" size={16} color="#7C3AED" />
+          <Text style={{ fontSize: 12, fontWeight: "700", color: "#7C3AED" }}>Add Time Slot</Text>
+        </TouchableOpacity>
+
+        <Text style={{ fontSize: 10, color: "#9CA3AF", marginTop: 6, lineHeight: 15 }}>
+          24-hour format (6 = 6 AM, 18 = 6 PM). Any hour not covered by a time slot falls back to the Day/Night price above.
+        </Text>
+      </>
+    ) : (
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: "#F3F4F6", borderRadius: 8, padding: 8, marginTop: 4 }}>
+        <Text style={{ fontSize: 12 }}>⚫</Text>
+        <Text style={{ fontSize: 11, color: "#9CA3AF", fontWeight: "600" }}>
+          Advance Pricing OFF — this turf uses the Day/Night price above
+        </Text>
+      </View>
+    )}
+  </View>
 
   {/* Rating */}
   <Text style={s.fieldLabel}>Rating (0.0 – 5.0)</Text>
@@ -712,7 +993,7 @@ const handleSaveEdit = async () => {
         onConfirm={onMapConfirm}
         onClose={() => setShowMap(false)}
       />
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -722,7 +1003,7 @@ const s = StyleSheet.create({
   loadText: { marginTop: 12, color: "#9CA3AF", fontSize: 15, fontWeight: "600" },
   list:     { paddingBottom: 100 },
 
-  hero:      { backgroundColor: DARK, paddingHorizontal: 20, paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 18, paddingBottom: 24, overflow: "hidden" },
+  hero:      { backgroundColor: DARK, paddingHorizontal: 20,  paddingBottom: 24, overflow: "hidden" },
   heroGlow1: { position: "absolute", top: -40, right: -40, width: 200, height: 200, borderRadius: 100, backgroundColor: "rgba(14,165,164,0.14)" },
   heroGlow2: { position: "absolute", bottom: -60, left: -40, width: 180, height: 180, borderRadius: 90, backgroundColor: "rgba(96,165,250,0.10)" },
   heroTop:   { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" },
@@ -843,4 +1124,10 @@ venueChipLabel:     { fontSize: 10, fontWeight: "700", color: "#6B7280", marginT
 venueChipLabelActive:{ color: "#fff" },
 venuePreview:       { backgroundColor: "#F0FDF4", borderRadius: 8, padding: 8, marginTop: 6, borderWidth: 1, borderColor: "#86EFAC" },
 venuePreviewText:   { fontSize: 12, color: "#15803D", fontWeight: "700" },
+  // booking mode
+  modeChip:           { flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 5, paddingVertical: 11, borderRadius: 12, backgroundColor: "#F3F4F6", borderWidth: 1, borderColor: "#E5E7EB" },
+  modeChipActive:     { backgroundColor: DARK, borderColor: DARK },
+  modeChipText:       { fontSize: 12, fontWeight: "700", color: "#6B7280" },
+  modeChipTextActive: { color: "#fff" },
+  modeHint:           { fontSize: 11, color: "#6B7280", fontWeight: "600", marginTop: 6 },
 });

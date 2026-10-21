@@ -17,11 +17,12 @@ import {
   Animated,
   LayoutAnimation,
   UIManager,
-   TextInput,
-   RefreshControl,
-   Modal,
-   KeyboardAvoidingView,
-   Keyboard
+  TextInput,
+  RefreshControl,
+  Modal,
+  KeyboardAvoidingView,
+  Keyboard,
+  Switch,
 } from "react-native";
 
 import { useLocalSearchParams, Stack } from "expo-router";
@@ -37,18 +38,26 @@ import {
 } from "firebase/firestore";
 import Carousel from "react-native-reanimated-carousel";
 import { SafeAreaView } from "react-native-safe-area-context";
-import RazorpayCheckout from "react-native-razorpay";
+
+const RazorpayCheckout = Platform.OS !== "web" && !__DEV__
+  ? require("react-native-razorpay").default
+  : { open: () => Promise.reject({ error: { description: "Razorpay not available in Expo Go" } }) };
 import { Ionicons } from "@expo/vector-icons";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 
 
 import { db, auth } from "../../firebaseConfig";
+import { onAuthStateChanged } from "firebase/auth";
 import { useRouter } from "expo-router";
 import { useFocusEffect } from "expo-router";
 // add to existing RN imports
 
 type BookingType = "advance" | "full";
 type BookingMode = "flexible" | "quick";
+ 
+// ── Advance Pricing ──
+type PriceSlab = { start: number; end: number; rate: number };
+type DayType   = "weekday" | "weekend";
 
 interface Turf {
   id: string;
@@ -73,9 +82,18 @@ interface Turf {
   status?: string;
   statusNote?: string;
   statusUpdatedAt?: string;
-  venueType?: string;  // ← add this line
+ venueType?: string;  // ← add this line
     latitude?: number;
   longitude?: number;
+  // ── Advance Pricing (opt-in per turf) ──
+    advancePricingEnabled?: boolean;
+  priceSlabs?: { weekday?: PriceSlab[]; weekend?: PriceSlab[] };
+  // ── Set by admin: "online" | "phone" | "both" ──
+  bookingMode?: "online" | "phone" | "both";
+  bookingPhone?: string;
+  flexibleSlotsEnabled?: boolean;   // missing = ON
+  quickSlotsEnabled?: boolean;      // missing = ON
+    lateCutoffHours?: number;         // late-night booking closes N hrs before 12 AM (0 = no cutoff)
 }
 
 interface TimeRange {
@@ -110,7 +128,16 @@ const STATUS_CONFIG: Record<string, {
   league:      { label: "League in Progress",  emoji: "🏆", color: "#F5F3FF", textColor: "#6D28D9", border: "#C4B5FD" },
 };
 
+// ── Quick slots grouped by part of the day ──
+type DayPart = "morning" | "afternoon" | "evening" | "night";
+const DAY_PARTS: { key: DayPart; label: string; icon: keyof typeof Ionicons.glyphMap; from: number; to: number }[] = [
+  { key: "morning",   label: "Morning",   icon: "sunny-outline",        from: 0,  to: 12 },
+  { key: "afternoon", label: "Afternoon", icon: "partly-sunny-outline", from: 12, to: 17 },
+  { key: "evening",   label: "Evening",   icon: "cloudy-night-outline", from: 17, to: 21 },
+    { key: "night",     label: "Night",     icon: "moon-outline",         from: 21, to: 28 },   // includes 12–4 AM
+];
 const SPORT_STYLE: Record<string, { bg: string; icon: keyof typeof Ionicons.glyphMap }> = {
+  
   Cricket:    { bg: "#16A34A", icon: "baseball-outline" },
   Football:   { bg: "#0B1220", icon: "football-outline" },
   Basketball: { bg: "#EA580C", icon: "basketball-outline" },
@@ -342,6 +369,8 @@ export default function TurfDetails() {
   const [activePanel, setActivePanel] = useState<"from" | "to" | null>(null);
 
   const [selectedQuickSlots, setSelectedQuickSlots] = useState<TimeRange[]>([]);
+    const [quickPart, setQuickPart] = useState<DayPart>("evening");
+      const [fromPart,  setFromPart]  = useState<DayPart>("evening");
 
   const [loading,     setLoading]     = useState(false);
   const [pageLoading, setPageLoading] = useState(true);
@@ -350,11 +379,28 @@ export default function TurfDetails() {
   const abortRef = useRef<AbortController | null>(null);
 const paymentCancelledRef = useRef(false);
   const scrollRef       = useRef<ScrollView>(null);
-  const days            = useMemo(() => getNextDays(), []);
+   const days            = useMemo(() => getNextDays(), [turf]);
+
+  // After midnight on a late-night turf, "today" is still last night → select it
+  useEffect(() => {
+    if (!turf) return;
+    const first = getNextDays()[0];
+    if (first.toDateString() !== new Date().toDateString()) setSelectedDate(first);
+  }, [turf]);
 
   const fromPanelAnim = useRef(new Animated.Value(0)).current;
   const toPanelAnim   = useRef(new Animated.Value(0)).current;
   const [refreshing, setRefreshing] = useState(false);
+
+  const [pcoinBalance,  setPcoinBalance]  = useState<number>(0);
+  const [vcoinBalance,  setVcoinBalance]  = useState<number>(0);
+  const [vcoinEnabled,  setVcoinEnabled]  = useState<boolean>(false);
+  const [vcoinRate,     setVcoinRate]     = useState<number>(0);
+
+    const [usePcoins,     setUsePcoins]     = useState(false); // toggle
+  const [useVcoins,     setUseVcoins]     = useState(false); // toggle
+  const [pcoinToUse,    setPcoinToUse]    = useState(0);     // how many PCoin to use
+  const [vcoinToUse,    setVcoinToUse]    = useState(0);     // how many VCoin to use
 
   const summaryCardYRef = useRef<number>(0); 
   const insets = useSafeAreaInsets();
@@ -372,11 +418,56 @@ const [promoError,      setPromoError]      = useState("");
 const [showPromoModal,  setShowPromoModal]  = useState(false);
 const discountAmount = promoApplied?.discount ?? 0;  // ✅ this is fine as-is
 
+// ── Auto-applied venue offer ────────────────────────────────────────────────
+// The SERVER decides this (findBestOffer). We only display what it returns, so
+// the badge on this screen and the amount Razorpay charges can never disagree.
+const [offer, setOffer] = useState<{
+  offerId: string;
+  title: string;
+  discount: number;
+  description?: string;
+} | null>(null);
+const [offerLoading, setOfferLoading] = useState(false);
+const offerDiscount = offer?.discount ?? 0;
+
+// ── This turf's offers for the next 7 days (banner, date tags, slot tags) ──
+// Display only — the server still decides the real discount at payment.
+type TurfOffer = {
+  offerId: string; title: string; tag?: string; type: "flat" | "percent"; value: number;
+  maxDiscount?: number; minBookingAmount?: number; targetSlots?: string[]; runsOn?: string[];
+  firstBookingOnly?: boolean;
+};
+const [turfOffers, setTurfOffers] = useState<TurfOffer[]>([]);
+useEffect(() => {
+  let alive = true;
+  (async () => {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      const res = await fetch(`https://bookora-backend-95u4.onrender.com/active-offers?turfId=${encodeURIComponent(String(id))}&days=7`, { signal: controller.signal });
+      clearTimeout(timer);
+      const data = await res.json();
+      if (alive) setTurfOffers(Array.isArray(data?.offers) ? data.offers : []);
+    } catch { /* badges are optional */ }
+  })();
+  return () => { alive = false; };
+}, [id]);
+
 const [showBilling, setShowBilling] = useState(false);
+ 
+// ── Price Details modal ──
+const [showPriceInfo, setShowPriceInfo] = useState(false);
+const [priceTab,      setPriceTab]      = useState<DayType>("weekday");
 
 const [promoFocused, setPromoFocused] = useState(false);
 const [kbHeight, setKbHeight] = useState(0);
 const [userCoords, setUserCoords] = useState<{ lat: number; lng: number } | null>(null);
+// ── Live login state: number is hidden until the user logs in ──
+const [isLoggedIn, setIsLoggedIn] = useState<boolean>(!!auth.currentUser);
+useEffect(() => {
+  const unsub = onAuthStateChanged(auth, (u) => setIsLoggedIn(!!u));
+  return unsub;
+}, []);
 
 useEffect(() => {
   const uid = auth.currentUser?.uid;
@@ -407,6 +498,14 @@ const distance = useMemo(() => {
   useEffect(() => { loadPage(); }, [id]);
   useEffect(() => { if (id) refreshAvailability(); }, [id, selectedDate]);
   useEffect(() => { clearSelection(); }, [selectedDate, bookingMode]);
+    // ── Owner-chosen booking styles: jump to whichever is allowed ──
+  useEffect(() => {
+    if (!turf) return;
+    const flexOn  = turf.flexibleSlotsEnabled !== false;
+    const quickOn = turf.quickSlotsEnabled !== false;
+    if (!flexOn && bookingMode === "flexible") setBookingMode("quick");
+    if (!quickOn && bookingMode === "quick")   setBookingMode("flexible");
+  }, [turf]);
   useEffect(() => {
     return () => {
       if (currentLocksRef.current.length > 0) {
@@ -449,6 +548,43 @@ useEffect(() => {
   return () => clearInterval(interval);
 }, [selectedDate, id, showBilling]);
 
+ useEffect(() => {
+    const fetchCoinData = async () => {
+      const uid    = auth.currentUser?.uid;
+      const turfId = String(id);
+      if (!uid || !turfId) return;
+ 
+      try {
+        // 1. PCoin wallet balance
+        const pcSnap = await getDoc(doc(db, "pcoinWallets", uid));
+        if (pcSnap.exists()) {
+          setPcoinBalance(Number(pcSnap.data().balance || 0));
+        }
+ 
+        // 2. VCoin wallet for THIS specific turf only
+        const vcSnap = await getDoc(doc(db, "vcoinWallets", `${uid}_${turfId}`));
+        if (vcSnap.exists()) {
+          setVcoinBalance(Number(vcSnap.data().balance || 0));
+        }
+ 
+        // 3. VCoin config from turf doc (vcoinEnabled + vcoinRate)
+        // Note: fetchTurf() already loads the turf doc into state,
+        // but we need these fields separately for coin logic
+        const turfSnap = await getDoc(doc(db, "turfs", turfId));
+        if (turfSnap.exists()) {
+          const td = turfSnap.data();
+          setVcoinEnabled(!!td.vcoinEnabled);
+          setVcoinRate(Number(td.vcoinRatePerHour || td.vcoinRate || 0));
+        }
+      } catch (e) {
+        // fail silently — coin UI is optional, booking still works
+        console.log("Coin fetch error:", e);
+      }
+    };
+ 
+    fetchCoinData();
+  }, [id]);
+
 
 function haversine(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const R = 6371;
@@ -463,17 +599,43 @@ function fmtDist(km: number): string {
   return `${Math.round(km)} km`;
 }
 
-  // ── Helpers ───────────────────────────────────────────────────────────────────
+   // ── Helpers ───────────────────────────────────────────────────────────────────
+  // ── Late-night helpers ──
+  function turfClose(): number {                       // 24 = midnight, 26 = 2 AM next day
+    if (turf?.closingTime === 0) return 24;
+    return Number(turf?.closingTime ?? 24);
+  }
+  function turfOpen(): number { return Number(turf?.openingTime || 0); }
+
+  // "1:00 AM" on a turf open 6 AM–2 AM means 25 (late night), not 1
+  function toTurfHour(v: number): number {
+    return turfClose() > 24 && v < turfOpen() ? v + 24 : v;
+  }
+
+  // Late-night (after 12 AM) booking closed for the selected day?
+  function isLateClosed(): boolean {
+    const cutoff = Number(turf?.lateCutoffHours || 0);
+    if (!cutoff || turfClose() <= 24) return false;
+    const deadline = new Date(selectedDate);
+    deadline.setHours(24 - cutoff, 0, 0, 0);
+    return Date.now() >= deadline.getTime();
+  }
+
   function getNextDays(): Date[] {
+    // Between 12 AM and late close, last night is still bookable → start from yesterday
+    const now   = new Date();
+    const cur   = now.getHours() + now.getMinutes() / 60;
+    const start = turfClose() > 24 && cur < turfClose() - 24 ? -1 : 0;
     return Array.from({ length: 5 }, (_, i) => {
       const d = new Date();
-      d.setDate(d.getDate() + i);
+      d.setDate(d.getDate() + start + i);
       return d;
     });
   }
 
   function formatTime(value: number): string {
-    if (value === 0 || value === 24) return "12:00 AM";
+    if (value >= 24) value -= 24;                      // 24.5 → "12:30 AM", 25 → "1:00 AM"
+    if (value === 0) return "12:00 AM";
     const hour        = Math.floor(value);
     const minute      = Math.round((value % 1) * 60);
     const suffix      = hour >= 12 ? "PM" : "AM";
@@ -496,9 +658,14 @@ function fmtDist(km: number): string {
     return now.getHours() + now.getMinutes() / 60;
   }
 
-  function isPastTime(startValue: number) {
-    if (!isToday(selectedDate)) return false;
-    return startValue < getCurrentDecimalTime();
+   function isPastTime(startValue: number) {
+    const now = new Date();
+    const cur = now.getHours() + now.getMinutes() / 60;
+    const sel = selectedDate.toDateString();
+    if (sel === now.toDateString()) return startValue < cur;
+    const y = new Date(now); y.setDate(now.getDate() - 1);
+    if (sel === y.toDateString()) return startValue < cur + 24;   // last night, after 12 AM
+    return false;                                                   // future date
   }
 
   function parseDisplayTime(time: string): number {
@@ -512,11 +679,11 @@ function fmtDist(km: number): string {
     return hour + minute / 60;
   }
 
-  function parseSlotRange(slotTime: string): { start: number; end: number } {
+   function parseSlotRange(slotTime: string): { start: number; end: number } {
     const parts = slotTime.split(" - ").map((v) => v.trim());
     if (parts.length < 2) return { start: 0, end: 0 };
-    const startValue = parseDisplayTime(parts[0]);
-    let   endValue   = parseDisplayTime(parts[1]);
+    const startValue = toTurfHour(parseDisplayTime(parts[0]));
+    let   endValue   = toTurfHour(parseDisplayTime(parts[1]));
     if (endValue <= startValue) endValue = 24;
     return { start: startValue, end: endValue };
   }
@@ -526,7 +693,7 @@ function fmtDist(km: number): string {
   }
 
   function buildTimeRange(start: number, end: number): string[] {
-    const safeEnd = Math.min(end, 24);
+         const safeEnd = Math.min(end, turfClose());
     const ranges: string[] = [];
     for (let time = start; time < safeEnd; time += 0.5) {
       const next = Math.min(time + 0.5, safeEnd);
@@ -535,14 +702,34 @@ function fmtDist(km: number): string {
     return ranges;
   }
 
-  function getRateForTime(time: number) {
+ // Mon–Fri = weekday, Sat/Sun = weekend (same rule as the server)
+  function getDayTypeFor(date: Date): DayType {
+    const d = date.getDay(); // 0 = Sun, 6 = Sat
+    return d === 0 || d === 6 ? "weekend" : "weekday";
+  }
+ 
+  // Looks up the Advance Pricing slab for this time on this date.
+  // Falls back to the normal Day/Night price when Advance Pricing is OFF,
+  // or when no time block covers this hour — identical to the server.
+  function getRateForTime(time: number, date: Date = selectedDate) {
     if (!turf) return 0;
+    if (turf.advancePricingEnabled === true) {
+      const slabs = turf.priceSlabs?.[getDayTypeFor(date)];
+      if (Array.isArray(slabs) && slabs.length > 0) {
+                const h   = time >= 24 ? time - 24 : time;                 // 1 AM next day → hour 1
+        const hit = slabs.find((s) => h >= Number(s.start) && h < Number(s.end));
+        if (hit) {
+          const r = Number(hit.rate);
+          if (!isNaN(r) && r >= 0) return r;
+        }
+      }
+    }
     if (time >= 6 && time < 18) return Number(turf.dayPrice   || turf.price || 0);
-    return                              Number(turf.nightPrice || turf.price || 0);
+    return                             Number(turf.nightPrice || turf.price || 0);
   }
 
   function getRangePrice(start: number, end: number): number {
-    const safeEnd = Math.min(end, 24);
+    const safeEnd = Math.min(end, turfClose());
     if (safeEnd <= start) return 0;
     let total = 0;
     for (let time = start; time < safeEnd; time += 0.5) {
@@ -559,6 +746,7 @@ function fmtDist(km: number): string {
   }
 
   function isRangeUnavailable(start: number, end: number) {
+    if (end > 24 && isLateClosed()) return true;          // late-night booking window closed
     return [...bookedSlots, ...lockedSlots].some((slotTime) => {
       try {
         const parsed = parseSlotRange(slotTime);
@@ -600,11 +788,11 @@ function getFacilityIcon(facility: string): keyof typeof MaterialCommunityIcons.
   const allTimePoints = useMemo<SlotChip[]>(() => {
     if (!turf) return [];
     const chips: SlotChip[] = [];
-    for (let t = openingTime; t < closingTime && t < 24; t += STEP) {
+    for (let t = openingTime; t < closingTime; t += STEP) {
       if (isPastTime(t)) continue;
       let status: SlotChip["status"] = "available";
       const isBooked = bookedSlots.some((s) => {
-        if (s === `${formatTime(t)} - ${formatTime(Math.min(t + STEP, 24))}`) return true;
+        if (s === `${formatTime(t)} - ${formatTime(Math.min(t + STEP, closingTime))}`) return true;
         try { const p = parseSlotRange(s); return rangesOverlap(t, t + STEP, p.start, p.end); }
         catch { return false; }
       });
@@ -612,8 +800,9 @@ function getFacilityIcon(facility: string): keyof typeof MaterialCommunityIcons.
         try { const p = parseSlotRange(s); return rangesOverlap(t, t + STEP, p.start, p.end); }
         catch { return false; }
       });
-      if (isBooked)      status = "booked";
-      else if (isLocked) status = "locked";
+            if (t >= 24 && isLateClosed()) status = "outside";   // shows "Closed"
+      else if (isBooked)  status = "booked";
+      else if (isLocked)  status = "locked";
       chips.push({ value: t, label: formatTime(t), status });
     }
     return chips;
@@ -621,12 +810,32 @@ function getFacilityIcon(facility: string): keyof typeof MaterialCommunityIcons.
 
   const fromChips = useMemo<SlotChip[]>(() => allTimePoints, [allTimePoints]);
 
+    // FROM chips split into Morning / Afternoon / Evening / Night (empty parts hidden)
+  const fromGroups = useMemo(() =>
+    DAY_PARTS.map((p) => {
+      const chips = fromChips.filter((c) => c.value >= p.from && c.value < p.to);
+      const free  = chips.filter((c) => c.status === "available").length;
+      return { ...p, chips, free };
+    }).filter((g) => g.chips.length > 0),
+  [fromChips]);
+
+  const visibleFromChips = useMemo(
+    () => fromGroups.find((g) => g.key === fromPart)?.chips ?? [],
+    [fromGroups, fromPart]
+  );
+
+  // Open on the part with the next free start time (re-checked on date change)
+  useEffect(() => {
+    if (fromGroups.length === 0) return;
+    const firstFree = fromGroups.find((g) => g.free > 0) ?? fromGroups[0];
+    if (!fromGroups.some((g) => g.key === fromPart && g.free > 0)) setFromPart(firstFree.key);
+  }, [selectedDate, fromGroups.map((g) => `${g.key}:${g.free}`).join("|")]);
   const toChips = useMemo<SlotChip[]>(() => {
     if (flexStart === null) return [];
     const chips: SlotChip[] = [];
     const minEnd = flexStart + MIN_BOOKING_HOURS;
     const maxEnd = flexStart + MAX_BOOKING_HOURS;
-    for (let t = minEnd; t <= closingTime && t <= 24 && t <= maxEnd; t += STEP) {
+    for (let t = minEnd; t <= closingTime && t <= maxEnd; t += STEP) {
       if (isRangeUnavailable(flexStart, t)) break;
       chips.push({ value: t, label: formatTime(t), status: "available" });
     }
@@ -647,20 +856,20 @@ function getFacilityIcon(facility: string): keyof typeof MaterialCommunityIcons.
 
   const durationMinutes = useMemo(() => {
     if (selectedStartValue === null || selectedEndValue === null ||
-        selectedEndValue <= selectedStartValue || selectedEndValue > 24) return 0;
+        selectedEndValue <= selectedStartValue || selectedEndValue > closingTime) return 0;
     return Math.round((selectedEndValue - selectedStartValue) * 60);
   }, [selectedStartValue, selectedEndValue]);
 
   const selectedSlots = useMemo(() => {
     if (selectedStartValue === null || selectedEndValue === null ||
-        selectedEndValue <= selectedStartValue || selectedEndValue > 24 ||
+        selectedEndValue <= selectedStartValue || selectedEndValue > closingTime ||
         durationMinutes > MAX_BOOKING_HOURS * 60) return [];
     return buildTimeRange(selectedStartValue, selectedEndValue);
   }, [selectedStartValue, selectedEndValue, durationMinutes]);
 
   const selectedTimeLabel = useMemo(() => {
     if (selectedStartValue === null || selectedEndValue === null ||
-        selectedEndValue <= selectedStartValue || selectedEndValue > 24) return "";
+        selectedEndValue <= selectedStartValue || selectedEndValue > closingTime) return "";
     return `${formatTime(selectedStartValue)} → ${formatTime(selectedEndValue)}`;
   }, [selectedStartValue, selectedEndValue]);
 
@@ -674,7 +883,7 @@ function getFacilityIcon(facility: string): keyof typeof MaterialCommunityIcons.
 
   const totalPrice = useMemo(() => {
     if (selectedStartValue === null || selectedEndValue === null ||
-        selectedEndValue <= selectedStartValue || selectedEndValue > 24) return 0;
+               selectedEndValue <= selectedStartValue || selectedEndValue > closingTime) return 0;
     return getRangePrice(selectedStartValue, selectedEndValue);
   }, [selectedStartValue, selectedEndValue, specialPrices, turf]);
 
@@ -691,28 +900,41 @@ const computedAdvanceAmount = useMemo(() => {
   return baseBookingPrice;
 }, [turf, durationMinutes]);
 
+// Venue offer (Option A): comes off the TOTAL. The advance stays the same;
+// the player pays less at the turf. (Same rule as the server's /create-order.)
+const offerTotal = useMemo(() => Math.max(totalPrice - offerDiscount, 0), [totalPrice, offerDiscount]);
+
 // Used for actual payment — depends on what the user selected
 const advanceAmount = useMemo(() => {
-  if (bookingType === "full") return totalPrice;
-  return computedAdvanceAmount;
-}, [bookingType, totalPrice, computedAdvanceAmount]);
+  if (bookingType === "full") return offerTotal;
+  return Math.min(computedAdvanceAmount, offerTotal);
+}, [bookingType, offerTotal, computedAdvanceAmount]);
 
   
 
   const remainingAmount = useMemo(() => {
     if (bookingType === "full") return 0;
-    return Math.max(totalPrice - advanceAmount, 0);
-  }, [bookingType, totalPrice, advanceAmount]);
+    return Math.max(offerTotal - advanceAmount, 0);
+  }, [bookingType, offerTotal, advanceAmount]);
 
-  const finalAdvanceAmount = useMemo(() => {
-  return Math.max(advanceAmount - discountAmount, 0);
-}, [advanceAmount, discountAmount]);
+ const coinDiscountAmount = useMemo(() => {
+    return (usePcoins ? pcoinToUse : 0) + (useVcoins ? vcoinToUse : 0);
+  }, [usePcoins, useVcoins, pcoinToUse, vcoinToUse]);
+ 
+    const finalAdvanceAmount = useMemo(() => {
+    // Only one of discountAmount / offerDiscount is ever non-zero — an offer
+    // blocks promo codes — but subtract both so the number can't drift if that
+    // ever changes.
+    // The offer is already inside advanceAmount/remainingAmount (Option A),
+    // so only promo + coins come off the online payment here.
+    return Math.max(advanceAmount - discountAmount - coinDiscountAmount, 1);
+  }, [advanceAmount, discountAmount, coinDiscountAmount]);
 
   const quickSlots = useMemo<TimeRange[]>(() => {
     if (!turf) return [];
     const generated: TimeRange[] = [];
     const duration = slotDuration / 60;
-    for (let time = openingTime; time + duration <= closingTime && time + duration <= 24; time += duration) {
+    for (let time = openingTime; time + duration <= closingTime; time += duration) {
       if (isPastTime(time)) continue;
       generated.push({
         time:       `${formatTime(time)} - ${formatTime(time + duration)}`,
@@ -723,16 +945,114 @@ const advanceAmount = useMemo(() => {
     return generated;
   }, [turf, openingTime, closingTime, slotDuration, selectedDate]);
 
+    // Quick slots split into Morning / Afternoon / Evening / Night (empty parts hidden)
+  const quickGroups = useMemo(() =>
+    DAY_PARTS.map((p) => {
+      const slots = quickSlots.filter((s) => s.startValue >= p.from && s.startValue < p.to);
+      const free  = slots.filter((s) => !isRangeUnavailable(s.startValue, s.endValue)).length;
+      return { ...p, slots, free };
+    }).filter((g) => g.slots.length > 0),
+  [quickSlots, bookedSlots, lockedSlots]);
+
+  const visibleQuickSlots = useMemo(
+    () => quickGroups.find((g) => g.key === quickPart)?.slots ?? [],
+    [quickGroups, quickPart]
+  );
+
+  // Open on the part with the next free slot (re-checked on date change)
+  useEffect(() => {
+    if (quickGroups.length === 0) return;
+    const firstFree = quickGroups.find((g) => g.free > 0) ?? quickGroups[0];
+    if (!quickGroups.some((g) => g.key === quickPart && g.free > 0)) setQuickPart(firstFree.key);
+  }, [selectedDate, quickGroups.map((g) => `${g.key}:${g.free}`).join("|")]);
+
   const hasValidSelection =
     selectedStartValue !== null &&
     selectedEndValue   !== null &&
-    selectedEndValue <= 24 &&
+    selectedEndValue <= closingTime &&
     selectedEndValue > selectedStartValue &&
     durationMinutes <= MAX_BOOKING_HOURS * 60 &&
     durationMinutes  > 0 &&
     !isPastTime(selectedStartValue) &&
     !isRangeUnavailable(selectedStartValue, selectedEndValue);
 
+      // ── Ask the server whether an offer applies to this exact selection ───────
+  // Debounced: slot chips fire fast and this is a network call.
+  useEffect(() => {
+    let alive = true;
+
+    if (!hasValidSelection || totalPrice <= 0) {
+      setOffer(null);
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      try {
+        setOfferLoading(true);
+        const res = await fetch("https://bookora-backend-95u4.onrender.com/best-offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            turfId:       String(id),
+            dateString:   selectedDate.toDateString(),
+            selectedSlots,
+            onlineAmount: totalPrice,   // same base the server prices against
+            userId:       auth.currentUser?.uid || null,   // per-player limits
+          }),
+        });
+        const data = await res.json();
+        if (!alive) return;
+
+        setOffer(data?.offer || null);
+
+        // An offer blocks promo codes — drop anything already applied.
+        if (data?.offer) {
+          setPromoApplied(null);
+          setPromoCode("");
+          setPromoError("");
+        }
+      } catch {
+        // A failed offer lookup must NEVER stop someone booking.
+        if (alive) setOffer(null);
+      } finally {
+        if (alive) setOfferLoading(false);
+      }
+    }, 300);
+
+    return () => { alive = false; clearTimeout(timer); };
+  }, [id, selectedDate, selectedSlots.join("|"), totalPrice, hasValidSelection]);
+
+  // ── Turf images ───────────────────────────────────────────────────────────────
+   // ── Advance Pricing helpers ───────────────────────────────────────────────────
+  const advancePricingOn = useMemo(() =>
+    turf?.advancePricingEnabled === true &&
+    ((turf?.priceSlabs?.weekday?.length ?? 0) > 0 ||
+     (turf?.priceSlabs?.weekend?.length ?? 0) > 0),
+  [turf]);
+ 
+  const sortedSlabs = useMemo(() => {
+    const pick = (arr?: PriceSlab[]) =>
+      Array.isArray(arr) ? [...arr].sort((a, b) => Number(a.start) - Number(b.start)) : [];
+    return {
+      weekday: pick(turf?.priceSlabs?.weekday),
+      weekend: pick(turf?.priceSlabs?.weekend),
+    };
+  }, [turf]);
+ 
+  const slabRange = useMemo(() => {
+    const rng = (arr: PriceSlab[]) =>
+      arr.length
+        ? { min: Math.min(...arr.map((s) => Number(s.rate))),
+            max: Math.max(...arr.map((s) => Number(s.rate))) }
+        : null;
+    return { weekday: rng(sortedSlabs.weekday), weekend: rng(sortedSlabs.weekend) };
+  }, [sortedSlabs]);
+ 
+  function openPriceInfo() {
+    setPriceTab(getDayTypeFor(selectedDate));
+    setShowPriceInfo(true);
+  }
+ 
   // ── Turf images ───────────────────────────────────────────────────────────────
   const turfImages = useMemo(() => {
     if (Array.isArray(turf?.images) && turf!.images!.length > 0) return turf!.images!;
@@ -844,9 +1164,14 @@ const advanceAmount = useMemo(() => {
     setActivePanel(null);
     animatePanel("from", false);
     animatePanel("to", false);
-     setPromoApplied(null);   // ← ADD
-    setPromoCode("");         // ← ADD
-    setPromoError("");   
+       setPromoApplied(null);
+    setPromoCode("");
+    setPromoError("");
+    setOffer(null);
+     setUsePcoins(false);
+    setUseVcoins(false);
+    setPcoinToUse(0);
+    setVcoinToUse(0);   
   }
 
   function handleQuickSlotSelect(slot: TimeRange) {
@@ -880,7 +1205,7 @@ const advanceAmount = useMemo(() => {
   function validateSelection(showAlert = true) {
     if (selectedStartValue === null) { if (showAlert) Alert.alert("Select Start Time", "Please select a start time first."); return false; }
     if (selectedEndValue === null)   { if (showAlert) Alert.alert("Select End Time", "Please select an end time."); return false; }
-    if (selectedEndValue > 24)       { if (showAlert) Alert.alert("Invalid Time", "Booking cannot go beyond 12:00 AM."); return false; }
+        if (selectedEndValue > closingTime) { if (showAlert) Alert.alert("Invalid Time", `Booking cannot go beyond ${formatTime(closingTime)}.`); return false; }
     if (selectedEndValue <= selectedStartValue) { if (showAlert) Alert.alert("Invalid Time Selection", "End time must be after start time."); return false; }
     if (durationMinutes > MAX_BOOKING_HOURS * 60) { if (showAlert) Alert.alert("Booking Limit Exceeded", `Maximum ${MAX_BOOKING_HOURS} hours allowed.`); return false; }
     if (selectedStartValue < openingTime || selectedEndValue > closingTime) { if (showAlert) Alert.alert("Outside Turf Hours", `Please select between ${formatTime(openingTime)} and ${formatTime(closingTime)}`); return false; }
@@ -890,7 +1215,14 @@ const advanceAmount = useMemo(() => {
   }
 
   // ── Promo code ───────────────────────────────────────────────────────────────
-  const applyPromo = async () => {
+    const applyPromo = async () => {
+    if (offer) {
+      Alert.alert(
+        "Offer already applied",
+        `"${offer.title}" is already applied to this slot. Venue offers can't be combined with promo codes.`
+      );
+      return;
+    }
     if (!promoCode.trim()) return;
     if (!auth.currentUser?.uid) return;
     if (!hasValidSelection) {
@@ -903,12 +1235,13 @@ const advanceAmount = useMemo(() => {
       const res = await fetch("https://bookora-backend-95u4.onrender.com/validate-promo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-     body: JSON.stringify({
+        body: JSON.stringify({
   code:          promoCode.trim().toUpperCase(),
   userId:        auth.currentUser.uid,
   turfId:        String(id),
-  onlineAmount:  advanceAmount,      // ← use this to totalprice advanceAmount
+  onlineAmount:  totalPrice,         // see note — was advanceAmount
   bookingType,
+  dateString:    selectedDate.toDateString(),
   selectedSlots: selectedSlots,
 }),
       });
@@ -1004,7 +1337,9 @@ const advanceAmount = useMemo(() => {
           endTime:   formatTime(selectedEndValue!),
           promoId:   promoApplied?.promoId   || null,  // ← ADD
           promoCode: promoApplied?.code      || null,  // ← ADD
-          discount:  promoApplied?.discount  || 0,     // ← ADD
+          discount:  promoApplied?.discount  || 0,    
+           usePcoins:   usePcoins ? pcoinToUse : 0,
+          useVcoins:   useVcoins ? vcoinToUse : 0, // ← ADD
         }),
       });
 
@@ -1199,10 +1534,107 @@ function requestCloseBilling() {
     );
   }
 
-  const fromPanelHeight = fromPanelAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 220] });
+   const fromPanelHeight = fromPanelAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 280] });
   const toPanelHeight   = toPanelAnim.interpolate(  { inputRange: [0, 1], outputRange: [0, 220] });
 
   const statusCfg = turf.status ? STATUS_CONFIG[turf.status] : null;
+    // ── Admin-set booking mode (missing = old turf = online) ──
+  const turfMode   = turf.bookingMode ?? "online";
+  const showCall   = turfMode !== "online" && !!turf.bookingPhone;
+  const showOnline = turfMode !== "phone" || !showCall; // safety: no number → keep online
+
+  // ── Offer display helpers (online turfs only) ──
+  const p2 = (n: number) => String(n).padStart(2, "0");
+  const keyOfDate = (d: Date) => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+  const offersOn = (d: Date) => (showOnline ? turfOffers.filter((o) => (o.runsOn || []).includes(keyOfDate(d))) : []);
+  const offerLabel = (o: TurfOffer) => (o.type === "flat" ? `₹${o.value} OFF` : `${o.value}% OFF`);
+  const parseHM = (t: string) => {
+    const m = String(t).trim().match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)/i);
+    if (!m) return 0;
+    let h = Number(m[1]) % 12;
+    if (m[3].toUpperCase() === "PM") h += 12;
+    return h + Number(m[2] || 0) / 60;
+  };
+  const inWindows = (o: TurfOffer, start: number, end: number) => {
+    const wins = o.targetSlots || [];
+    if (!wins.length) return true;
+    return wins.some((w) => {
+      const [a, b] = String(w).split("-");
+      const ws = parseHM(a); let we = parseHM(b || "");
+      if (we <= ws) we += 24;
+      return (start >= ws && end <= we) || (start >= ws + 24 && end <= we + 24) || (start + 24 >= ws && end + 24 <= we);
+    });
+  };
+  // Best offer covering a slot on the selected date (for the green slot tag)
+  const slotOffer = (start: number, end: number) => {
+    const list = offersOn(selectedDate).filter((o) => inWindows(o, start, end));
+    if (!list.length) return null;
+    const worth = (o: TurfOffer) => (o.type === "flat" ? o.value : Math.min(o.value * 10, Number(o.maxDiscount) > 0 ? Number(o.maxDiscount) : Infinity));
+    return list.sort((a, b) => worth(b) - worth(a))[0];
+  };
+  const slotOfferPrice = (o: TurfOffer, price: number) => {
+    if (o.type === "flat") return null;           // flat ₹ comes off the booking, not each slot
+    const cut = Math.round(price * o.value / 100);
+    return Math.max(price - Math.min(cut, Number(o.maxDiscount) > 0 ? Number(o.maxDiscount) : cut), 0);
+  };
+  const todayOffers = offersOn(selectedDate);
+  const bannerOffer = todayOffers[0] || null;
+  const upcomingOffer = !bannerOffer && showOnline
+    ? turfOffers.find((o) => (o.runsOn || []).some((k) => k > keyOfDate(selectedDate))) || null
+    : null;
+  const windowsText = (o: TurfOffer) => (o.targetSlots?.length ? o.targetSlots.map((w) => w.replace(/:00/g, "").replace(" - ", "–")).join(", ") : "All day");
+ 
+  // ── Option 1: must be logged in to call / WhatsApp ──
+  const requireLogin = (): boolean => {
+    if (auth.currentUser) return true;
+    Alert.alert(
+      "Login required",
+      "Please log in to contact this turf.",
+      [
+        { text: "Cancel", style: "cancel" },
+        { text: "Log in", onPress: () => router.push("/(auth)/login" as any) },
+      ]
+    );
+    return false;
+  };
+
+  // ── Options 2 + 3: log lead + notify owner (fire-and-forget, never blocks the call) ──
+  const logCallLead = async (channel: "call" | "whatsapp") => {
+    try {
+      const token = await auth.currentUser?.getIdToken();
+      if (!token) return;
+      fetch("https://bookora-backend-95u4.onrender.com/call-lead", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ turfId: String(id), channel }),
+      }).catch(() => {});
+    } catch {}
+  };
+
+  const callTurf = () => {
+    if (!requireLogin()) return;
+    logCallLead("call");
+    Linking.openURL(`tel:${turf.bookingPhone}`);
+  };
+
+  const whatsappTurf = () => {
+    if (!requireLogin()) return;
+    logCallLead("whatsapp");
+    const msg = encodeURIComponent(`Hi, I want to book ${turf.name} (found on PlayOn).`);
+    Linking.openURL(`https://wa.me/91${turf.bookingPhone}?text=${msg}`).catch(() =>
+      Alert.alert("WhatsApp not found", "Please call the number instead.")
+    );
+  };
+
+  // "9876543210" → "98765 43210"
+  // "9876543210" → "98765 43210"  (guests see "98XXX XXXXX")
+  const prettyPhone = turf.bookingPhone
+    ? isLoggedIn
+      ? `${turf.bookingPhone.slice(0, 5)} ${turf.bookingPhone.slice(5)}`
+      : `${turf.bookingPhone.slice(0, 2)}XXX XXXXX`
+    : "";
+  // "6:00 AM" → "6 AM"
+  const shortTime = (v: number) => formatTime(v).replace(":00", "");
 
   
 
@@ -1240,6 +1672,16 @@ function requestCloseBilling() {
               ))}
             </View>
           )}
+
+          {/* ── Back Button (iOS safe area aware) ── */}
+ <TouchableOpacity
+  style={[styles.backBtn, { top: insets.top + 8 }]}
+  onPress={() => router.back()}
+  activeOpacity={0.85}
+  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+>
+  <Ionicons name="arrow-back" size={20} color="#fff" />
+</TouchableOpacity>
         </View>
 
         {/* ── Header Card ── */}
@@ -1289,15 +1731,75 @@ function requestCloseBilling() {
   </TouchableOpacity>
 </View>
 
-          {/* Price cards */}
-          <View style={styles.priceRow}>
-            {[["Day", turf.dayPrice], ["Night", turf.nightPrice], ["Advance", turf.bookingPrice]].map(([label, val]) => (
-              <View key={label as string} style={styles.priceCard}>
-                <Text style={styles.priceLabel}>{label as string}</Text>
-                <Text style={styles.priceValue}>₹{val || 0}</Text>
-              </View>
-            ))}
-          </View>
+           {/* Price cards — tap to open full price details */}
+           {advancePricingOn ? (
+  <TouchableOpacity style={styles.priceCardV2} onPress={openPriceInfo} activeOpacity={0.85}>
+    <View style={styles.priceRowV2}>
+      <View style={styles.priceRowLeft}>
+        <View style={styles.priceDayDot} />
+        <Text style={styles.priceRowLabel}>Mon – Fri</Text>
+      </View>
+      <Text style={styles.priceRowValue} numberOfLines={1} adjustsFontSizeToFit>
+        {slabRange.weekday
+          ? (slabRange.weekday.min === slabRange.weekday.max
+              ? `₹${slabRange.weekday.min}`
+              : `₹${slabRange.weekday.min} – ₹${slabRange.weekday.max}`)
+          : `₹${turf.dayPrice || 0}`}
+        <Text style={styles.priceRowUnit}> /hr</Text>
+      </Text>
+    </View>
+
+    <View style={styles.priceDividerV2} />
+
+    <View style={styles.priceRowV2}>
+      <View style={styles.priceRowLeft}>
+        <View style={[styles.priceDayDot, { backgroundColor: "#F59E0B" }]} />
+        <Text style={styles.priceRowLabel}>Sat – Sun</Text>
+      </View>
+      <Text style={styles.priceRowValue} numberOfLines={1} adjustsFontSizeToFit>
+        {slabRange.weekend
+          ? (slabRange.weekend.min === slabRange.weekend.max
+              ? `₹${slabRange.weekend.min}`
+              : `₹${slabRange.weekend.min} – ₹${slabRange.weekend.max}`)
+          : `₹${turf.dayPrice || 0}`}
+        <Text style={styles.priceRowUnit}> /hr</Text>
+      </Text>
+    </View>
+
+{showOnline && (
+    <View style={styles.advanceStrip}>
+      <View style={styles.priceRowLeft}>
+        <Ionicons name="flash" size={13} color="#16A34A" />
+        <Text style={styles.advanceStripLabel}>Book with advance</Text>
+      </View>
+      <Text style={styles.advanceStripValue}>₹{turf.bookingPrice || 0}</Text>
+    </View>
+      )}
+  </TouchableOpacity>
+) : (
+  /* keep your existing non-advance-pricing block as is */
+            <TouchableOpacity style={styles.priceRow} onPress={openPriceInfo} activeOpacity={0.85}>
+                           {([["Day", turf.dayPrice], ["Night", turf.nightPrice], ["Advance", turf.bookingPrice]] as [string, any][])
+                .filter(([label]) => showOnline || label !== "Advance")
+                .map(([label, val]) => (
+
+                <View key={label} style={styles.priceCard}>
+                  <Text style={styles.priceLabel}>{label}</Text>
+                  <Text style={styles.priceValue}>₹{val || 0}</Text>
+                </View>
+              ))}
+            </TouchableOpacity>
+          )}
+ 
+          <TouchableOpacity style={styles.priceHintRow} onPress={openPriceInfo} activeOpacity={0.8}>
+            <Ionicons name="information-circle-outline" size={14} color="#16A34A" />
+            <Text style={styles.priceHintTxt}>
+              {advancePricingOn
+                ? "Price changes by time & day — view full price chart"
+                : "View full price details"}
+            </Text>
+            <Ionicons name="chevron-forward" size={14} color="#16A34A" />
+          </TouchableOpacity>
 
           
 
@@ -1316,9 +1818,132 @@ function requestCloseBilling() {
               </View>
             </View>
           )}
+          
         </View>
+                  {/* ── Book by phone (admin set Phone Only / Both) ── */}
+        {showCall && (
+          <View style={styles.callCard}>
+            {/* Header */}
+            <View style={styles.callHeader}>
+              <View style={styles.callIconWrap}>
+                <Ionicons name="call-outline" size={22} color="#15803D" />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.callTitle}>
+                  {showOnline ? "Prefer to book by call?" : "Book by phone"}
+                </Text>
+                <Text style={styles.callSub}>
+                  {showOnline
+                    ? "You can also book this turf over a call"
+                    : "This turf takes bookings over a call"}
+                </Text>
+              </View>
+            </View>
 
+            {/* Number box */}
+            <View style={styles.callNumberBox}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.callNumberLabel}>BOOKING NUMBER</Text>
+                <Text style={styles.callNumber}>{prettyPhone}</Text>
+              </View>
+              <Text style={styles.callHours}>
+                {shortTime(openingTime)} – {shortTime(closingTime)}
+              </Text>
+            </View>
+
+                        {/* Buttons — logged in: WhatsApp + Call | guest: Log in */}
+            {isLoggedIn ? (
+              <>
+                <View style={styles.callBtnRow}>
+                  <TouchableOpacity style={styles.callOutlineBtn} onPress={whatsappTurf} activeOpacity={0.85}>
+                    <Ionicons name="logo-whatsapp" size={18} color="#16A34A" />
+                    <Text style={styles.callOutlineBtnText}>WhatsApp</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.callOutlineBtn} onPress={callTurf} activeOpacity={0.85}>
+                    <Ionicons name="call" size={16} color="#111111" />
+                    <Text style={styles.callOutlineBtnText}>Call now</Text>
+                  </TouchableOpacity>
+                </View>
+                <Text style={styles.callPrivacy}>
+                                    Mention PlayOn when you call — the turf will know you found them here.
+                </Text>
+              </>
+            ) : (
+              <TouchableOpacity
+                style={styles.callLoginBtn}
+                onPress={() => router.push("/(auth)/signup" as any)}
+                activeOpacity={0.85}
+              >
+                <Ionicons name="lock-closed" size={16} color="#fff" />
+                <Text style={styles.callLoginBtnText}>Create account to see number</Text>
+              </TouchableOpacity>
+            )}
+
+          
+            {!showOnline && (
+              <Text style={styles.callNote}>
+                Online slots, coins and offers are not available for this turf. Pay the full amount at the venue.
+              </Text>
+            )}
+          </View>
+        )}
+
+       {/* ── Coin Balance Strip ── */}
+       {showOnline &&(
+        <TouchableOpacity
+          style={coinStyles.strip}
+          activeOpacity={0.82}
+          onPress={() => router.push("/wallet" as any)}
+        >
+          <View style={coinStyles.iconCircle}>
+            <Text style={{ fontSize: 18 }}>🪙</Text>
+          </View>
+
+          <View style={{ flex: 1, marginLeft: 10 }}>
+            <View style={coinStyles.pillsRow}>
+              {pcoinBalance > 0 && (
+                <View style={[coinStyles.pill, { backgroundColor: "#EDE9FE" }]}>
+                  <View style={[coinStyles.pillDot, { backgroundColor: "#7C3AED" }]} />
+                  <Text style={[coinStyles.pillTxt, { color: "#7C3AED" }]}>
+                    {pcoinBalance} PCoin
+                  </Text>
+                </View>
+              )}
+              {vcoinEnabled && (
+                vcoinBalance > 0 ? (
+                  <View style={[coinStyles.pill, { backgroundColor: "#FEF3C7" }]}>
+                    <View style={[coinStyles.pillDot, { backgroundColor: "#D97706" }]} />
+                    <Text style={[coinStyles.pillTxt, { color: "#D97706" }]}>
+                      {vcoinBalance} VCoin · This turf
+                    </Text>
+                  </View>
+                ) : (
+                  <View style={[coinStyles.pill, { backgroundColor: "#FEF3C7" }]}>
+                    <View style={[coinStyles.pillDot, { backgroundColor: "#D97706" }]} />
+                    <Text style={[coinStyles.pillTxt, { color: "#D97706" }]}>
+                      Earn {vcoinRate}/hr VCoin here
+                    </Text>
+                  </View>
+                )
+              )}
+            </View>
+
+            <Text style={coinStyles.sub}>
+              {(pcoinBalance > 0 || (vcoinBalance > 0 && vcoinEnabled))
+                ? `₹${pcoinBalance + (vcoinEnabled ? vcoinBalance : 0)} available · Tap wallet to use`
+                : vcoinEnabled
+                  ? `Earn ${vcoinRate} VCoin/hr + PCoin on every booking here`
+                  : "Earn PCoin on every booking · Tap to view wallet"
+              }
+            </Text>
+          </View>
+
+          <Ionicons name="chevron-forward" size={15} color="#9CA3AF" />
+        </TouchableOpacity>
+  
+            )}
         {/* ── Turf Status Banner ── */}
+          
         {turf.status && (
           <View style={[
             styles.statusCard,
@@ -1352,6 +1977,32 @@ function requestCloseBilling() {
           </View>
         )}
 
+              {showOnline && (<>
+        {/* ── Offer banner ── */}
+        {(bannerOffer || upcomingOffer) && (() => {
+          const o = (bannerOffer || upcomingOffer)!;
+          const isToday = !!bannerOffer;
+          const nextDays = (o.runsOn || []).filter((k) => k > keyOfDate(selectedDate)).slice(0, 3)
+            .map((k) => { const [y, m, d] = k.split("-").map(Number); return `${d} ${new Date(y, m - 1, d).toLocaleDateString("en-US", { month: "short" })}`; });
+          return (
+            <View style={offerStyles.banner}>
+              <View style={offerStyles.bannerIcon}><Text style={{ fontSize: 22 }}>🎉</Text></View>
+              <View style={{ flex: 1 }}>
+                <Text style={offerStyles.bannerKicker}>
+                  {isToday ? (selectedDate.toDateString() === new Date().toDateString() ? "TODAY'S SPECIAL" : "OFFER ON THIS DAY") : "COMING SOON"}
+                </Text>
+                <Text style={offerStyles.bannerTitle} numberOfLines={1}>{o.tag || o.title} · {offerLabel(o)}</Text>
+                <Text style={offerStyles.bannerSub} numberOfLines={2}>
+                  {isToday
+                    ? `${windowsText(o)}${o.type === "percent" && Number(o.maxDiscount) > 0 ? ` · save up to ₹${o.maxDiscount}` : ""} · applied automatically`
+                    : `On ${nextDays.join(", ")} · book ahead`}
+                  {isToday && todayOffers.length > 1 ? ` · +${todayOffers.length - 1} more` : ""}
+                </Text>
+              </View>
+            </View>
+          );
+        })()}
+
         {/* ── Date Picker ── */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Choose Date</Text>
@@ -1371,6 +2022,11 @@ function requestCloseBilling() {
                   <Text style={[styles.dateNumber, selected && styles.dateTextSelected]}>
                     {item.getDate()}
                   </Text>
+                  {offersOn(item).length > 0 && (
+                    <Text style={[offerStyles.dateTag, selected && { color: "#DCFCE7" }]} numberOfLines={1}>
+                      {offerLabel(offersOn(item)[0])}
+                    </Text>
+                  )}
                 </TouchableOpacity>
               );
             }}
@@ -1381,9 +2037,30 @@ function requestCloseBilling() {
         {/* ── Booking Mode + Picker ── */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Book Your Time</Text>
-
+                    {closingTime > 24 && (() => {
+            const cutoff = Number(turf.lateCutoffHours || 0);
+            const shut   = isLateClosed();
+            return (
+              <View style={[styles.lateBanner, shut && styles.lateBannerShut]}>
+                <Ionicons name="moon" size={14} color={shut ? "#9CA3AF" : "#6D28D9"} />
+                <Text style={[styles.lateBannerTxt, shut && { color: "#6B7280" }]}>
+                  {shut
+                    ? `Late-night booking closed for this day`
+                    : `Late-night slots till ${formatTime(closingTime)}` +
+                      (cutoff ? ` · booking closes at ${formatTime(24 - cutoff)}` : "")}
+                </Text>
+              </View>
+            );
+          })()}
+          
+                        {(() => {
+            const allowedModes = (["flexible", "quick"] as BookingMode[]).filter((m) =>
+              m === "flexible" ? turf.flexibleSlotsEnabled !== false : turf.quickSlotsEnabled !== false
+            );
+            if (allowedModes.length < 2) return null;   // only one style → no switcher
+            return (
           <View style={styles.modeSwitcher}>
-            {(["flexible", "quick"] as BookingMode[]).map((mode) => (
+            {allowedModes.map((mode) => (
   <TouchableOpacity
     key={mode}
     style={[styles.modeButton, bookingMode === mode && styles.modeButtonActive]}
@@ -1397,9 +2074,11 @@ function requestCloseBilling() {
     <Text style={[styles.modeButtonText, bookingMode === mode && styles.modeButtonTextActive]}>
       {mode === "flexible" ? "Flexible Time" : "Quick Slots"}
     </Text>
-  </TouchableOpacity>
+   </TouchableOpacity>
 ))}
           </View>
+            );
+          })()}
 
           {bookingMode === "flexible" ? (
             <View style={styles.flexContainer}>
@@ -1455,9 +2134,34 @@ function requestCloseBilling() {
 
               <Animated.View style={[styles.slotPanel, { maxHeight: fromPanelHeight, overflow: "hidden" }]}>
                 <View style={styles.slotPanelInner}>
-                  <Text style={styles.slotPanelTitle}>Select start time</Text>
+                                 <Text style={styles.slotPanelTitle}>Select start time</Text>
+
+                  {/* Morning / Afternoon / Evening / Night */}
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={[styles.partRow, { paddingTop: 0, paddingBottom: 10 }]}>
+                    {fromGroups.map((g) => {
+                      const on = fromPart === g.key;
+                      return (
+                        <TouchableOpacity
+                          key={g.key}
+                          style={[styles.partChip, on && styles.partChipOn, { paddingVertical: 7 }]}
+                          onPress={() => setFromPart(g.key)}
+                          activeOpacity={0.8}
+                        >
+                          <Ionicons name={g.icon} size={13} color={on ? "#fff" : "#6B7280"} />
+                          <Text style={[styles.partChipTxt, on && styles.partChipTxtOn, { fontSize: 12 }]}>{g.label}</Text>
+                          <View style={[styles.partCount, on && styles.partCountOn]}>
+                            <Text style={[styles.partCountTxt, on && { color: "#15803D" }]}>{g.free}</Text>
+                          </View>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </ScrollView>
+
+                  {visibleFromChips.length === 0 && (
+                    <Text style={styles.noSlotsText}>No start times left here. Try another part of the day.</Text>
+                  )}
                   <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chipRow}>
-                    {fromChips.map((chip) => (
+                    {visibleFromChips.map((chip) => (
                       <SlotChip key={chip.value} chip={chip} isSelected={flexStart === chip.value} isInRange={false} onPress={() => handleSelectFrom(chip)} />
                     ))}
                   </ScrollView>
@@ -1513,10 +2217,46 @@ function requestCloseBilling() {
                 </View>
               )}
             </View>
-          ) : (
+                 ) : (
+            <View>
+              {/* Tell users this turf books in fixed slots */}
+              {turf.flexibleSlotsEnabled === false && (
+                <View style={styles.quickInfo}>
+                  <Ionicons name="flash" size={14} color="#15803D" />
+                  <Text style={styles.quickInfoTxt}>
+                    Quick slot booking · fixed {slotDuration}-min slots
+                  </Text>
+                </View>
+              )}
+
+              {/* Morning / Afternoon / Evening / Night */}
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.partRow}>
+                {quickGroups.map((g) => {
+                  const on = quickPart === g.key;
+                  return (
+                    <TouchableOpacity
+                      key={g.key}
+                      style={[styles.partChip, on && styles.partChipOn]}
+                      onPress={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setQuickPart(g.key); }}
+                      activeOpacity={0.8}
+                    >
+                      <Ionicons name={g.icon} size={14} color={on ? "#fff" : "#6B7280"} />
+                      <Text style={[styles.partChipTxt, on && styles.partChipTxtOn]}>{g.label}</Text>
+                      <View style={[styles.partCount, on && styles.partCountOn]}>
+                        <Text style={[styles.partCountTxt, on && { color: "#15803D" }]}>{g.free}</Text>
+                      </View>
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
+
             <View style={styles.quickSlotGrid}>
-            {quickSlots.map((slot) => {
-  const past     = isPastTime(slot.startValue);
+            {visibleQuickSlots.length === 0 && (
+              <Text style={styles.noSlotsText}>No slots left today. Try another date.</Text>
+            )}
+            {visibleQuickSlots.map((slot) => {
+    const past     = isPastTime(slot.startValue);
+  const lateShut = slot.endValue > 24 && isLateClosed();
   const disabled = isRangeUnavailable(slot.startValue, slot.endValue) || past;
   const selected = selectedQuickSlots.some((s) => s.time === slot.time);
   return (
@@ -1532,45 +2272,81 @@ function requestCloseBilling() {
         </View>
       )}
       <Text style={[styles.quickSlotTime, selected && styles.quickSlotTimeActive, disabled && styles.quickSlotTextDisabled]}>{slot.time}</Text>
-      <Text style={[styles.quickSlotPrice, disabled && styles.quickSlotTextDisabled]}>₹{getRangePrice(slot.startValue, slot.endValue)}</Text>
+      {(() => {
+        const price = getRangePrice(slot.startValue, slot.endValue);
+        const so = !disabled ? slotOffer(slot.startValue, slot.endValue) : null;
+        const np = so ? slotOfferPrice(so, price) : null;
+        return (
+          <>
+            <Text style={[styles.quickSlotPrice, disabled && styles.quickSlotTextDisabled]}>
+              {np !== null && np < price && (
+                <Text style={offerStyles.oldPrice}>₹{price}  </Text>
+              )}
+              <Text style={np !== null && np < price ? { color: "#15803D" } : undefined}>₹{np !== null && np < price ? np : price}</Text>
+            </Text>
+            {so && <Text style={offerStyles.slotTag} numberOfLines={1}>🏷 {so.tag || so.title}</Text>}
+          </>
+        );
+      })()}
       <Text style={[styles.quickSlotStatus, selected && styles.quickSlotStatusActive, disabled && styles.quickSlotTextDisabled]}>
-        {past ? "Time Over" : disabled ? "Unavailable" : selected ? "Selected" : "Available"}
+               {past ? "Time Over" : lateShut ? "Closed" : disabled ? "Unavailable" : selected ? "Selected" : "Available"}
       </Text>
     </TouchableOpacity>
   );
 })}
             </View>
+            </View>
           )}
         </View>
 
         {/* ── Booking Summary ── */}
-        
+                </>)}
         
         <View style={{ height: 130 }} />
       </ScrollView>
 
-      {/* ── Bottom Bar ── */}
-     {/* ── Sticky Mini Billing Strip (shows when slot selected, above bottom bar) ── */}
-{hasValidSelection && (
-  <View style={[styles.bottomWrapper, { paddingBottom: insets.bottom }]}>
-    <View style={styles.bottomBar}>
-      <View style={{ flex: 1 }}>
-  <Text style={styles.bottomLabel}>Advance booking amount</Text>
-  <Text style={styles.bottomAmount}>₹{advanceAmount}</Text>
-  <Text style={styles.bottomRemaining}>
-    {selectedTimeLabel} · {durationLabel}
-    {durationMinutes / 60 > ADVANCE_THRESHOLD_HOURS && " · Extended booking"}
-  </Text>
-</View>
-      <TouchableOpacity
-        style={styles.bookBtn}
-        onPress={() => { if (!validateSelection(true)) return; setShowBilling(true); }}
-      >
-        <Text style={styles.bookBtnText}>Book Now</Text>
-      </TouchableOpacity>
-    </View>
-  </View>
-)}
+          {/* ── Bottom Bar: Phone Only (always visible) ── */}
+      {!showOnline && showCall && (
+        <View style={[styles.bottomWrapper, { paddingBottom: insets.bottom }]}>
+          <View style={styles.bottomBar}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.bottomLabel}>Booking</Text>
+              <Text style={[styles.bottomAmount, { fontSize: 17 }]}>By phone only</Text>
+            </View>
+            <TouchableOpacity style={[styles.bookBtn, { flexDirection: "row", gap: 8 }]} onPress={callTurf}>
+              <Ionicons name="call" size={16} color="#fff" />
+              <Text style={styles.bookBtnText}>Call to book</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+
+      {/* ── Bottom Bar: Online / Both (shows when slot selected) ── */}
+      {showOnline && hasValidSelection && (
+        <View style={[styles.bottomWrapper, { paddingBottom: insets.bottom }]}>
+          <View style={styles.bottomBar}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.bottomLabel}>Advance booking amount</Text>
+              <Text style={styles.bottomAmount}>₹{advanceAmount}</Text>
+              <Text style={styles.bottomRemaining}>
+                {selectedTimeLabel} · {durationLabel}
+                {durationMinutes / 60 > ADVANCE_THRESHOLD_HOURS && " · Extended booking"}
+              </Text>
+            </View>
+            {showCall && (
+              <TouchableOpacity style={styles.callIconBtn} onPress={callTurf} activeOpacity={0.85}>
+                <Ionicons name="call" size={20} color="#15803D" />
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity
+              style={styles.bookBtn}
+              onPress={() => { if (!validateSelection(true)) return; setShowBilling(true); }}
+            >
+              <Text style={styles.bookBtnText}>Book Now</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
 
 
 
@@ -1598,9 +2374,18 @@ function requestCloseBilling() {
 </TouchableOpacity>
         </View>
         <View style={styles.summaryDivider} />
-        <View style={styles.summaryRow}><Text style={styles.summaryKey}>Date</Text><Text style={styles.summaryValue}>{formatFullDate(selectedDate)}</Text></View>
-        <View style={styles.summaryRow}><Text style={styles.summaryKey}>Duration</Text><Text style={styles.summaryValue}>{durationLabel}</Text></View>
-        <View style={styles.summaryRow}><Text style={styles.summaryKey}>Total</Text><Text style={styles.summaryTotal}>₹{totalPrice}</Text></View>
+        <View style={styles.summaryRow}>
+  <Text style={styles.summaryKey}>Date</Text>
+  <Text style={styles.summaryValue}>{formatFullDate(selectedDate)}</Text>
+</View>
+<View style={styles.summaryRow}>
+  <Text style={styles.summaryKey}>Duration</Text>
+  <Text style={styles.summaryValue}>{durationLabel}</Text>
+</View>
+<View style={styles.summaryRow}>
+  <Text style={styles.summaryKey}>Total</Text>
+  <Text style={styles.summaryTotal}>₹{totalPrice}</Text>
+</View>
 
         <Text style={styles.paymentTitle}>Payment Type</Text>
 <View style={styles.paymentTypeRow}>
@@ -1620,7 +2405,7 @@ function requestCloseBilling() {
         )}
         <Text style={[styles.paymentOptionLabel, active && styles.paymentOptionLabelActive]}>{type === "advance" ? "Advance" : "Full Payment"}</Text>
         <Text style={[styles.paymentOptionAmount, active && styles.paymentOptionAmountActive]}>
-  ₹{type === "advance" ? computedAdvanceAmount : totalPrice}
+  ₹{type === "advance" ? Math.min(computedAdvanceAmount, offerTotal) : offerTotal}
 </Text>
         <Text style={[styles.paymentOptionNote, active && styles.paymentOptionNoteActive]}>{type === "advance" ? "Pay rest at turf" : "Paid online"}</Text>
       </TouchableOpacity>
@@ -1628,38 +2413,385 @@ function requestCloseBilling() {
   })}
 </View>
 
-        <View style={promoStyles.wrap}>
-          <Text style={promoStyles.sectionTitle}>Have a promo code?</Text>
-          {promoApplied ? (
-            <View style={promoStyles.appliedBox}>
-              <View style={promoStyles.appliedLeft}>
-                <View style={promoStyles.appliedBadge}><Text style={promoStyles.appliedBadgeTxt}>🎟️ {promoApplied.code}</Text></View>
-                <Text style={promoStyles.appliedDesc} numberOfLines={1}>₹{promoApplied.discount} off applied</Text>
-              </View>
-              <TouchableOpacity style={promoStyles.removeBtn} onPress={removePromo}><Text style={{ fontSize: 16, color: "#6B7280" }}>✕</Text></TouchableOpacity>
-            </View>
-          ) : (
-            <View style={promoStyles.inputRow}>
-              <TextInput style={promoStyles.input} placeholder="Enter code" placeholderTextColor="#9CA3AF" value={promoCode} onChangeText={(v) => { setPromoCode(v.toUpperCase()); setPromoError(""); }} autoCapitalize="characters" returnKeyType="done" onSubmitEditing={applyPromo} />
-              <TouchableOpacity style={[promoStyles.applyBtn, (!promoCode.trim() || promoLoading) && promoStyles.applyBtnDisabled]} onPress={applyPromo} disabled={!promoCode.trim() || promoLoading}>
-                {promoLoading ? <ActivityIndicator size="small" color="#fff" /> : <Text style={promoStyles.applyBtnTxt}>Apply</Text>}
-              </TouchableOpacity>
-            </View>
-          )}
-          {!!promoError && <View style={promoStyles.errorBox}><Text style={promoStyles.errorTxt}>⚠ {promoError}</Text></View>}
-        </View>
+   {/* ── Venue offer (auto-applied) ── */}
+{offer && (
+  <View style={{
+    marginTop: 10, paddingTop: 16, borderTopWidth: 1, borderTopColor: "#F3F4F6",
+  }}>
+    <View style={{
+      flexDirection: "row", alignItems: "center", gap: 10,
+      backgroundColor: "#F0FDF4", borderWidth: 1, borderColor: "#86EFAC",
+      borderRadius: 14, paddingHorizontal: 12, paddingVertical: 11,
+    }}>
+      <View style={{
+        width: 34, height: 34, borderRadius: 10, backgroundColor: "#DCFCE7",
+        alignItems: "center", justifyContent: "center",
+      }}>
+        <Ionicons name="pricetag" size={16} color="#15803D" />
+      </View>
+      <View style={{ flex: 1 }}>
+        <Text style={{ fontSize: 13, fontWeight: "900", color: "#15803D" }}>
+          {offer.title}
+        </Text>
+        <Text style={{ fontSize: 11, fontWeight: "600", color: "#16A34A", marginTop: 2 }}>
+          ₹{offer.discount} off — applied automatically
+        </Text>
+        {bookingType === "advance" && (
+          <Text style={{ fontSize: 11, fontWeight: "700", color: "#15803D", marginTop: 2 }}>
+            Same advance now · you pay ₹{offer.discount} less at the turf
+          </Text>
+        )}
+      </View>
+    </View>
+    <Text style={{ fontSize: 11, color: "#9CA3AF", fontWeight: "600", marginTop: 8 }}>
+      This venue offer can't be combined with a promo code.
+    </Text>
+  </View>
+)}
 
-        <View style={styles.paymentBreakdown}>
-          {discountAmount > 0 && (
-            <View style={styles.summaryRow}><Text style={[styles.summaryKey, { color: "#16A34A" }]}>Promo ({promoApplied?.code})</Text><Text style={[styles.summaryValue, { color: "#16A34A" }]}>− ₹{discountAmount}</Text></View>
-          )}
-          <View style={styles.summaryRow}><Text style={styles.summaryKey}>Pay now</Text><Text style={[styles.summaryValue, discountAmount > 0 && { color: "#16A34A", fontWeight: "900" as const }]}>₹{finalAdvanceAmount}</Text></View>
-          <View style={styles.summaryRow}><Text style={styles.summaryKey}>Remaining at turf</Text><Text style={styles.summaryValue}>₹{remainingAmount}</Text></View>
-        </View>
+{/* ── Promo Code Section ── */}
+{!offer && (
+<View style={promoStyles.wrap}>
+  <Text style={promoStyles.sectionTitle}>
+    Have a promo code?{coinDiscountAmount > 0 ? " (Remove coins to use promo)" : ""}
+  </Text>
 
+  {promoApplied ? (
+    <View style={promoStyles.appliedBox}>
+      <View style={promoStyles.appliedLeft}>
+        <View style={promoStyles.appliedBadge}>
+          <Text style={promoStyles.appliedBadgeTxt}>🎟️ {promoApplied.code}</Text>
+        </View>
+        <Text style={promoStyles.appliedDesc} numberOfLines={1}>
+          ₹{promoApplied.discount} off applied
+        </Text>
+      </View>
+      <TouchableOpacity style={promoStyles.removeBtn} onPress={removePromo}>
+        <Text style={{ fontSize: 16, color: "#6B7280" }}>✕</Text>
+      </TouchableOpacity>
+    </View>
+  ) : (
+    <View style={[promoStyles.inputRow, coinDiscountAmount > 0 && { opacity: 0.4 }]}>
+      <TextInput
+        style={promoStyles.input}
+        placeholder="Enter code"
+        placeholderTextColor="#9CA3AF"
+        value={promoCode}
+        onChangeText={(v) => {
+          if (coinDiscountAmount > 0) {
+            Alert.alert("Remove Coins First", "Deselect coins to use a promo code.");
+            return;
+          }
+          setPromoCode(v.toUpperCase());
+          setPromoError("");
+        }}
+        editable={coinDiscountAmount === 0}
+        autoCapitalize="characters"
+        returnKeyType="done"
+        onSubmitEditing={applyPromo}
+      />
+      <TouchableOpacity
+        style={[promoStyles.applyBtn, (!promoCode.trim() || promoLoading || coinDiscountAmount > 0) && promoStyles.applyBtnDisabled]}
+        onPress={() => {
+          if (coinDiscountAmount > 0) {
+            Alert.alert("Remove Coins First", "Deselect coins to use a promo code.");
+            return;
+          }
+          applyPromo();
+        }}
+        disabled={!promoCode.trim() || promoLoading || coinDiscountAmount > 0}
+      >
+        {promoLoading
+          ? <ActivityIndicator size="small" color="#fff" />
+          : <Text style={promoStyles.applyBtnTxt}>Apply</Text>
+        }
+      </TouchableOpacity>
+    </View>
+  )}
+   {!!promoError && (
+    <View style={promoStyles.errorBox}>
+      <Text style={promoStyles.errorTxt}>⚠ {promoError}</Text>
+    </View>
+  )}
+</View>
+)}
+
+{/* ── Coin Redeem Section ── */}
+<View style={[coinRedeemStyles.wrap, promoApplied && { opacity: 0.4 }]}>
+  <Text style={coinRedeemStyles.sectionTitle}>
+    Use Your Coins{promoApplied ? " (Remove promo to use coins)" : ""}
+  </Text>
+  <View style={coinRedeemStyles.cardsRow}>
+    {/* PCoin card */}
+    <TouchableOpacity
+      style={[coinRedeemStyles.coinCard, usePcoins && coinRedeemStyles.coinCardActive]}
+      onPress={() => {
+        if (promoApplied) {
+          Alert.alert("Remove Promo First", "Remove the promo code to use coins.");
+          return;
+        }
+        const val = !usePcoins;
+        setUsePcoins(val);
+                setPcoinToUse(val ? Math.max(Math.min(pcoinBalance, advanceAmount - (useVcoins ? vcoinToUse : 0) - 1), 0) : 0);
+      }}
+      activeOpacity={0.8}
+    >
+      <View style={coinRedeemStyles.cardTop}>
+        <Text style={{ fontSize: 18 }}>🪙</Text>
+        <View style={[coinRedeemStyles.checkbox, usePcoins && coinRedeemStyles.checkboxActive]}>
+          {usePcoins && <Ionicons name="checkmark" size={11} color="#fff" />}
+        </View>
+      </View>
+      <Text style={coinRedeemStyles.coinLabel}>PCoin</Text>
+      <Text style={coinRedeemStyles.coinBalance}>
+        {pcoinBalance > 0 ? `${pcoinBalance} available` : "Balance: 0"}
+      </Text>
+      <Text style={[coinRedeemStyles.coinOff, pcoinBalance === 0 && { color: "#9CA3AF" }]}>
+        {pcoinBalance > 0 ? `₹${pcoinBalance} off · any turf` : "No PCoin yet"}
+      </Text>
+      {usePcoins && pcoinToUse > 0 && (
+        <View style={coinRedeemStyles.usedBadge}>
+          <Text style={coinRedeemStyles.usedBadgeTxt}>−₹{pcoinToUse}</Text>
+        </View>
+      )}
+    </TouchableOpacity>
+
+    {/* VCoin card */}
+    <TouchableOpacity
+      style={[
+        coinRedeemStyles.coinCard,
+        useVcoins && coinRedeemStyles.coinCardActiveAmber,
+        !vcoinEnabled && coinRedeemStyles.coinCardDisabled,
+      ]}
+      onPress={() => {
+        if (!vcoinEnabled) return;
+        if (promoApplied) {
+          Alert.alert("Remove Promo First", "Remove the promo code to use coins.");
+          return;
+        }
+        const val = !useVcoins;
+        setUseVcoins(val);
+                setVcoinToUse(val ? Math.max(Math.min(vcoinBalance, advanceAmount - (usePcoins ? pcoinToUse : 0) - 1), 0) : 0);
+      }}
+      activeOpacity={vcoinEnabled ? 0.8 : 1}
+    >
+      <View style={coinRedeemStyles.cardTop}>
+        <Text style={{ fontSize: 18 }}>🏟️</Text>
+        <View style={[coinRedeemStyles.checkbox, useVcoins && coinRedeemStyles.checkboxAmber]}>
+          {useVcoins && <Ionicons name="checkmark" size={11} color="#fff" />}
+        </View>
+      </View>
+      <Text style={coinRedeemStyles.coinLabel}>VCoin</Text>
+      <Text style={coinRedeemStyles.coinBalance}>
+        {!vcoinEnabled ? "Not available" : vcoinBalance > 0 ? `${vcoinBalance} available` : "Balance: 0"}
+      </Text>
+      <Text style={[coinRedeemStyles.coinOff, (vcoinBalance === 0 || !vcoinEnabled) && { color: "#9CA3AF" }]}>
+        {!vcoinEnabled ? "Turf disabled" : vcoinBalance > 0 ? `₹${vcoinBalance} off · this turf` : "No VCoin yet"}
+      </Text>
+      {useVcoins && vcoinToUse > 0 && (
+        <View style={[coinRedeemStyles.usedBadge, { backgroundColor: "#FEF3C7", borderColor: "#FDE68A" }]}>
+          <Text style={[coinRedeemStyles.usedBadgeTxt, { color: "#B45309" }]}>−₹{vcoinToUse}</Text>
+        </View>
+      )}
+    </TouchableOpacity>
+  </View>
+</View>
+
+      <View style={styles.paymentBreakdown}>
+  {offerDiscount > 0 && (
+    <>
+      <View style={styles.breakdownRow}>
+        <Text style={styles.breakdownKey}>Slot price</Text>
+        <Text style={styles.breakdownVal}>₹{totalPrice}</Text>
+      </View>
+      <View style={styles.breakdownRow}>
+        <Text style={[styles.breakdownKey, { color: "#16A34A" }]}>🎉 {offer?.title}</Text>
+        <Text style={[styles.breakdownVal, { color: "#16A34A" }]}>− ₹{offerDiscount}</Text>
+      </View>
+      <View style={styles.breakdownRow}>
+        <Text style={[styles.breakdownKey, { fontWeight: "800", color: "#111111" }]}>Total</Text>
+        <Text style={[styles.breakdownVal, { fontWeight: "900" }]}>₹{offerTotal}</Text>
+      </View>
+      <View style={styles.summaryDivider} />
+    </>
+  )}
+  {discountAmount > 0 && (
+    <View style={styles.breakdownRow}>
+      <Text style={[styles.breakdownKey, { color: "#16A34A" }]}>Promo ({promoApplied?.code})</Text>
+      <Text style={[styles.breakdownVal, { color: "#16A34A" }]}>− ₹{discountAmount}</Text>
+    </View>
+  )}
+  {coinDiscountAmount > 0 && (
+    <View style={styles.breakdownRow}>
+      <Text style={[styles.breakdownKey, { color: "#7C3AED" }]}>Coins ({coinDiscountAmount} 🪙)</Text>
+      <Text style={[styles.breakdownVal, { color: "#7C3AED" }]}>− ₹{coinDiscountAmount}</Text>
+    </View>
+  )}
+   {(discountAmount > 0 || coinDiscountAmount > 0) && (
+    <View style={styles.summaryDivider} />
+  )}
+  <View style={styles.breakdownRow}>
+    <Text style={styles.breakdownKey}>Pay now</Text>
+    <Text style={[styles.breakdownVal, { fontSize: 16, fontWeight: "900", color: "#111111" }]}>
+      ₹{finalAdvanceAmount}
+    </Text>
+  </View>
+  <View style={styles.breakdownRow}>
+    <Text style={styles.breakdownKey}>Remaining at turf</Text>
+    <Text style={styles.breakdownVal}>
+      {offerDiscount > 0 && bookingType === "advance" && (
+        <Text style={{ color: "#9CA3AF", textDecorationLine: "line-through", fontWeight: "700" }}>₹{remainingAmount + offerDiscount}  </Text>
+      )}
+      ₹{remainingAmount}
+    </Text>
+  </View>
+</View>
+{offerDiscount > 0 && (
+  <Text style={{ textAlign: "center", marginTop: 10, fontSize: 12.5, fontWeight: "800", color: "#15803D" }}>
+    🎉 You save ₹{offerDiscount} on this booking
+  </Text>
+)}
+        
+        
         <TouchableOpacity style={[styles.bookBtn, { marginTop: 16 },{backgroundColor:"#16A34A"}, loading && styles.bookBtnLoading]} onPress={handlePayment} disabled={loading}>
           {loading ? <ActivityIndicator size="small" color="#fff" /> : <Text style={styles.bookBtnText}>Pay ₹{finalAdvanceAmount} & Book</Text>}
         </TouchableOpacity>
+          
+        
+      </ScrollView>
+    </View>
+  </View>
+</Modal>
+
+<Modal
+  visible={showPriceInfo}
+  transparent
+  animationType="slide"
+  onRequestClose={() => setShowPriceInfo(false)}
+>
+  <View style={pi.backdrop}>
+    <View style={[pi.sheet, { paddingBottom: insets.bottom + 20 }]}>
+      <View style={pi.handle} />
+ 
+      <View style={pi.header}>
+        <View style={{ flex: 1 }}>
+          <Text style={pi.title}>Price Details</Text>
+          <Text style={pi.sub}>{turf.name}</Text>
+        </View>
+        <TouchableOpacity style={pi.closeBtn} onPress={() => setShowPriceInfo(false)}>
+          <Ionicons name="close" size={18} color="#374151" />
+        </TouchableOpacity>
+      </View>
+ 
+      <ScrollView showsVerticalScrollIndicator={false}>
+        {advancePricingOn ? (
+          <>
+            {/* Mon–Fri / Sat–Sun tabs */}
+            <View style={pi.tabRow}>
+              {(["weekday", "weekend"] as DayType[]).map((tab) => (
+                <TouchableOpacity
+                  key={tab}
+                  style={[pi.tab, priceTab === tab && pi.tabActive]}
+                  onPress={() => setPriceTab(tab)}
+                  activeOpacity={0.85}
+                >
+                  <Text style={[pi.tabTxt, priceTab === tab && pi.tabTxtActive]}>
+                    {tab === "weekday" ? "Mon – Fri" : "Sat – Sun"}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+ 
+            {getDayTypeFor(selectedDate) === priceTab && (
+              <View style={pi.todayNote}>
+                <Text style={pi.todayNoteTxt}>✓ These rates apply to your selected date</Text>
+              </View>
+            )}
+ 
+            {sortedSlabs[priceTab].length === 0 ? (
+              <Text style={pi.emptyTxt}>
+                No time blocks set for these days — standard Day/Night pricing applies.
+              </Text>
+            ) : (
+              sortedSlabs[priceTab].map((slab, i) => {
+                const nowDec = new Date().getHours() + new Date().getMinutes() / 60;
+                const isNow =
+                  getDayTypeFor(selectedDate) === priceTab &&
+                  selectedDate.toDateString() === new Date().toDateString() &&
+                  nowDec >= Number(slab.start) && nowDec < Number(slab.end);
+                return (
+                  <View key={i} style={[pi.slabRow, isNow && pi.slabRowNow]}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[pi.slabTime, isNow && { color: "#15803D" }]}>
+                        {formatTime(Number(slab.start))} – {formatTime(Number(slab.end))}
+                      </Text>
+                      {isNow && <Text style={pi.slabNowTxt}>Playing now</Text>}
+                    </View>
+                    <Text style={[pi.slabRate, isNow && { color: "#15803D" }]}>
+                      ₹{Number(slab.rate)}<Text style={pi.slabUnit}> /hr</Text>
+                    </Text>
+                  </View>
+                );
+              })
+            )}
+ 
+            <Text style={pi.footNote}>
+              Any hour not listed above is charged at the standard rate
+              (₹{Number(turf.dayPrice || 0)}/hr day, ₹{Number(turf.nightPrice || 0)}/hr night).
+            </Text>
+          </>
+        ) : (
+          <>
+            <View style={pi.slabRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={pi.slabTime}>6:00 AM – 6:00 PM</Text>
+                <Text style={pi.slabNowTxt}>Day rate</Text>
+              </View>
+              <Text style={pi.slabRate}>
+                ₹{Number(turf.dayPrice || 0)}<Text style={pi.slabUnit}> /hr</Text>
+              </Text>
+            </View>
+            <View style={pi.slabRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={pi.slabTime}>6:00 PM – 12:00 AM</Text>
+                <Text style={pi.slabNowTxt}>Night rate</Text>
+              </View>
+              <Text style={pi.slabRate}>
+                ₹{Number(turf.nightPrice || 0)}<Text style={pi.slabUnit}> /hr</Text>
+              </Text>
+            </View>
+            <Text style={pi.footNote}>
+              This turf uses the same rates on every day of the week.
+            </Text>
+          </>
+        )}
+ 
+        {specialPrices.length > 0 && (
+          <View style={pi.specialWrap}>
+            <Text style={pi.specialTitle}>⭐ Special price for {selectedDate.toDateString()}</Text>
+            {specialPrices.map((sp, i) => (
+              <View key={i} style={pi.specialRow}>
+                <Text style={pi.specialSlot}>{sp.slotTime}</Text>
+                <Text style={pi.specialVal}>₹{Number(sp.price)}</Text>
+              </View>
+            ))}
+          </View>
+        )}
+ 
+           {showOnline && (
+        <View style={pi.advanceBox}>
+          <View style={{ flex: 1 }}>
+            <Text style={pi.advanceLabel}>Advance to book</Text>
+            <Text style={pi.advanceSub}>Pay the rest at the turf</Text>
+          </View>
+          <Text style={pi.advanceVal}>₹{turf.bookingPrice || 0}</Text>
+        </View>
+           )}
+ 
+        <TouchableOpacity style={pi.gotItBtn} onPress={() => setShowPriceInfo(false)}>
+          <Text style={pi.gotItTxt}>Got it</Text>
+        </TouchableOpacity>
+        <View style={{ height: 8 }} />
       </ScrollView>
     </View>
   </View>
@@ -1680,19 +2812,143 @@ function requestCloseBilling() {
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
+
+
+  // advance pricing details 
+  priceCardV2: {
+  marginTop: 18,
+  backgroundColor: "#F9FAFB",
+  borderRadius: 18,
+  borderWidth: 1,
+  borderColor: "#EEF0F4",
+  paddingHorizontal: 14,
+  paddingVertical: 4,
+  overflow: "hidden",
+},
+priceRowV2: {
+  flexDirection: "row",
+  alignItems: "center",
+  justifyContent: "space-between",
+  paddingVertical: 12,
+},
+priceRowLeft: {
+  flexDirection: "row",
+  alignItems: "center",
+  gap: 8,
+},
+priceDayDot: {
+  width: 7,
+  height: 7,
+  borderRadius: 4,
+  backgroundColor: "#16A34A",
+},
+priceRowLabel: {
+  fontSize: 13,
+  fontWeight: "700",
+  color: "#6B7280",
+},
+priceRowValue: {
+  fontSize: 15,
+  fontWeight: "900",
+  color: "#111111",
+  flexShrink: 1,
+  textAlign: "right",
+},
+priceRowUnit: {
+  fontSize: 11,
+  fontWeight: "700",
+  color: "#9CA3AF",
+},
+priceDividerV2: {
+  height: 1,
+  backgroundColor: "#EEF0F4",
+},
+advanceStrip: {
+  flexDirection: "row",
+  alignItems: "center",
+  justifyContent: "space-between",
+  backgroundColor: "#F0FDF4",
+  borderRadius: 12,
+  paddingHorizontal: 12,
+  paddingVertical: 10,
+  marginTop: 4,
+  marginBottom: 10,
+  borderWidth: 1,
+  borderColor: "#BBF7D0",
+},
+advanceStripLabel: {
+  fontSize: 12.5,
+  fontWeight: "800",
+  color: "#15803D",
+},
+advanceStripValue: {
+  fontSize: 16,
+  fontWeight: "900",
+  color: "#15803D",
+},//
+    //wallet
+  breakdownRow: {
+  flexDirection: "row",
+  justifyContent: "space-between",
+  alignItems: "center",
+  paddingVertical: 6,
+},
+breakdownKey: {
+  fontSize: 13,
+  fontWeight: "600",
+  color: "#6B7280",
+},
+breakdownVal: {
+  fontSize: 13,
+  fontWeight: "800",
+  color: "#1A1D21",
+},
   screen:         { flex: 1, backgroundColor: "#F4F6FA" },
+    // call to book
+  callCard:           { marginHorizontal: 16, marginTop: 12, backgroundColor: "#FFFFFF", borderRadius: 22, borderWidth: 1.5, borderColor: "#86EFAC", padding: 16, gap: 12 },
+  callHeader:         { flexDirection: "row", alignItems: "center", gap: 12 },
+  callIconWrap:       { width: 46, height: 46, borderRadius: 14, backgroundColor: "#DCFCE7", alignItems: "center", justifyContent: "center" },
+  callTitle:          { fontSize: 16, fontWeight: "800", color: "#111111" },
+  callSub:            { fontSize: 12, fontWeight: "600", color: "#4B5563", marginTop: 2 },
+  callNumberBox:      { flexDirection: "row", alignItems: "center", backgroundColor: "#F7F8FA", borderRadius: 14, paddingHorizontal: 14, paddingVertical: 12 },
+  callNumberLabel:    { fontSize: 10, fontWeight: "700", color: "#6B7280", letterSpacing: 0.4 },
+  callNumber:         { fontSize: 19, fontWeight: "900", color: "#111111", marginTop: 3, letterSpacing: 0.5 },
+  callHours:          { fontSize: 12, fontWeight: "700", color: "#4B5563" },
+  callBtnRow:         { flexDirection: "row", gap: 10 },
+  callOutlineBtn:     { flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 7, height: 48, borderRadius: 14, borderWidth: 1.5, borderColor: "#E5E7EB", backgroundColor: "#FFFFFF" },
+  callOutlineBtnText: { fontSize: 14, fontWeight: "800", color: "#111111" },
+  callNote:           { fontSize: 11.5, fontWeight: "600", color: "#4B5563", lineHeight: 17 },
+  callIconBtn:      { width: 46, height: 46, borderRadius: 13, borderWidth: 1.5, borderColor: "#86EFAC", backgroundColor: "#F0FDF4", alignItems: "center", justifyContent: "center", marginRight: 10 },
   scrollContent:  { paddingBottom: 100 },
   loaderWrap:     { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: "#F4F6FA" },
   loaderText:     { marginTop: 12, fontSize: 15, color: "#5B6472", fontWeight: "600" },
   heroImage:      { width: "100%", height: 280, backgroundColor: "#E0E4EC" },
+    callPrivacy:        { fontSize: 11, fontWeight: "600", color: "#6B7280", textAlign: "center", marginTop: -4 },
+      callLoginBtn:       { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, height: 48, borderRadius: 14, backgroundColor: "#16A34A" },
+  callLoginBtnText:   { color: "#fff", fontSize: 14, fontWeight: "800" },
+
+  //back 
+ backBtn: {
+  position: "absolute",
+  left: 16,
+  width: 40,
+  height: 40,
+  borderRadius: 20,
+  backgroundColor: "rgba(0,0,0,0.4)",
+  justifyContent: "center",
+  alignItems: "center",
+  zIndex: 10,
+},
+
+
 
   // dots
-  dotRow:   { position: "absolute", bottom: 40, left: 0, right: 0, flexDirection: "row", justifyContent: "center", alignItems: "center", gap: 6 },
+  dotRow:   { position: "absolute", bottom: 30, left: 0, right: 0, flexDirection: "row", justifyContent: "center", alignItems: "center", gap: 6 },
   dot:      { width: 10,  height: 6, borderRadius: 99, backgroundColor: "rgba(255,255,255,0.45)" },
   dotActive:{ width: 10, height: 6, borderRadius: 99, backgroundColor: "#fff" },
 
   // header card
-  headerCard: { backgroundColor: "#FFFFFF", marginHorizontal: 16, marginTop: -32, borderRadius: 24, padding: 20, shadowColor: "#000", shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.08, shadowRadius: 12, elevation: 5 },
+  headerCard: { backgroundColor: "#FFFFFF", marginHorizontal: 16, marginTop: -20, borderRadius: 24, padding: 20, shadowColor: "#000", shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.08, shadowRadius: 12, elevation: 5 },
   titleRow:   { flexDirection: "row", alignItems: "flex-start" },
   nameLine:   { flexDirection: "row", alignItems: "flex-start", gap: 8 },
   title:      { fontSize: 22, fontWeight: "800", color: "#111111" },
@@ -1714,8 +2970,10 @@ sportIconCircle: { width: 18, height: 18, borderRadius: 9, backgroundColor: "#ff
   // price cards
   priceRow:  { flexDirection: "row", marginTop: 18, gap: 8 },
   priceCard: { flex: 1, backgroundColor: "#F7F8FA", borderRadius: 16, padding: 12 },
-  priceLabel:{ color: "#9CA3AF", fontSize: 11, fontWeight: "700", textTransform: "uppercase" },
-  priceValue:{ marginTop: 5, color: "#111111", fontSize: 17, fontWeight: "800" },
+   priceLabel:{ color: "#9CA3AF", fontSize: 11, fontWeight: "700", textTransform: "uppercase" },
+  priceValue:{ marginTop: 5, color: "#111111", fontSize: 15, fontWeight: "800" },
+  priceHintRow: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 8, backgroundColor: "#F0FDF4", borderWidth: 1, borderColor: "#BBF7D0", borderRadius: 12, paddingHorizontal: 10, paddingVertical: 8 },
+  priceHintTxt: { flex: 1, fontSize: 11.5, fontWeight: "700", color: "#16A34A" },
 
 location:        { color: "#111827", fontSize: 14, fontWeight: "700", flexShrink: 1 },
 locationBlock:   { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 15, gap: 10 },
@@ -1795,13 +3053,13 @@ modeButtonTextActive:{ color: "#16A34A" },
   slotPanelSubtitle: { fontSize: 13, fontWeight: "500", color: "#6B7280" },
   chipRow:        { paddingBottom: 4, gap: 8 },
 
-  slotChip:             { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 14, backgroundColor: "#FFFFFF", borderWidth: 1.5, borderColor: "#E5E7EB", alignItems: "center", minWidth: 72 },
+    slotChip:             { paddingHorizontal: 15, paddingVertical: 11, borderRadius: 16, backgroundColor: "#FFFFFF", borderWidth: 1.5, borderColor: "#E5E7EB", alignItems: "center", justifyContent: "center", minWidth: 84, minHeight: 54 },
   slotChipSelected:     { backgroundColor: "#111111", borderColor: "#111111" },
   slotChipInRange:      { backgroundColor: "#F3F4F6", borderColor: "#9CA3AF" },
   slotChipBooked:       { backgroundColor: "#FEE2E2", borderColor: "#FECACA" },
   slotChipLocked:       { backgroundColor: "#FEF3C7", borderColor: "#FDE68A" },
   slotChipPast:         { backgroundColor: "#F3F4F6", borderColor: "#E5E7EB" },
-  slotChipText:         { fontSize: 13, fontWeight: "800", color: "#111111" },
+   slotChipText:         { fontSize: 14, fontWeight: "800", color: "#111111" },
   slotChipTextSelected: { color: "#FFFFFF" },
   slotChipTextInRange:  { color: "#374151" },
   slotChipTextDisabled: { color: "#9CA3AF" },
@@ -1830,14 +3088,38 @@ quickSlotStatusActive: { color: "#16A34A" },
 quickSlotTextDisabled: { color: "#9CA3AF" },
 quickSlotCheck:        { position: "absolute", top: 8, right: 8, width: 20, height: 20, borderRadius: 10, backgroundColor: "#16A34A", alignItems: "center", justifyContent: "center", zIndex: 2 },
 
+  quickInfo:     { flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: "#F0FDF4", borderWidth: 1, borderColor: "#BBF7D0", borderRadius: 12, paddingHorizontal: 12, paddingVertical: 9, marginTop: 14 },
+  quickInfoTxt:  { fontSize: 12.5, fontWeight: "800", color: "#15803D" },
+  partRow:       { gap: 8, paddingTop: 12, paddingBottom: 2 },
+  partChip:      { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 12, paddingVertical: 9, borderRadius: 999, backgroundColor: "#F3F4F6", borderWidth: 1, borderColor: "#E5E7EB" },
+  partChipOn:    { backgroundColor: "#16A34A", borderColor: "#16A34A" },
+  partChipTxt:   { fontSize: 12.5, fontWeight: "800", color: "#4B5563" },
+  partChipTxtOn: { color: "#fff" },
+  partCount:     { minWidth: 20, height: 20, borderRadius: 10, paddingHorizontal: 5, backgroundColor: "#E5E7EB", alignItems: "center", justifyContent: "center" },
+  partCountOn:   { backgroundColor: "#fff" },
+  partCountTxt:  { fontSize: 11, fontWeight: "900", color: "#4B5563" },
+
   // summary
+  summaryRow: {
+  flexDirection: "row",
+  justifyContent: "space-between",
+  alignItems: "center",        // ← yeh zaroori hai vertical align ke liye
+  paddingVertical: 5,
+},
   summaryCard:    { marginTop: 16, marginHorizontal: 16, backgroundColor: "#FFFFFF", borderRadius: 24, padding: 16, shadowColor: "#000", shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.06, shadowRadius: 10, elevation: 3 , marginBottom:120,},
   summaryHeader:  { flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between" },
   summaryLabel:   { color: "#9CA3AF", fontSize: 11, fontWeight: "800", textTransform: "uppercase" },
 summaryTime:    { marginTop: 3, color: "#1A1D21", fontSize: 17, fontWeight: "900" },
 summaryDivider: { height: 1, backgroundColor: "#F3F4F6", marginVertical: 10 },
-summaryKey:     { color: "#6B7280", fontSize: 13, fontWeight: "700" },
-summaryValue:   { flex: 1, textAlign: "right", color: "#1A1D21", fontSize: 13, fontWeight: "800" },
+summaryKey:   { 
+  color: "#6B7280", fontSize: 13, fontWeight: "700",
+  width: 80,        // ← fixed width so all labels align
+},
+summaryValue: { 
+  flex: 1, 
+  textAlign: "right", 
+  color: "#1A1D21", fontSize: 13, fontWeight: "800",
+},
 summaryTotal:   { color: "#1A1D21", fontSize: 17, fontWeight: "900" },
 
 paymentTitle:             { marginTop: 4, marginBottom: 8, fontSize: 15, fontWeight: "900", color: "#1A1D21" },
@@ -1882,7 +3164,7 @@ bottomBar: {
   bottomLabel:     { color: "#9CA3AF", fontSize: 10, fontWeight: "800", textTransform: "uppercase" },
   bottomAmount:    { marginTop: 3, color: "#111111", fontSize: 23, fontWeight: "900" },
   bottomRemaining: { marginTop: 2, fontSize: 8, color: "#9CA3AF", fontWeight: "600" },
-  bookBtn:         { backgroundColor: "#16A34A", paddingHorizontal: 22, paddingVertical: 10.5, borderRadius: 13, minWidth: 100, alignItems: "center", justifyContent: "center" },
+  bookBtn:         { backgroundColor: "#16A34A", paddingHorizontal: 22, paddingVertical: 10.5, borderRadius: 13, minWidth: 100, alignItems: "center", justifyContent: "center", },
   bookBtnLoading:  { opacity: 0.7 },
   bookBtnText:     { color: "#FFFFFF", fontWeight: "900", fontSize: 15 },
 
@@ -1930,7 +3212,26 @@ scrollUpArrow: {
   fontSize: 16,
   fontWeight: "900",
   lineHeight: 18,
+
+
+  // advance pricing 
+
+    lateBanner:     { flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: "#F5F3FF", borderWidth: 1, borderColor: "#DDD6FE", borderRadius: 12, paddingHorizontal: 12, paddingVertical: 9, marginTop: 12 },
+  lateBannerShut: { backgroundColor: "#F3F4F6", borderColor: "#E5E7EB" },
+  lateBannerTxt:  { fontSize: 12.5, fontWeight: "800", color: "#6D28D9", flex: 1 },
+  
 },
+});
+
+const offerStyles = StyleSheet.create({
+  banner:       { flexDirection: "row", alignItems: "center", gap: 12, marginHorizontal: 16, marginTop: 12, borderRadius: 18, padding: 14, backgroundColor: "#16A34A" },
+  bannerIcon:   { width: 48, height: 48, borderRadius: 14, backgroundColor: "rgba(255,255,255,0.18)", alignItems: "center", justifyContent: "center" },
+  bannerKicker: { fontSize: 10.5, fontWeight: "800", letterSpacing: 0.8, color: "#DCFCE7" },
+  bannerTitle:  { fontSize: 16, fontWeight: "900", color: "#fff" },
+  bannerSub:    { fontSize: 12, fontWeight: "700", color: "#DCFCE7", marginTop: 1 },
+  dateTag:      { fontSize: 8.5, fontWeight: "900", color: "#16A34A", marginTop: 2 },
+  oldPrice:     { fontSize: 12, fontWeight: "700", color: "#9CA3AF", textDecorationLine: "line-through" },
+  slotTag:      { fontSize: 10.5, fontWeight: "800", color: "#15803D", marginTop: 2 },
 });
 
 const promoStyles = StyleSheet.create({
@@ -1954,4 +3255,179 @@ appliedBox:     { flexDirection: "row", alignItems: "center", justifyContent: "s
   errorBox:     { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 6, backgroundColor: "#FEF2F2", borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6 },
   errorTxt:     { fontSize: 12, color: "#DC2626", fontWeight: "600", flex: 1 },
  
+});
+
+const coinStyles = StyleSheet.create({
+  // Strip — shown under header card, above status banner
+  strip: {
+    flexDirection:    "row",
+    alignItems:       "center",
+    backgroundColor:  "#F5F3FF",
+    borderRadius:     16,
+    borderWidth:      1,
+    borderColor:      "#DDD6FE",
+    paddingHorizontal: 14,
+    paddingVertical:   11,
+    marginHorizontal:  16,
+    marginTop:         10,
+  },
+  iconCircle: {
+    width: 36, height: 36, borderRadius: 18,
+    backgroundColor: "#EDE9FE",
+    justifyContent: "center", alignItems: "center",
+  },
+  pillsRow: { flexDirection: "row", flexWrap: "wrap", gap: 5, marginBottom: 3 },
+  pill: {
+    flexDirection: "row", alignItems: "center", gap: 4,
+    paddingHorizontal: 8, paddingVertical: 3,
+    borderRadius: 99,
+  },
+  pillDot: { width: 5, height: 5, borderRadius: 3 },
+  pillTxt: { fontSize: 11, fontWeight: "800" },
+  sub:     { fontSize: 11, color: "#6B7280", fontWeight: "600" },
+ 
+  // Earn note — shown in billing modal above Pay button
+  earnNote: {
+    flexDirection:   "row",
+    alignItems:      "flex-start",
+    backgroundColor: "#FAFAF0",
+    borderRadius:    12,
+    borderWidth:     1,
+    borderColor:     "#E9E9B8",
+    padding:         12,
+    marginBottom:    10,
+  },
+  earnTitle:     { fontSize: 12, fontWeight: "800", color: "#374151", marginBottom: 5 },
+  earnPillsRow:  { flexDirection: "row", flexWrap: "wrap", gap: 5, marginBottom: 5 },
+  earnPill:      { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 99 },
+  earnPillTxt:   { fontSize: 11, fontWeight: "800" },
+  earnSub:       { fontSize: 10, color: "#9CA3AF", fontWeight: "600", lineHeight: 15 },
+
+  
+});
+
+const coinRedeemStyles = StyleSheet.create({
+  wrap: {
+    marginTop: 8,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: "#F3F4F6",
+  },
+  sectionTitle: {
+    fontSize: 11, fontWeight: "700", color: "#6B7280",
+    marginBottom: 7, textTransform: "uppercase", letterSpacing: 0.4,
+  },
+  cardsRow: {
+    flexDirection: "row",
+    gap: 6,
+  },
+coinCard: {
+    flex: 1,
+    backgroundColor: "#F9FAFB",
+    borderRadius: 12,
+    padding: 8,
+    borderWidth: 2,
+    borderColor: "#E5E7EB",
+    marginBottom: 5,
+     minHeight: 100,   // ← badge ke liye space
+  },
+  coinCardActive: {
+    backgroundColor: "#F5F3FF",
+    borderColor: "#7C3AED",
+    borderWidth: 2,        // ← explicitly same
+  },
+  coinCardActiveAmber: {
+    backgroundColor: "#FFFBEB",
+    borderColor: "#D97706",
+    borderWidth: 2,        // ← explicitly same
+  },
+  coinCardDisabled: {
+    opacity: 0.45,
+  },
+  cardTop: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 5,
+  },
+  checkbox: {
+    width: 18, height: 18, borderRadius: 9,
+    borderWidth: 2, borderColor: "#D1D5DB",
+    backgroundColor: "#fff",
+    alignItems: "center", justifyContent: "center",
+  },
+ checkboxActive: {
+    backgroundColor: "#7C3AED",
+    borderColor: "#7C3AED",
+    borderWidth: 0,
+  },
+  checkboxAmber: {
+    backgroundColor: "#D97706",
+    borderColor: "#D97706",
+    borderWidth:0,
+  },
+  coinLabel: {
+    fontSize: 12, fontWeight: "900", color: "#111111", marginBottom: 1,
+  },
+  coinBalance: {
+    fontSize: 11, fontWeight: "700", color: "#374151", marginBottom: 1,
+  },
+  coinOff: {
+    fontSize: 10, fontWeight: "600", color: "#6B7280",
+  },
+ usedBadge: {
+    position: "absolute",
+    bottom: 8,
+    right: 8,
+    backgroundColor: "#EDE9FE",
+    borderRadius: 6,
+    borderWidth: 1, borderColor: "#DDD6FE",
+    paddingHorizontal: 6, paddingVertical: 3,
+  },
+  usedBadgeTxt: {
+    fontSize: 11, fontWeight: "800", color: "#7C3AED",
+  },
+ 
+});
+
+const pi = StyleSheet.create({
+  backdrop:     { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
+  sheet:        { backgroundColor: "#fff", borderTopLeftRadius: 28, borderTopRightRadius: 28, maxHeight: "85%", paddingHorizontal: 20, paddingTop: 12 },
+  handle:       { width: 44, height: 4, borderRadius: 2, backgroundColor: "#E5E7EB", alignSelf: "center", marginBottom: 14 },
+  header:       { flexDirection: "row", alignItems: "flex-start", marginBottom: 14 },
+  title:        { fontSize: 20, fontWeight: "900", color: "#111111" },
+  sub:          { fontSize: 13, color: "#6B7280", fontWeight: "600", marginTop: 2 },
+  closeBtn:     { width: 34, height: 34, borderRadius: 17, backgroundColor: "#F3F4F6", alignItems: "center", justifyContent: "center" },
+ 
+  tabRow:       { flexDirection: "row", backgroundColor: "#F3F4F6", padding: 4, borderRadius: 14, marginBottom: 12 },
+  tab:          { flex: 1, paddingVertical: 9, borderRadius: 11, alignItems: "center" },
+  tabActive:    { backgroundColor: "#16A34A" },
+  tabTxt:       { fontSize: 13, fontWeight: "800", color: "#6B7280" },
+  tabTxtActive: { color: "#fff" },
+ 
+  todayNote:    { backgroundColor: "#F0FDF4", borderRadius: 10, paddingHorizontal: 10, paddingVertical: 7, marginBottom: 10, borderWidth: 1, borderColor: "#BBF7D0" },
+  todayNoteTxt: { fontSize: 11.5, fontWeight: "700", color: "#15803D" },
+ 
+  slabRow:      { flexDirection: "row", alignItems: "center", backgroundColor: "#F9FAFB", borderRadius: 14, borderWidth: 1.5, borderColor: "#F3F4F6", paddingHorizontal: 14, paddingVertical: 12, marginBottom: 8 },
+  slabRowNow:   { backgroundColor: "#F0FDF4", borderColor: "#86EFAC" },
+  slabTime:     { fontSize: 14, fontWeight: "800", color: "#111111" },
+  slabNowTxt:   { fontSize: 10.5, fontWeight: "700", color: "#9CA3AF", marginTop: 2 },
+  slabRate:     { fontSize: 17, fontWeight: "900", color: "#111111" },
+  slabUnit:     { fontSize: 11, fontWeight: "700", color: "#9CA3AF" },
+  emptyTxt:     { fontSize: 13, color: "#6B7280", fontWeight: "600", textAlign: "center", paddingVertical: 18 },
+  footNote:     { fontSize: 11, color: "#9CA3AF", fontWeight: "600", lineHeight: 16, marginTop: 4 },
+ 
+  specialWrap:  { marginTop: 14, backgroundColor: "#FFFBEB", borderRadius: 14, borderWidth: 1, borderColor: "#FDE68A", padding: 12 },
+  specialTitle: { fontSize: 12, fontWeight: "800", color: "#B45309", marginBottom: 8 },
+  specialRow:   { flexDirection: "row", justifyContent: "space-between", paddingVertical: 4 },
+  specialSlot:  { fontSize: 12, fontWeight: "700", color: "#92400E" },
+  specialVal:   { fontSize: 10, fontWeight: "900", color: "#92400E" },
+ 
+  advanceBox:   { flexDirection: "row", alignItems: "center", backgroundColor: "#111111", borderRadius: 16, padding: 14, marginTop: 16 },
+  advanceLabel: { fontSize: 13, fontWeight: "800", color: "#fff" },
+  advanceSub:   { fontSize: 11, fontWeight: "600", color: "rgba(255,255,255,0.6)", marginTop: 2 },
+  advanceVal:   { fontSize: 18, fontWeight: "900", color: "#fff" },
+ 
+  gotItBtn:     { backgroundColor: "#16A34A", borderRadius: 14, paddingVertical: 14, alignItems: "center", marginTop: 14 },
+  gotItTxt:     { color: "#fff", fontSize: 15, fontWeight: "900" },
 });

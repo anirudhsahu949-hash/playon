@@ -1,8 +1,9 @@
 import {
-  View, Text, StyleSheet, SafeAreaView, StatusBar,
+  View, Text, StyleSheet, StatusBar,
   ScrollView, TouchableOpacity, ActivityIndicator,
   RefreshControl, Platform, Alert, Dimensions,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useEffect, useMemo, useState } from "react";
 import { db } from "../../firebaseConfig";
 import { collection, getDocs, query, where, orderBy, limit, Timestamp } from "firebase/firestore"
@@ -127,6 +128,8 @@ function Sparkline({ data, color }: { data: number[]; color: string }) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 export default function BookingAnalysis() {
+  const insets = useSafeAreaInsets();
+
   const [bookings, setBookings]     = useState<Booking[]>([]);
   const [loading, setLoading]       = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -281,7 +284,7 @@ setBookings((snap.docs ?? []).map((d) => ({id: d.id, ...d.data()} as Booking)));
   );
 
   return (
-    <SafeAreaView style={s.safe}>
+    <View style={s.safe}>
       <StatusBar barStyle="light-content" backgroundColor={DARK}/>
       <ScrollView
         showsVerticalScrollIndicator={false}
@@ -289,7 +292,7 @@ setBookings((snap.docs ?? []).map((d) => ({id: d.id, ...d.data()} as Booking)));
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={()=>fetchBookings(true)} tintColor={ACCENT}/>}
       >
         {/* Hero */}
-        <View style={s.hero}>
+         <View style={[s.hero, { paddingTop: insets.top + 12 }]}>
           <View style={s.glow1}/><View style={s.glow2}/>
           <Text style={s.heroTag}>Admin · Intelligence</Text>
           <Text style={s.heroTitle}>Booking Analytics</Text>
@@ -542,7 +545,7 @@ setBookings((snap.docs ?? []).map((d) => ({id: d.id, ...d.data()} as Booking)));
         <View style={{height:20}}/>
       </ScrollView>
       <AdminNavBar/>
-    </SafeAreaView>
+    </View>
   );
 }
 

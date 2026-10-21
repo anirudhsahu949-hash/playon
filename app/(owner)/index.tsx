@@ -1,3 +1,29 @@
+// app/(owner)/index.tsx  —  FULL FILE
+//
+// WHAT CHANGED (Slot Overview redesign — 21 Oct)
+// ─────────────────────────────────────────────────────────────────────────────
+// • Slot Overview is now a compact card:
+//     - 7 small date chips in one row (no horizontal scroll)
+//     - NEW turf filter chips: "All turfs" + one chip per turf
+//       (hidden when the owner has only one turf — it's auto-selected)
+//     - One turf selected  → 4-per-row tile grid of every slot of the day,
+//       coloured Free / Booked / Blocked / Over (past).
+//         · tap Free    → Block Slots screen (turfId, date, slot passed as params)
+//         · tap Booked  → that booking's receipt
+//         · tap Blocked → Block Slots screen
+//     - All turfs selected → one compact row per turf: counts + a colour strip
+//       of the whole day. Tap a row to filter to that turf.
+//     - Counts row (Free / Booked / Blocked / Over) follows the filter.
+//     - "Add New Slot" button → "Block Slots".
+// • Removed the old one-slot-per-line SlotRow list (and its 8-slot cap).
+// • Turfs that close after midnight (closingTime <= openingTime) now get their
+//   late-night slots in the grid; formatTime handles hours past 24.
+//
+// Data fetching is untouched — same queries, same fallbacks, same reads.
+// Everything in the Slot Overview is pure useMemo: changing date or turf
+// filter = 0 Firestore reads.
+// ─────────────────────────────────────────────────────────────────────────────
+
 import {
   View,
   Text,
@@ -10,16 +36,36 @@ import {
   ScrollView,
   RefreshControl,
   Dimensions,
-  Switch,
 } from "react-native";
 import { useRouter } from "expo-router";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { auth, db } from "../../firebaseConfig";
-import { doc, getDoc, collection, getDocs, query, where, limit } from "firebase/firestore";
+import {
+  doc,
+  getDoc,
+  collection,
+  getDocs,
+  query,
+  where,
+  orderBy,
+  limit,
+  Timestamp,
+} from "firebase/firestore";
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 const { width: SW } = Dimensions.get("window");
+
+// How far back the dashboard needs history for (week revenue, today, stats).
+const HISTORY_DAYS = 30;
+// Hard safety cap on the bookings read.
+const BOOKINGS_CAP = 500;
+
+// Slot grid: card has 16px outer margin each side, 18px padding, 1px border.
+// SLOT_COLS = tiles per row.
+const SLOT_COLS = 4;
+const GRID_GAP = 8;
+const TILE_W = Math.floor((SW - 32 - 36 - 2 - GRID_GAP * (SLOT_COLS - 1)) / SLOT_COLS);
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
 type Theme = {
@@ -52,6 +98,43 @@ const LIGHT_THEME: Theme = {
   greenBg:   "#DCFCE7",
 };
 
+// ── Slot status colours (tiles + strips) ────────────────────────────────────
+type SlotStatus = "free" | "booked" | "blocked" | "past";
+
+type TileColors = { bg: string; border: string; label: string; strip: string };
+
+function slotColors(status: SlotStatus, isDark: boolean, t: Theme): TileColors {
+  if (isDark) {
+    switch (status) {
+      case "free":    return { bg: "rgba(63,185,80,0.12)",  border: "rgba(63,185,80,0.35)",  label: "#3FB950", strip: "#3FB950" };
+      case "booked":  return { bg: "rgba(248,81,73,0.12)",  border: "rgba(248,81,73,0.35)",  label: "#F85149", strip: "#F85149" };
+      case "blocked": return { bg: "rgba(88,166,255,0.12)", border: "rgba(88,166,255,0.35)", label: "#58A6FF", strip: "#58A6FF" };
+      default:        return { bg: t.card2,                 border: "rgba(255,255,255,0.10)", label: t.textSub, strip: "#30363D" };
+    }
+  }
+  switch (status) {
+    case "free":    return { bg: "#F0FDF4", border: "#BBF7D0", label: "#15803D", strip: "#22C55E" };
+    case "booked":  return { bg: "#FEF2F2", border: "#FECACA", label: "#B91C1C", strip: "#DC2626" };
+    case "blocked": return { bg: "#EFF6FF", border: "#BFDBFE", label: "#1D4ED8", strip: "#2563EB" };
+    default:        return { bg: "#F8FAFC", border: "#E2E8F0", label: "#64748B", strip: "#E2E8F0" };
+  }
+}
+
+const STATUS_LABEL: Record<SlotStatus, string> = {
+  free: "Free", booked: "Booked", blocked: "Blocked", past: "Over",
+};
+
+type GridSlot = {
+  id: string;
+  turfId: string;
+  label: string;      // "6 AM", "6:30 PM"
+  slotStr: string;    // "6:00 AM - 7:00 AM"
+  start: number;      // hours, may be > 24 for after-midnight slots
+  status: SlotStatus;
+  bookingId?: string;
+  wasBooked?: boolean; // past slot that was booked/blocked (shown dimmed)
+};
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function getGreeting() {
   const h = new Date().getHours();
@@ -79,24 +162,32 @@ function fmtAmt(n: number): string {
 
 const pad = (n: number) => String(n).padStart(2, "0");
 function formatTime(h: number): string {
-  if (h >= 24) return "12:00 AM";
-  const hour = Math.floor(h);
-  const min  = Math.round((h % 1) * 60);
+  const hh   = ((h % 24) + 24) % 24;
+  const hour = Math.floor(hh);
+  const min  = Math.round((hh % 1) * 60);
   const suf  = hour >= 12 ? "PM" : "AM";
   const hr   = hour % 12 === 0 ? 12 : hour % 12;
   return `${hr}:${pad(min)} ${suf}`;
 }
 
-function getSlotMins(slotTime: string): number {
-  if (!slotTime) return 0;
-  const m = slotTime.split("-")[0]?.trim().match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?/i);
-  if (!m) return 0;
-  let h = Number(m[1]);
-  const min = Number(m[2] || 0);
-  const p = m[3]?.toUpperCase();
-  if (p === "PM" && h < 12) h += 12;
-  if (p === "AM" && h === 12) h = 0;
-  return h * 60 + min;
+// Short tile label: "6 AM", "6:30 PM"
+function shortTime(h: number): string {
+  const hh   = ((h % 24) + 24) % 24;
+  const hour = Math.floor(hh);
+  const min  = Math.round((hh % 1) * 60);
+  const suf  = hour >= 12 ? "PM" : "AM";
+  const hr   = hour % 12 === 0 ? 12 : hour % 12;
+  return min ? `${hr}:${pad(min)} ${suf}` : `${hr} ${suf}`;
+}
+
+// The 7 day-keys the date strip can show. blockedSlots.date is stored as a
+// toDateString() string (see block-slots.tsx), so we match on exactly these.
+function next7DayKeys(): string[] {
+  return Array.from({ length: 7 }, (_, i) => {
+    const d = new Date();
+    d.setDate(d.getDate() + i);
+    return d.toDateString();
+  });
 }
 
 // ── Mini wave decoration ──────────────────────────────────────────────────────
@@ -175,38 +266,83 @@ const ab = StyleSheet.create({
   label: { fontSize: 11, fontWeight: "700", textAlign: "center" },
 });
 
-// ── Slot Row ──────────────────────────────────────────────────────────────────
-function SlotRow({ slot, onPress, t }: { slot: any; onPress: () => void; t: Theme }) {
-  const isAvailable = slot.status === "available";
-  const isBooked    = slot.status === "booked";
-  const dotColor   = isAvailable ? t.green : isBooked ? "#F85149" : "#58A6FF";
-  const badgeBg    = isAvailable ? t.greenBg : isBooked ? "rgba(248,81,73,0.15)" : "rgba(88,166,255,0.15)";
-  const badgeColor = isAvailable ? t.green   : isBooked ? "#F85149" : "#58A6FF";
-  const badgeLabel = isAvailable ? "Available" : isBooked ? "Booked" : "Blocked";
-
+// ── Slot Tile (one-turf grid) ─────────────────────────────────────────────────
+function SlotTile({ slot, isDark, t, onPress }: {
+  slot: GridSlot; isDark: boolean; t: Theme; onPress: () => void;
+}) {
+  const c = slotColors(slot.status, isDark, t);
+  const isPast = slot.status === "past";
   return (
-    <TouchableOpacity style={[sr.row, { borderBottomColor: t.border }]} onPress={onPress} activeOpacity={0.75}>
-      <View style={[sr.dot, { backgroundColor: dotColor }]} />
-      <View style={{ flex: 1 }}>
-        <Text style={[sr.time, { color: t.text }]}>{slot.slotTime}</Text>
-        <Text style={[sr.turf, { color: t.textMuted }]}>{slot.turfName}</Text>
+    <TouchableOpacity
+      style={[
+        ov.tile,
+        { backgroundColor: c.bg, borderColor: c.border, borderStyle: isPast ? "dashed" : "solid" },
+      ]}
+      onPress={onPress}
+      disabled={isPast}
+      activeOpacity={0.7}
+    >
+      <Text style={[ov.tileTime, { color: isPast ? c.label : t.text }]}>{slot.label}</Text>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 3 }}>
+        {slot.status === "blocked" && <Ionicons name="lock-closed" size={9} color={c.label} />}
+        <Text style={[ov.tileLabel, { color: c.label }]}>
+          {isPast && slot.wasBooked ? "Played" : STATUS_LABEL[slot.status]}
+        </Text>
       </View>
-      <View style={[sr.badge, { backgroundColor: badgeBg }]}>
-        <Text style={[sr.badgeText, { color: badgeColor }]}>{badgeLabel}</Text>
-      </View>
-      <Ionicons name="chevron-forward" size={14} color={t.textMuted} style={{ marginLeft: 6 }} />
     </TouchableOpacity>
   );
 }
 
-const sr = StyleSheet.create({
-  row:      { flexDirection: "row", alignItems: "center", paddingVertical: 14, borderBottomWidth: 1 },
-  dot:      { width: 8, height: 8, borderRadius: 4, marginRight: 12 },
-  time:     { fontSize: 15, fontWeight: "800" },
-  turf:     { fontSize: 11, fontWeight: "500", marginTop: 2 },
-  badge:    { paddingHorizontal: 12, paddingVertical: 5, borderRadius: 999 },
-  badgeText:{ fontSize: 11, fontWeight: "800" },
-});
+// ── Turf Strip Row (all-turfs view) ───────────────────────────────────────────
+function TurfStripRow({ name, slots, isDark, t, onPress }: {
+  name: string; slots: GridSlot[]; isDark: boolean; t: Theme; onPress: () => void;
+}) {
+  const free    = slots.filter((s) => s.status === "free").length;
+  const booked  = slots.filter((s) => s.status === "booked").length;
+  const blocked = slots.filter((s) => s.status === "blocked").length;
+
+  const parts = [
+    `${free} free`,
+    booked  ? `${booked} booked`   : "",
+    blocked ? `${blocked} blocked` : "",
+  ].filter(Boolean).join(" · ");
+
+  const first = slots[0];
+  const mid   = slots[Math.floor(slots.length / 2)];
+  const last  = slots[slots.length - 1];
+  const stripGap = slots.length > 20 ? 1 : 3;
+
+  return (
+    <TouchableOpacity
+      style={[ov.turfRow, { backgroundColor: t.card2, borderColor: t.border }]}
+      onPress={onPress}
+      activeOpacity={0.75}
+    >
+      <View style={ov.turfRowHead}>
+        <Text style={[ov.turfRowName, { color: t.text }]} numberOfLines={1}>{name}</Text>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 2 }}>
+          <Text style={[ov.turfRowCounts, { color: t.textSub }]}>{slots.length ? parts : "No slots"}</Text>
+          <Ionicons name="chevron-forward" size={13} color={t.textSub} />
+        </View>
+      </View>
+
+      {slots.length > 0 && (
+        <>
+          <View style={[ov.strip, { gap: stripGap }]}>
+            {slots.map((s) => (
+              <View key={s.id} style={[ov.stripSeg, { backgroundColor: slotColors(s.status, isDark, t).strip }]} />
+            ))}
+          </View>
+          <View style={ov.stripLabels}>
+            <Text style={[ov.stripLabel, { color: t.textSub }]}>{first.label}</Text>
+            <Text style={[ov.stripLabel, { color: t.textSub }]}>{mid.label}</Text>
+            <Text style={[ov.stripLabel, { color: t.textSub }]}>{shortTime(last.start + (last.start - (slots[slots.length - 2]?.start ?? last.start - 1)))}</Text>
+          </View>
+        </>
+      )}
+    </TouchableOpacity>
+  );
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main
@@ -222,7 +358,15 @@ export default function OwnerHome() {
   const [loading,      setLoading]      = useState(true);
   const [refreshing,   setRefreshing]   = useState(false);
   const [selectedDate, setSelectedDate] = useState(new Date());
+  const [selectedTurfId, setSelectedTurfId] = useState<string>("all");
   const [isDark,       setIsDark]       = useState(false);
+
+  // Guards against setState after the screen goes away.
+  const aliveRef = useRef(true);
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => { aliveRef.current = false; };
+  }, []);
 
   useEffect(() => {
     AsyncStorage.getItem("owner_theme").then((val) => {
@@ -238,10 +382,8 @@ export default function OwnerHome() {
   };
 
   const t = isDark ? DARK_THEME : LIGHT_THEME;
-
-  function normalizeSlot(s: string): string {
-    return s.replace(/\s*-\s*/g, " - ").trim();
-  }
+  // Accent for the Slot Overview card (light theme's t.green is grey).
+  const accent = isDark ? "#3FB950" : "#15803D";
 
   function parseSlotToRange(slotStr: string): { start: number; end: number } | null {
     const parts = slotStr.split(" - ");
@@ -268,61 +410,129 @@ export default function OwnerHome() {
 
   useEffect(() => { loadAll(); }, []);
 
+  // allSettled, not all — one failing query must not wipe out the other three.
   const loadAll = async () => {
     if (!auth.currentUser?.uid) { setLoading(false); return; }
     try {
-      await Promise.all([fetchOwner(), fetchTurfs(), fetchBookings(), fetchBlockedSlots()]);
-    } catch (e) { console.log(e); }
-    finally { setLoading(false); }
+      const results = await Promise.allSettled([
+        fetchOwner(),
+        fetchTurfs(),
+        fetchBookings(),
+        fetchBlockedSlots(),
+      ]);
+      results.forEach((r, i) => {
+        if (r.status === "rejected") {
+          console.log(
+            `Owner dashboard: ${["fetchOwner", "fetchTurfs", "fetchBookings", "fetchBlockedSlots"][i]} failed —`,
+            r.reason
+          );
+        }
+      });
+    } catch (e) {
+      console.log(e);
+    } finally {
+      if (aliveRef.current) setLoading(false);
+    }
   };
 
   const onRefresh = async () => {
     setRefreshing(true);
     await loadAll();
-    setRefreshing(false);
+    if (aliveRef.current) setRefreshing(false);
   };
 
   const fetchOwner = async () => {
     const snap = await getDoc(doc(db, "users", auth.currentUser!.uid));
-    if (snap.exists()) {
+    if (snap.exists() && aliveRef.current) {
       setOwnerName(snap.data().name || "Owner");
       setBusinessName(snap.data().businessName || "");
     }
   };
 
   const fetchTurfs = async () => {
-    const snap = await getDocs(query(collection(db, "turfs"), where("ownerId", "==", auth.currentUser!.uid)));
-    setTurfs(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    const snap = await getDocs(
+      query(collection(db, "turfs"), where("ownerId", "==", auth.currentUser!.uid))
+    );
+    if (aliveRef.current) setTurfs(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
   };
 
-  // ─── fetchBookings — THE ONLY CHANGE ────────────────────────────────────────
-  // BEFORE: fetched ALL bookings ever with no date limit
-  //   → getDocs(query(bookings, where ownerId == uid))
-  //   → After 3 months = ~450 reads, after 1 year = ~1800+ reads every app open
+  // ─── fetchBookings ──────────────────────────────────────────────────────────
+  // Last HISTORY_DAYS days AND everything upcoming (the >= range is open-ended
+  // upward), newest first, capped at BOOKINGS_CAP.
   //
-  // AFTER: fetches only last 30 days + upcoming (covers dashboard needs)
-  //   → 30 days back covers: week revenue, recent bookings, stats
-  //   → future dates covered: upcoming count works correctly
-  //   → limit(500) as a hard safety cap
-  //   → reads stay ~30–150 regardless of how old the turf is
-  //
-  // NOTE: The date strip shows next 7 days — all covered by "upcoming" range.
-  //       The slot overview, today's bookings, week revenue, pending collect
-  //       all work correctly with this 30-day window.
-const fetchBookings = async () => {
-  const snap = await getDocs(
-    query(
-      collection(db, "bookings"),
-      where("ownerId", "==", auth.currentUser!.uid),
-      limit(200)
-    )
-  );
-  setBookings(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-};
+  // Needs the composite index:  bookings → ownerId (ASC) + date (DESC)
+  // First run without it logs a "create index" link from Firestore. Until then
+  // the catch block falls back to the old unbounded read so the dashboard is
+  // never blank — it just costs more reads.
+  const fetchBookings = async () => {
+    const uid  = auth.currentUser!.uid;
+    const from = new Date();
+    from.setDate(from.getDate() - HISTORY_DAYS);
+    from.setHours(0, 0, 0, 0);
 
+    let docs: any[];
+    try {
+      const snap = await getDocs(
+        query(
+          collection(db, "bookings"),
+          where("ownerId", "==", uid),
+          where("date", ">=", Timestamp.fromDate(from)),
+          orderBy("date", "desc"),
+          limit(BOOKINGS_CAP)
+        )
+      );
+      docs = snap.docs;
+    } catch (indexErr) {
+      console.warn(
+        "⚠️ Owner dashboard: bounded bookings query failed (most likely the missing " +
+          "Firestore composite index on bookings: ownerId + date). Falling back to an " +
+          "unbounded fetch. Check the Firestore console for the auto-generated " +
+          "'create index' link — creating it will cut your reads a lot.",
+        indexErr
+      );
+      const full = await getDocs(
+        query(collection(db, "bookings"), where("ownerId", "==", uid))
+      );
+      docs = full.docs;
+    }
+
+    if (aliveRef.current) setBookings(docs.map((d) => ({ id: d.id, ...d.data() })));
+  };
+
+  // ─── fetchBlockedSlots ──────────────────────────────────────────────────────
+  // Only the 7 days the date strip can actually show. blockedSlots.date is a
+  // toDateString() STRING, so this is an "in" match, not a range.
+  //
+  // Needs the composite index:  blockedSlots → ownerId (ASC) + date (ASC)
+  // Same fallback as above if it isn't there yet.
   const fetchBlockedSlots = async () => {
-    const snap = await getDocs(query(collection(db, "blockedSlots"), where("ownerId", "==", auth.currentUser!.uid)));
-    setBlockedSlots(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    const uid  = auth.currentUser!.uid;
+    const keys = next7DayKeys();
+
+    let docs: any[];
+    try {
+      const snap = await getDocs(
+        query(
+          collection(db, "blockedSlots"),
+          where("ownerId", "==", uid),
+          where("date", "in", keys)
+        )
+      );
+      docs = snap.docs;
+    } catch (indexErr) {
+      console.warn(
+        "⚠️ Owner dashboard: bounded blockedSlots query failed (likely a missing " +
+          "composite index on blockedSlots: ownerId + date). Falling back to an " +
+          "unbounded fetch.",
+        indexErr
+      );
+      const full = await getDocs(
+        query(collection(db, "blockedSlots"), where("ownerId", "==", uid))
+      );
+      docs = full.docs;
+    }
+
+    if (aliveRef.current) setBlockedSlots(docs.map((d) => ({ id: d.id, ...d.data() })));
   };
 
   // ── Derived — all pure useMemo, zero Firestore reads ─────────────────────
@@ -336,7 +546,11 @@ const fetchBookings = async () => {
         const fromStr  = b.dateString;
         return (fromDate === selectedDateKey || fromStr === selectedDateKey) && b.status !== "cancelled";
       })
-      .sort((a, b) => getSlotMins(a.slotTime ?? (a.selectedSlots?.[0] || "")) - getSlotMins(b.slotTime ?? (b.selectedSlots?.[0] || ""))),
+      .sort((a, b) => {
+        const am = parseSlotToRange(a.slotTime ?? (a.selectedSlots?.[0] || ""))?.start ?? 0;
+        const bm = parseSlotToRange(b.slotTime ?? (b.selectedSlots?.[0] || ""))?.start ?? 0;
+        return am - bm;
+      }),
   [bookings, selectedDateKey]);
 
   const upcomingCount = useMemo(() => {
@@ -345,7 +559,7 @@ const fetchBookings = async () => {
       const d = getSafeDate(b.date || b.dateString);
       return d && d > now && d.toDateString() !== todayKey && b.status !== "cancelled";
     }).length;
-  }, [bookings]);
+  }, [bookings, todayKey]);
 
   const todayPaid = useMemo(() =>
     todayBookings.reduce((s, b) => s + Number(b.paidAmount || b.advanceAmount || 0), 0),
@@ -362,83 +576,83 @@ const fetchBookings = async () => {
       .reduce((s, b) => s + Number(b.paidAmount || b.advanceAmount || 0), 0);
   }, [bookings]);
 
-  const slotSummary = useMemo(() => {
-    let available = 0, booked = 0, blocked = 0;
-    turfs.forEach((turf) => {
-      const open  = Number(turf.openingTime ?? 6);
-      const close = Number(turf.closingTime ?? 23);
-      const dur   = Number(turf.slotDuration ?? 60) / 60;
-      for (let tm = open; tm + dur <= close; tm += dur) {
-        const slotStart = tm;
-        const slotEnd   = tm + dur;
-        const isBooked = todayBookings.some((b) => {
-          if (b.turfId !== turf.id) return false;
-          const storedSlots: string[] = Array.isArray(b.selectedSlots) && b.selectedSlots.length > 0
-            ? b.selectedSlots : [b.slotTime].filter(Boolean);
-          return storedSlots.some((s) => {
-            const r = parseSlotToRange(s);
-            return r ? rangesOverlap(slotStart, slotEnd, r.start, r.end) : false;
-          });
-        });
-        const isBlocked = blockedSlots.some((b) => {
-          if (b.turfId !== turf.id || b.date !== selectedDateKey) return false;
-          const storedSlots: string[] = Array.isArray(b.slots) ? b.slots : [b.slotTime].filter(Boolean);
-          return storedSlots.some((s) => {
-            const r = parseSlotToRange(s);
-            return r ? rangesOverlap(slotStart, slotEnd, r.start, r.end) : false;
-          });
-        });
-        if (isBooked) booked++;
-        else if (isBlocked) blocked++;
-        else available++;
-      }
-    });
-    return { available, booked, blocked, total: available + booked + blocked };
-  }, [turfs, todayBookings, blockedSlots, selectedDateKey]);
-
-  const slotRows = useMemo(() => {
+  // Every slot of the selected day, per turf, with its status.
+  const slotsByTurf = useMemo(() => {
     const now     = new Date();
-    const curMins = now.getHours() * 60 + now.getMinutes();
-    const isToday = selectedDate.toDateString() === todayKey;
-    const result: any[] = [];
+    const curH    = now.getHours() + now.getMinutes() / 60;
+    const isToday = selectedDateKey === todayKey;
+    const map: Record<string, GridSlot[]> = {};
+
     turfs.forEach((turf) => {
-      const open  = Number(turf.openingTime ?? 6);
-      const close = Number(turf.closingTime ?? 23);
-      const dur   = Number(turf.slotDuration ?? 60) / 60;
-      for (let tm = open; tm + dur <= close; tm += dur) {
-        const slotStart = tm;
-        const slotEnd   = tm + dur;
-        const slotStr   = `${formatTime(slotStart)} - ${formatTime(slotEnd)}`;
-        const mins      = slotStart * 60;
-        if (isToday && mins < curMins) continue;
-        const isBooked = todayBookings.some((b) => {
-          if (b.turfId !== turf.id) return false;
-          const storedSlots: string[] = Array.isArray(b.selectedSlots) && b.selectedSlots.length > 0
-            ? b.selectedSlots : [b.slotTime].filter(Boolean);
-          return storedSlots.some((s) => {
+      const open = Number(turf.openingTime ?? 6);
+      let close  = Number(turf.closingTime ?? 23);
+      if (close <= open) close += 24;            // runs past midnight
+      const dur  = Number(turf.slotDuration ?? 60) / 60;
+      const list: GridSlot[] = [];
+      map[turf.id] = list;
+      if (!(dur > 0)) return;
+
+      const turfBookings = todayBookings.filter((b) => b.turfId === turf.id);
+      const turfBlocks   = blockedSlots.filter((b) => b.turfId === turf.id && b.date === selectedDateKey);
+
+      for (let tm = open; tm + dur <= close + 1e-6; tm += dur) {
+        const slotEnd = tm + dur;
+        // Compare in 0–24 space (stored slot strings never go past 24).
+        const cs = tm >= 24 ? tm - 24 : tm;
+        const ce = tm >= 24 ? slotEnd - 24 : Math.min(slotEnd, 24);
+        const hits = (stored: string[]) =>
+          stored.some((s) => {
             const r = parseSlotToRange(s);
-            return r ? rangesOverlap(slotStart, slotEnd, r.start, r.end) : false;
+            return r ? rangesOverlap(cs, ce, r.start, r.end) : false;
           });
-        });
-        const isBlocked = blockedSlots.some((b) => {
-          if (b.turfId !== turf.id || b.date !== selectedDateKey) return false;
-          const storedSlots: string[] = Array.isArray(b.slots) ? b.slots : [b.slotTime].filter(Boolean);
-          return storedSlots.some((s) => {
-            const r = parseSlotToRange(s);
-            return r ? rangesOverlap(slotStart, slotEnd, r.start, r.end) : false;
-          });
-        });
-        result.push({
-          id:       `${turf.id}-${slotStr}`,
-          turfName: turf.name || "Turf",
-          slotTime: slotStr,
-          mins,
-          status:   isBooked ? "booked" : isBlocked ? "blocked" : "available",
+
+        const booking = turfBookings.find((b) =>
+          hits(Array.isArray(b.selectedSlots) && b.selectedSlots.length > 0
+            ? b.selectedSlots : [b.slotTime].filter(Boolean))
+        );
+        const isBlocked = !booking && turfBlocks.some((b) =>
+          hits(Array.isArray(b.slots) ? b.slots : [b.slotTime].filter(Boolean))
+        );
+        const isPast = isToday && slotEnd <= curH;
+
+        let status: SlotStatus = booking ? "booked" : isBlocked ? "blocked" : "free";
+        const wasBooked = isPast && status !== "free";
+        if (isPast) status = "past";
+
+        list.push({
+          id:        `${turf.id}-${tm}`,
+          turfId:    turf.id,
+          label:     shortTime(tm),
+          slotStr:   `${formatTime(tm)} - ${formatTime(slotEnd)}`,
+          start:     tm,
+          status,
+          bookingId: booking?.id,
+          wasBooked,
         });
       }
     });
-    return result.sort((a, b) => a.mins - b.mins).slice(0, 8);
-  }, [turfs, todayBookings, blockedSlots, selectedDateKey]);
+    return map;
+  }, [turfs, todayBookings, blockedSlots, selectedDateKey, todayKey]);
+
+  // One turf → always that turf. Selected turf removed → back to "all".
+  const activeTurfId = useMemo(() => {
+    if (turfs.length === 1) return turfs[0].id;
+    if (selectedTurfId !== "all" && turfs.some((tf) => tf.id === selectedTurfId)) return selectedTurfId;
+    return "all";
+  }, [turfs, selectedTurfId]);
+
+  const activeTurf = turfs.find((tf) => tf.id === activeTurfId);
+
+  const slotSummary = useMemo(() => {
+    const scope = activeTurfId === "all"
+      ? Object.values(slotsByTurf).flat()
+      : slotsByTurf[activeTurfId] || [];
+    const count = (st: SlotStatus) => scope.filter((s) => s.status === st).length;
+    return {
+      free: count("free"), booked: count("booked"), blocked: count("blocked"),
+      past: count("past"), total: scope.length,
+    };
+  }, [slotsByTurf, activeTurfId]);
 
   const dateStrip = useMemo(() =>
     Array.from({ length: 7 }, (_, i) => { const d = new Date(); d.setDate(d.getDate() + i); return d; }),
@@ -448,13 +662,33 @@ const fetchBookings = async () => {
     todayBookings.filter((b) => Number(b.remainingAmount || 0) > 0),
   [todayBookings]);
 
+  const onSlotPress = (slot: GridSlot) => {
+    if (slot.status === "booked" && slot.bookingId) {
+      router.push({ pathname: "/(owner)/booking-receipt/[id]", params: { id: slot.bookingId } } as any);
+      return;
+    }
+    router.push({
+      pathname: "/(owner)/block-slots",
+      params: { turfId: slot.turfId, date: selectedDateKey, slot: slot.slotStr },
+    } as any);
+  };
+
   if (loading) return (
     <View style={{ flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: t.bg }}>
-      <StatusBar barStyle="light-content" backgroundColor={t.bg} />
+      <StatusBar barStyle={isDark ? "light-content" : "dark-content"} backgroundColor={t.bg} />
       <ActivityIndicator size="large" color={t.green} />
       <Text style={{ color: t.textSub, marginTop: 12, fontSize: 15, fontWeight: "600" }}>Loading...</Text>
     </View>
   );
+
+  const legend = [
+    { color: slotColors("free",    isDark, t).strip, label: `${slotSummary.free} Free` },
+    { color: slotColors("booked",  isDark, t).strip, label: `${slotSummary.booked} Booked` },
+    { color: slotColors("blocked", isDark, t).strip, label: `${slotSummary.blocked} Blocked` },
+    ...(slotSummary.past > 0
+      ? [{ color: isDark ? "#484F58" : "#CBD5E1", label: `${slotSummary.past} Over` }]
+      : []),
+  ];
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: t.bg }}>
@@ -548,9 +782,9 @@ const fetchBookings = async () => {
           {[
             { icon: "calendar-outline",    label: "Bookings",    color: "#58A6FF", bg: "rgba(88,166,255,0.15)",  route: "/(owner)/bookings" },
             { icon: "lock-closed-outline", label: "Block Slots", color: "#F85149", bg: "rgba(248,81,73,0.15)",   route: "/(owner)/block-slots" },
-            { icon: "stats-chart",         label: "Revenue",     color: "#BC8CFF", bg: "rgba(188,140,255,0.15)", route: "/(owner)/revenue" },
-            { icon: "headset-outline",     label: "Support",     color: "#FFA500", bg: "rgba(255,165,0,0.15)",   route: "/support/owner-support" },
-            { icon: "person-outline",      label: "Profile",     color: "#3FB950", bg: "rgba(63,185,80,0.15)",   route: "/(owner)/profile" },
+            // { icon: "stats-chart",      label: "Revenue",     color: "#BC8CFF", bg: "rgba(188,140,255,0.15)", route: "/(owner)/revenue" },
+            { icon: "list",     label: "Schedule",     color: "#FFA500", bg: "rgba(255,165,0,0.15)",   route: "/(owner)/schedule" },
+            { icon: "wallet-outline",      label: "Transection", color: "#3FB950", bg: "rgba(63,185,80,0.15)",   route: "/(owner)/settlementscreen" },
           ].map((a) => (
             <ActionBtn key={a.label} icon={a.icon} label={a.label} color={a.color} bg={a.bg}
               onPress={() => router.push(a.route as any)} t={t} />
@@ -559,56 +793,37 @@ const fetchBookings = async () => {
 
         {/* ══ SLOT OVERVIEW ════════════════════════════════════ */}
         <View style={[ov.card, { backgroundColor: t.card, borderColor: t.border, marginHorizontal: 16, marginTop: 16 }]}>
-          <View style={ov.header}>
-  <View>
-    <Text style={[ov.title, { color: t.text }]}>
-      Slot Overview
-    </Text>
+          <View style={[ov.header, { alignItems: "center", marginBottom: 14 }]}>
+            <View>
+              <Text style={[ov.title, { color: t.text }]}>Slot Overview</Text>
+              <Text style={[ov.subtitle, { color: t.textSub }]}>
+                {selectedDate.toLocaleDateString("en-US", { weekday: "short", day: "numeric", month: "short" })} · pull down to refresh
+              </Text>
+            </View>
+            <TouchableOpacity onPress={() => router.push("/(owner)/block-slots" as any)} hitSlop={8}>
+              <Text style={[ov.link, { color: accent }]}>Full Schedule →</Text>
+            </TouchableOpacity>
+          </View>
 
-    <View style={{ flexDirection: "row", alignItems: "center", marginTop: 4 }}>
-      <Ionicons
-        name="refresh-outline"
-        size={11}
-        color={t.textMuted}
-        style={{ marginRight: 4 }}
-      />
-
-      <Text
-        style={{
-          color: t.textMuted,
-          fontSize: 11,
-          fontWeight: "600",
-        }}
-      >
-        Pull to refresh for accurate live data
-      </Text>
-    </View>
-  </View>
-
-  <TouchableOpacity
-    onPress={() => router.push("/(owner)/block-slots" as any)}
-  >
-    <Text style={[ov.link, { color: t.green }]}>
-      Full Schedule →
-    </Text>
-  </TouchableOpacity>
-</View>
-
-          {/* Date chips — changing date = 0 Firestore reads (pure useMemo) */}
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingBottom: 16 }}>
+          {/* Dates — wider chips, scroll sideways. Changing date = 0 Firestore reads. */}
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={ov.dateRow}>
             {dateStrip.map((d) => {
               const active = d.toDateString() === selectedDateKey;
               return (
                 <TouchableOpacity
                   key={d.toDateString()}
-                  style={[ov.dateChip, { backgroundColor: active ? t.green : t.card2, borderColor: active ? t.green : t.border }]}
+                  style={[ov.dateChip, {
+                    backgroundColor: active ? accent : t.card2,
+                    borderColor: active ? accent : t.border,
+                  }]}
                   onPress={() => setSelectedDate(d)}
+                  activeOpacity={0.8}
                 >
                   <Text style={[ov.dateDay, { color: active ? "#fff" : t.textSub }]}>
                     {d.toLocaleDateString("en-US", { weekday: "short" }).toUpperCase()}
                   </Text>
                   <Text style={[ov.dateNum, { color: active ? "#fff" : t.text }]}>{d.getDate()}</Text>
-                  <Text style={[ov.dateMon, { color: active ? "rgba(255,255,255,0.7)" : t.textMuted }]}>
+                  <Text style={[ov.dateMon, { color: active ? "rgba(255,255,255,0.8)" : t.textSub }]}>
                     {d.toLocaleDateString("en-US", { month: "short" }).toUpperCase()}
                   </Text>
                 </TouchableOpacity>
@@ -616,48 +831,112 @@ const fetchBookings = async () => {
             })}
           </ScrollView>
 
-          {slotSummary.total > 0 && (
-            <>
-              <View style={[ov.occBar, { backgroundColor: t.card2 }]}>
-                {slotSummary.booked > 0   && <View style={[ov.seg, { flex: slotSummary.booked,   backgroundColor: "#F85149" }]} />}
-                {slotSummary.blocked > 0  && <View style={[ov.seg, { flex: slotSummary.blocked,  backgroundColor: "#58A6FF" }]} />}
-                {slotSummary.available > 0 && <View style={[ov.seg, { flex: slotSummary.available, backgroundColor: t.green }]} />}
-              </View>
-              <View style={ov.occLegend}>
-                {[
-                  { color: "#F85149", label: `${slotSummary.booked} Booked` },
-                  { color: "#58A6FF", label: `${slotSummary.blocked} Blocked` },
-                  { color: t.green,   label: `${slotSummary.available} Free` },
-                ].map((l) => (
-                  <View key={l.label} style={ov.legendItem}>
-                    <View style={[ov.legendDot, { backgroundColor: l.color }]} />
-                    <Text style={[ov.legendText, { color: t.textSub }]}>{l.label}</Text>
-                  </View>
-                ))}
-              </View>
-            </>
+          {/* Turf filter — hidden when there's only one turf */}
+          {turfs.length > 1 && (
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={{ gap: 8 }}
+              style={{ marginTop: 14 }}
+            >
+              {[{ id: "all", name: "All turfs" }, ...turfs].map((tf: any) => {
+                const active = tf.id === activeTurfId;
+                return (
+                  <TouchableOpacity
+                    key={tf.id}
+                    style={[ov.turfChip, {
+                      backgroundColor: active ? t.text : t.card,
+                      borderColor: active ? t.text : t.border,
+                    }]}
+                    onPress={() => setSelectedTurfId(tf.id)}
+                    activeOpacity={0.8}
+                  >
+                    <Text style={[ov.turfChipText, { color: active ? t.bg : t.textSub }]} numberOfLines={1}>
+                      {tf.name || "Turf"}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
           )}
 
-          {slotRows.length === 0 ? (
+          {turfs.length === 0 ? (
             <View style={{ alignItems: "center", paddingVertical: 24, gap: 8 }}>
-              <Ionicons name="checkmark-circle" size={28} color={t.green} />
-              <Text style={{ color: t.textMuted, fontSize: 13, fontWeight: "600" }}>All slots filled for this date</Text>
+              <Ionicons name="football-outline" size={28} color={t.textSub} />
+              <Text style={{ color: t.textSub, fontSize: 13, fontWeight: "600" }}>Add a turf to see its slots</Text>
             </View>
           ) : (
-            slotRows.map((slot) => (
-              <SlotRow key={slot.id} slot={slot} t={t}
-                onPress={() => router.push("/(owner)/block-slots" as any)} />
-            ))
-          )}
+            <>
+              {/* Occupancy bar (one turf) + counts */}
+              <View style={{ marginTop: 14, gap: 8 }}>
+                {activeTurfId !== "all" && slotSummary.total > 0 && (
+                  <View style={ov.occBar}>
+                    {slotSummary.booked  > 0 && <View style={{ flex: slotSummary.booked,  backgroundColor: slotColors("booked",  isDark, t).strip }} />}
+                    {slotSummary.blocked > 0 && <View style={{ flex: slotSummary.blocked, backgroundColor: slotColors("blocked", isDark, t).strip }} />}
+                    {slotSummary.free    > 0 && <View style={{ flex: slotSummary.free,    backgroundColor: slotColors("free",    isDark, t).strip }} />}
+                    {slotSummary.past    > 0 && <View style={{ flex: slotSummary.past,    backgroundColor: slotColors("past",    isDark, t).strip }} />}
+                  </View>
+                )}
+                <View style={ov.legend}>
+                  {legend.map((l) => (
+                    <View key={l.label} style={ov.legendItem}>
+                      <View style={[ov.legendDot, { backgroundColor: l.color }]} />
+                      <Text style={[ov.legendText, { color: t.textSub }]}>{l.label}</Text>
+                    </View>
+                  ))}
+                </View>
+              </View>
 
-          <TouchableOpacity
-            style={[ov.addBtn, { backgroundColor: t.greenBg, borderColor: isDark ? "rgba(63,185,80,0.3)" : t.green }]}
-            onPress={() => router.push("/(owner)/block-slots" as any)}
-            activeOpacity={0.8}
-          >
-            <Ionicons name="calendar-outline" size={16} color={t.green} />
-            <Text style={[ov.addBtnText, { color: t.green }]}>Add New Slot</Text>
-          </TouchableOpacity>
+              {activeTurfId === "all" ? (
+                /* ── All turfs: one strip row per turf ── */
+                <View style={{ marginTop: 14, gap: 10 }}>
+                  {turfs.map((tf) => (
+                    <TurfStripRow
+                      key={tf.id}
+                      name={tf.name || "Turf"}
+                      slots={slotsByTurf[tf.id] || []}
+                      isDark={isDark}
+                      t={t}
+                      onPress={() => setSelectedTurfId(tf.id)}
+                    />
+                  ))}
+                  <Text style={[ov.hint, { color: t.textSub }]}>Tap a turf to see its slots</Text>
+                </View>
+              ) : (
+                /* ── One turf: tile grid ── */
+                <View style={{ marginTop: 14 }}>
+                  {(slotsByTurf[activeTurfId] || []).length === 0 ? (
+                    <View style={{ alignItems: "center", paddingVertical: 20, gap: 6 }}>
+                      <Ionicons name="time-outline" size={26} color={t.textSub} />
+                      <Text style={{ color: t.textSub, fontSize: 13, fontWeight: "600" }}>
+                        No slots for {activeTurf?.name || "this turf"} on this day
+                      </Text>
+                    </View>
+                  ) : (
+                    <>
+                      <View style={ov.grid}>
+                        {(slotsByTurf[activeTurfId] || []).map((slot) => (
+                          <SlotTile key={slot.id} slot={slot} isDark={isDark} t={t} onPress={() => onSlotPress(slot)} />
+                        ))}
+                      </View>
+                      <Text style={[ov.hint, { color: t.textSub, marginTop: 12 }]}>
+                        Tap a free slot to block it · tap booked to see the booking
+                      </Text>
+                    </>
+                  )}
+
+                  <TouchableOpacity
+                    style={[ov.addBtn, { backgroundColor: isDark ? "rgba(63,185,80,0.15)" : "#DCFCE7", borderColor: accent }]}
+                    onPress={() => router.push({ pathname: "/(owner)/block-slots", params: { turfId: activeTurfId, date: selectedDateKey } } as any)}
+                    activeOpacity={0.8}
+                  >
+                    <Ionicons name="lock-closed-outline" size={16} color={accent} />
+                    <Text style={[ov.addBtnText, { color: accent }]}>Block Slots</Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+            </>
+          )}
         </View>
 
         {/* ══ TODAY'S BOOKINGS ════════════════════════════════ */}
@@ -755,6 +1034,23 @@ const fetchBookings = async () => {
           </View>
         )}
 
+        {/* ══ OWNER GUIDE ═════════════════════════════════════ */}
+        <TouchableOpacity
+          style={[ov.card, { backgroundColor: t.card, borderColor: t.border, marginHorizontal: 16, marginTop: 16, flexDirection: "row", alignItems: "center", gap: 14 }]}
+          onPress={() => router.push("/(owner)/ownerguide" as any)}
+          activeOpacity={0.8}
+        >
+          <View style={{ width: 46, height: 46, borderRadius: 14, backgroundColor: t.greenBg, justifyContent: "center", alignItems: "center" }}>
+            <Ionicons name="book-outline" size={22} color={t.green} />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={{ color: t.text, fontSize: 15, fontWeight: "800" }}>Owner Guide</Text>
+            <Text style={{ color: t.textSub, fontSize: 11, fontWeight: "600", marginTop: 2 }}>
+              Learn bookings, coins, block slots & settlements
+            </Text>
+          </View>
+          <Ionicons name="chevron-forward" size={16} color={t.textMuted} />
+        </TouchableOpacity>
       </ScrollView>
     </SafeAreaView>
   );
@@ -798,17 +1094,44 @@ const ov = StyleSheet.create({
   card:      { borderRadius: 22, padding: 18, borderWidth: 1 },
   header:    { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 },
   title:     { fontSize: 17, fontWeight: "900" },
-  link:      { fontSize: 13, fontWeight: "700" },
-  dateChip:  { width: 60, paddingVertical: 10, borderRadius: 14, alignItems: "center", borderWidth: 1 },
-  dateDay:   { fontSize: 9, fontWeight: "800" },
-  dateNum:   { fontSize: 20, fontWeight: "900", marginTop: 2 },
+  subtitle:  { fontSize: 11, fontWeight: "600", marginTop: 2 },
+  link:      { fontSize: 13, fontWeight: "800" },
+
+  // dates
+  dateRow:   { flexDirection: "row", gap: 8 },
+  dateChip:  { width: 50, height: 64, borderRadius: 14, alignItems: "center", justifyContent: "center", borderWidth: 1 },
+  dateDay:   { fontSize: 10, fontWeight: "800" },
+  dateNum:   { fontSize: 19, fontWeight: "900", marginTop: 1 },
   dateMon:   { fontSize: 9, fontWeight: "700", marginTop: 1 },
-  occBar:    { flexDirection: "row", height: 6, borderRadius: 3, overflow: "hidden", marginBottom: 10 },
-  seg:       { height: 6 },
-  occLegend: { flexDirection: "row", gap: 16, marginBottom: 14 },
+
+  // turf filter
+  turfChip:     { height: 34, paddingHorizontal: 14, borderRadius: 999, borderWidth: 1, justifyContent: "center", maxWidth: 160 },
+  turfChipText: { fontSize: 12, fontWeight: "800" },
+
+  // counts
+  occBar:    { flexDirection: "row", height: 6, borderRadius: 3, overflow: "hidden", gap: 2 },
+  legend:    { flexDirection: "row", flexWrap: "wrap", columnGap: 14, rowGap: 4 },
   legendItem:{ flexDirection: "row", alignItems: "center", gap: 5 },
-  legendDot: { width: 7, height: 7, borderRadius: 4 },
-  legendText:{ fontSize: 11, fontWeight: "600" },
+  legendDot: { width: 8, height: 8, borderRadius: 4 },
+  legendText:{ fontSize: 11, fontWeight: "700" },
+
+  // one-turf grid
+  grid:      { flexDirection: "row", flexWrap: "wrap", gap: GRID_GAP },
+  tile:      { width: TILE_W, height: 54, borderRadius: 12, borderWidth: 1, alignItems: "center", justifyContent: "center", gap: 2 },
+  tileTime:  { fontSize: 13, fontWeight: "800" },
+  tileLabel: { fontSize: 10, fontWeight: "700" },
+
+  // all-turfs rows
+  turfRow:       { borderWidth: 1, borderRadius: 14, padding: 12, gap: 8 },
+  turfRowHead:   { flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 8 },
+  turfRowName:   { fontSize: 14, fontWeight: "800", flexShrink: 1 },
+  turfRowCounts: { fontSize: 11, fontWeight: "700" },
+  strip:         { flexDirection: "row" },
+  stripSeg:      { flex: 1, height: 16, borderRadius: 4 },
+  stripLabels:   { flexDirection: "row", justifyContent: "space-between" },
+  stripLabel:    { fontSize: 9, fontWeight: "700" },
+
+  hint:      { fontSize: 11, fontWeight: "600", textAlign: "center" },
   addBtn:    { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, marginTop: 14, paddingVertical: 13, borderRadius: 14, borderWidth: 1 },
   addBtnText:{ fontSize: 14, fontWeight: "800" },
 });

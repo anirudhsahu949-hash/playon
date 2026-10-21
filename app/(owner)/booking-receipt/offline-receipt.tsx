@@ -1,487 +1,442 @@
+/**
+ * booking-receipt/offline-receipt.tsx — Walk-in receipt (bill style)
+ * Reads the "blockedSlots" doc: router.push({ pathname: "/(owner)/booking-receipt/offline-receipt", params: { id } })
+ * • Green turf-stripe backdrop with a paper "bill" ticket on top
+ * • Share receipt → sends the ticket as an image (phone + note stay private)
+ * Fixes: advance amount read correctly (no more "Pending"), late-night status,
+ * total = advance + remaining, safe areas.
+ */
 import {
-  View,
-  Text,
-  StyleSheet,
-  ActivityIndicator,
-  TouchableOpacity,
-  ScrollView,
-  SafeAreaView,
-  StatusBar,
-  Alert,
-  Platform,
+  View, Text, StyleSheet, ScrollView, TouchableOpacity, StatusBar, ActivityIndicator, Alert, Linking, Platform, Image,
 } from "react-native";
-import { useEffect, useMemo, useState, useRef } from "react";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLocalSearchParams, useRouter } from "expo-router";
+import { useEffect, useRef, useState } from "react";
 import { doc, getDoc } from "firebase/firestore";
 import { db } from "../../../firebaseConfig";
-import Animated, { FadeInDown } from "react-native-reanimated";
 import { Ionicons } from "@expo/vector-icons";
 import * as Sharing from "expo-sharing";
 import ViewShot from "react-native-view-shot";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// OFFLINE BOOKING RECEIPT
-// Fetches from "blockedSlots" collection using the offlineDocId param
-// Usage: router.push(`/offline-receipt?id=${offlineDocId}`)
-// ─────────────────────────────────────────────────────────────────────────────
+// Logo file: put playon-receipt-logo.png in assets/images/
+const PLAYON_LOGO = require("../../../assets/images/playon-receipt-logo.png");
 
-type OfflineBooking = {
-  id: string;
-  customerName?: string;
-  customerPhone?: string;
-  note?: string;
-  turfName?: string;
-  turfId?: string;
-  date?: string;           // stored as string e.g. "Mon May 16 2026"
-  slots?: string[];
-  slotTime?: string;
-  amount?: number;
-  totalAmount?: number;
-  paidAmount?: number;
-  advanceAmount?: number;
-  remainingAmount?: number;
-  remainingCollected?: boolean;
-  arrived?: boolean;
-  type?: string;
-};
+// ── Palette ─────────────────────────────────────────────────────────────────
+const BRAND = "#15803D";
+const STRIPE = "#138A3F";
+const ON_BRAND = "#DCFCE7";
+const PAGE = "#F1F4F7";
+const INK = "#0F172A";
+const SLATE = "#475569";
+const MUTED = "#64748B";
+const FAINT = "#94A3B8";
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function parseTime(s: string): number {
-  const parts = s.trim().split(" ");
-  const [hStr, mStr] = parts[0].split(":");
-  let h = Number(hStr);
-  const m = Number(mStr || 0);
-  const period = (parts[1] || "").toUpperCase();
-  if (period === "PM" && h !== 12) h += 12;
-  if (period === "AM" && h === 12) h = 0;
-  return h + m / 60;
+// ── Helpers ─────────────────────────────────────────────────────────────────
+function toDate(v: any): Date | null {
+  if (!v) return null;
+  if (typeof v?.toDate === "function") return v.toDate();
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
 }
-
-function formatTime(v: number): string {
-  if (v >= 24) v = 0;
-  const hour = Math.floor(v);
-  const minute = Math.round((v % 1) * 60);
-  const suffix = hour >= 12 ? "PM" : "AM";
-  const h = hour % 12 === 0 ? 12 : hour % 12;
-  return `${h}:${String(minute).padStart(2, "0")} ${suffix}`;
+function dayStart(d: Date): number { const x = new Date(d); x.setHours(0, 0, 0, 0); return x.getTime(); }
+function partMins(s: string): number {
+  const m = String(s || "").trim().match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)/i);
+  if (!m) return 0;
+  let h = Number(m[1]);
+  const p = m[3].toUpperCase();
+  if (p === "PM" && h !== 12) h += 12;
+  if (p === "AM" && h === 12) h = 0;
+  return h * 60 + Number(m[2] || 0);
 }
-
-function formatDuration(hrs: number): string {
-  if (hrs < 1) return `${Math.round(hrs * 60)} min`;
-  if (hrs === 1) return "1 hr";
-  return `${hrs % 1 === 0 ? hrs : hrs.toFixed(1)} hrs`;
-}
-
-function formatSlotRange(slots: string[]): string {
-  if (!Array.isArray(slots) || slots.length === 0) return "Slot not available";
-
-  const parsed = slots
-    .map((s) => {
-      const parts = s.split(" - ");
-      if (parts.length < 2) return null;
-      return { start: parseTime(parts[0]), end: parseTime(parts[1]) };
-    })
-    .filter(Boolean) as { start: number; end: number }[];
-
-  parsed.sort((a, b) => a.start - b.start);
-
-  const merged: { start: number; end: number }[] = [];
-  for (const slot of parsed) {
-    if (merged.length === 0) {
-      merged.push({ ...slot });
-    } else {
-      const last = merged[merged.length - 1];
-      if (Math.abs(slot.start - last.end) < 0.02) {
-        last.end = slot.end;
-      } else {
-        merged.push({ ...slot });
-      }
-    }
-  }
-
-  return merged
-    .map(({ start, end }) => {
-      let duration = end - start;
-      if (duration <= 0) duration += 24;
-      return `${formatTime(start)} – ${formatTime(end)} · ${formatDuration(duration)}`;
-    })
-    .join("\n");
-}
-
-function formatDate(raw: string | undefined): string {
-  if (!raw) return "Date not available";
-  const d = new Date(raw);
-  if (isNaN(d.getTime())) return raw; // fallback: show raw string
-  return d.toLocaleDateString("en-US", {
-    weekday: "long",
-    day: "numeric",
-    month: "long",
-    year: "numeric",
+/** Start/end minutes from the booking day's midnight; late-night slots go past 1440 */
+function minsRange(slots: string[], turf: any): { start: number; end: number } | null {
+  const open = Number(turf?.openingTime ?? 6);
+  const close = Number(turf?.closingTime ?? 23) || 24;
+  const adj = (m: number) => (close > 24 && m < open * 60 ? m + 1440 : m);
+  let start = Infinity, end = -Infinity;
+  slots.forEach(s => {
+    const p = String(s).split(" - ");
+    if (p.length < 2) return;
+    const a = adj(partMins(p[0]));
+    let e = adj(partMins(p[1]));
+    if (e <= a) e += 1440;
+    start = Math.min(start, a); end = Math.max(end, e);
   });
+  return isFinite(start) ? { start, end } : null;
+}
+function hm(min: number): string {
+  const x = ((min % 1440) + 1440) % 1440;
+  const h = Math.floor(x / 60), m = x % 60;
+  return `${h % 12 === 0 ? 12 : h % 12}:${String(m).padStart(2, "0")}`;
+}
+const per = (min: number) => ((((min % 1440) + 1440) % 1440) >= 720 ? "PM" : "AM");
+const rangeTxt = (a: number, b: number) => `${hm(a)}${per(a) !== per(b) ? ` ${per(a)}` : ""} – ${hm(b)} ${per(b)}`;
+const hrsTxt = (mins: number) => {
+  if (mins < 60) return `${mins} min`;
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return m ? `${h}h ${m}m` : `${h} hr${h === 1 ? "" : "s"}`;
+};
+const leftTxt = (mins: number) => {
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return h === 0 ? `${m}m` : m === 0 ? `${h}h` : `${h}h ${m}m`;
+};
+const rs = (n: number) => `₹${Math.round(n).toLocaleString("en-IN")}`;
+function fmtCreated(v: any): string {
+  const d = toDate(v);
+  return d ? d.toLocaleString("en-IN", { day: "numeric", month: "short", hour: "numeric", minute: "2-digit", hour12: true }) : "";
 }
 
-function fmtAmount(n: number): string {
-  return `₹${Math.round(n).toLocaleString("en-IN")}`;
-}
+const STATUS = {
+  confirmed: { label: "CONFIRMED", bg: "#DCFCE7", fg: BRAND },
+  pending:   { label: "PENDING",   bg: "#FEF3C7", fg: "#B45309" },
+  cancelled: { label: "CANCELLED", bg: "#FEE2E2", fg: "#DC2626" },
+  completed: { label: "DONE",      bg: "#F1F5F9", fg: SLATE },
+};
+type StatusKey = keyof typeof STATUS;
 
-// ── Screen ────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 export default function OfflineBookingReceipt() {
-  const { id } = useLocalSearchParams<{ id: string }>();
+  const insets = useSafeAreaInsets();
+  const { id } = useLocalSearchParams();
   const router = useRouter();
-  const receiptRef = useRef<ViewShot>(null);
+  const shotRef = useRef<any>(null);
 
-  const [booking, setBooking] = useState<OfflineBooking | null>(null);
-  const [loading, setLoading]   = useState(true);
+  const [booking, setBooking] = useState<any>(null);
+  const [turf, setTurf] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [sharing, setSharing] = useState(false);
+  const [, setTick] = useState(0);
 
-  useEffect(() => { fetchBooking(); }, []);
+  useEffect(() => { load(); }, []);
+  useEffect(() => { const t = setInterval(() => setTick(x => x + 1), 60000); return () => clearInterval(t); }, []);
 
-  const fetchBooking = async () => {
+  const load = async () => {
     try {
-      setLoading(true);
       const snap = await getDoc(doc(db, "blockedSlots", String(id)));
       if (snap.exists()) {
-        setBooking({ id: snap.id, ...snap.data() } as OfflineBooking);
-      } else {
-        setBooking(null);
+        const b: any = { id: snap.id, ...snap.data() };
+        setBooking(b);
+        if (b.turfId) {
+          try { const t = await getDoc(doc(db, "turfs", b.turfId)); if (t.exists()) setTurf(t.data()); } catch {}
+        }
       }
-    } catch (e) {
-      console.log(e);
-      setBooking(null);
-    } finally {
-      setLoading(false);
-    }
+    } catch (e) { console.log(e); }
+    finally { setLoading(false); }
   };
 
-  const shareReceipt = async () => {
+  const share = async () => {
     try {
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      const uri = await (receiptRef.current as any).capture();
-      await Sharing.shareAsync(uri);
+      setSharing(true);
+      await new Promise(r => setTimeout(r, 250));
+      const uri = await (shotRef.current as any)?.capture?.();
+      if (!uri) throw new Error("capture failed");
+      await Sharing.shareAsync(uri, { mimeType: "image/png", dialogTitle: "Share receipt" });
     } catch (e) {
       console.log(e);
-      Alert.alert("Error", "Unable to share receipt.");
+      Alert.alert("Error", "Unable to share the receipt.");
+    } finally {
+      setSharing(false);
     }
   };
 
-  // ── Derived values ─────────────────────────────────────────────────────────
-  const totalAmount     = Number(booking?.totalAmount ?? booking?.amount ?? 0);
-  const paidAmount      = Number(booking?.paidAmount  ?? booking?.advanceAmount ?? 0);
-  const remainingAmount = Number(
-    booking?.remainingAmount !== undefined
-      ? booking.remainingAmount
-      : Math.max(totalAmount - paidAmount, 0)
-  );
-
-  const slots = Array.isArray(booking?.slots)
-    ? booking!.slots
-    : booking?.slotTime
-    ? [booking!.slotTime]
-    : [];
-
-  const paymentLabel = useMemo(() => {
-    if (remainingAmount <= 0 || booking?.remainingCollected) return "Fully Paid (Cash)";
-    if (paidAmount > 0) return "Partial (Advance Paid)";
-    return "Pending";
-  }, [booking, paidAmount, remainingAmount]);
-
-  const paymentColor = useMemo(() => {
-    if (remainingAmount <= 0 || booking?.remainingCollected) return "#0A7D57";
-    if (paidAmount > 0) return "#B76E00";
-    return "#D92D20";
-  }, [booking, paidAmount, remainingAmount]);
-
-  // ── Loading ────────────────────────────────────────────────────────────────
   if (loading) {
     return (
-      <SafeAreaView style={styles.center}>
-        <StatusBar barStyle="dark-content" backgroundColor="#F3F4F6" />
-        <ActivityIndicator size="large" color="#111111" />
-        <Text style={styles.loaderText}>Loading receipt...</Text>
-      </SafeAreaView>
+      <View style={s.center}>
+        <StatusBar barStyle="dark-content" />
+        <ActivityIndicator size="large" color={BRAND} />
+        <Text style={s.loadTxt}>Loading receipt…</Text>
+      </View>
     );
   }
-
   if (!booking) {
     return (
-      <SafeAreaView style={styles.center}>
-        <StatusBar barStyle="dark-content" backgroundColor="#F3F4F6" />
-        <Text style={styles.emptyTitle}>Booking not found</Text>
-        <TouchableOpacity style={styles.backButton} onPress={() => router.back()}>
-          <Text style={styles.backButtonText}>Go Back</Text>
-        </TouchableOpacity>
-      </SafeAreaView>
+      <View style={[s.center, { paddingHorizontal: 32 }]}>
+        <StatusBar barStyle="dark-content" />
+        <Ionicons name="alert-circle-outline" size={40} color={FAINT} />
+        <Text style={s.nfTitle}>Booking not found</Text>
+        <Text style={s.nfSub}>It may have been removed.</Text>
+        <TouchableOpacity style={s.nfBtn} onPress={() => router.back()}><Text style={s.nfBtnTxt}>Go back</Text></TouchableOpacity>
+      </View>
     );
   }
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  // ── Derived ──
+  const slots: string[] = Array.isArray(booking.slots) && booking.slots.length ? booking.slots : [booking.slotTime].filter(Boolean);
+  const range = minsRange(slots, turf);
+  const day = toDate(booking.date) ?? toDate(booking.dateString);
+  const dayMs = day ? dayStart(day) : null;
+  const now = Date.now();
+  const endAbs = dayMs !== null ? dayMs + (range ? range.end : 1440) * 60000 : null;
+  const status: StatusKey = endAbs !== null && now >= endAbs ? "completed" : "confirmed";
+  const st = STATUS[status];
+
+  // FIX: Block Slots saves amount = advance taken, remainingAmount = still to collect
+  const advance = Number(booking.paidAmount ?? booking.advanceAmount ?? booking.amount ?? 0) || 0;
+  const remainingRaw = Number(booking.remainingAmount ?? 0) || 0;
+  const total = Number(booking.totalAmount ?? 0) || advance + remainingRaw;
+  const collected = !!booking.remainingCollected;
+  const due = collected ? 0 : remainingRaw;
+  const paid = collected ? total : advance;
+  const payLabel = due <= 0 ? "Walk-in · Paid" : advance > 0 ? "Walk-in · Advance" : "Walk-in · Cash";
+
+  const phone: string = booking.customerPhone || "";
+  const phoneOpen = !!phone;
+  const name = booking.customerName || "Walk-in";
+  const dateTitle = day ? day.toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "long", year: "numeric" }).toUpperCase() : "DATE NOT AVAILABLE";
+  const location = turf?.location || turf?.address || "";
+  const created = fmtCreated(booking.createdAt);
+  const isCancelled = false;
+  const series = booking.isRecurring
+    ? (booking.recurrenceIndex && booking.recurrenceTotal ? `Session ${booking.recurrenceIndex} of ${booking.recurrenceTotal}` : "Recurring")
+    : "";
+
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <StatusBar barStyle="dark-content" backgroundColor="#F3F4F6" />
-
-      <ScrollView
-        style={styles.container}
-        contentContainerStyle={styles.content}
-        showsVerticalScrollIndicator={false}
-      >
-        {/* TOP BAR */}
-        <Animated.View entering={FadeInDown.duration(150)} style={styles.topBar}>
-          <TouchableOpacity style={styles.iconBtn} onPress={() => router.back()}>
-            <Ionicons name="arrow-back" size={20} color="#111111" />
-          </TouchableOpacity>
-          <Text style={styles.topBarTitle}>Walk-in Receipt</Text>
-          <View style={styles.iconBtnPlaceholder} />
-        </Animated.View>
-
-        {/* OFFLINE BADGE */}
-        <Animated.View entering={FadeInDown.delay(80).duration(200)} style={styles.offlineBadgeWrap}>
-          <View style={styles.offlineBadge}>
-            <Ionicons name="person-outline" size={13} color="#0F766E" />
-            <Text style={styles.offlineBadgeText}>WALK-IN / CASH BOOKING</Text>
+    <View style={s.root}>
+      <StatusBar barStyle="light-content" backgroundColor={BRAND} />
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: insets.bottom + 30 }}>
+        {/* Green turf area: header + ticket (this part is shared as image) */}
+        <View style={s.turf}>
+          <Stripes />
+          <View style={[s.headerRow, { paddingTop: insets.top + 10 }]}>
+            <TouchableOpacity style={s.hBtn} onPress={() => router.back()} accessibilityLabel="Back">
+              <Ionicons name="arrow-back" size={20} color="#fff" />
+            </TouchableOpacity>
+            <View style={{ flex: 1 }}>
+              <Text style={s.hKicker}>WALK-IN BOOKING</Text>
+              <Text style={s.hTitle}>Receipt</Text>
+            </View>
+            <TouchableOpacity style={s.hBtn} onPress={share} disabled={sharing} accessibilityLabel="Share receipt">
+              {sharing ? <ActivityIndicator color="#fff" size="small" /> : <Ionicons name="share-outline" size={19} color="#fff" />}
+            </TouchableOpacity>
           </View>
-        </Animated.View>
 
-        {/* RECEIPT CARD (captured for share) */}
-        <ViewShot
-          ref={receiptRef}
-          options={{ format: "png", quality: 1 }}
-          style={{ backgroundColor: "#FFFFFF", padding: 16 }}
-        >
-          <Animated.View
-            entering={FadeInDown.delay(100).duration(300)}
-            style={styles.receiptCard}
-          >
-            {/* Header */}
-            <View style={styles.receiptHeader}>
-              <View>
-                <Text style={styles.receiptTitle}>PLAYON </Text>
-                
-              </View>
-              <Ionicons name="person-circle-outline" size={34} color="#0F766E" />
-            </View>
+          <ViewShot ref={shotRef} options={{ format: "png", quality: 1 }} style={s.shot}>
+            <Stripes />
+            <View style={s.ticketWrap}>
+              {/* Top part */}
+              <View style={s.ticketTop}>
+                <View style={s.brandRow}>
+                  <Image source={PLAYON_LOGO} style={s.logo} resizeMode="contain" accessibilityLabel="Playon logo" />
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.brand}>Playon</Text>
+                    <Text style={s.brandSub} numberOfLines={1}>Turf & Sport Booking App</Text>
+                  </View>
+                  <View style={[s.stamp, { backgroundColor: st.bg }]}><Text style={[s.stampTxt, { color: st.fg }]}>● {st.label}</Text></View>
+                </View>
 
-            <View style={styles.dashedLine} />
-
-            {/* Customer info */}
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Customer</Text>
-              <Text style={styles.receiptValue}>{booking.customerName || "Walk-in"}</Text>
-            </View>
-
-          {/*  {booking.customerPhone ? (
-              <View style={styles.receiptRow}>
-                <Text style={styles.receiptLabel}>Phone</Text>
-                <Text style={styles.receiptValue}>{booking.customerPhone}</Text>
-              </View>
-            ) : null} */}
-
-       {/*     {booking.note ? (
-              <View style={styles.receiptRow}>
-                <Text style={styles.receiptLabel}>Note</Text>
-                <Text style={[styles.receiptValue, styles.noteValue]}>{booking.note}</Text>
-              </View>
-            ) : null} */}
-
-            <View style={styles.dashedLine} />
-
-            {/* Booking details */}
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Venue</Text>
-              <Text style={styles.receiptValue}>{booking.turfName || "N/A"}</Text>
-            </View>
-
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Date</Text>
-              <Text style={styles.receiptValue}>{formatDate(booking.date)}</Text>
-            </View>
-
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Slot</Text>
-              <Text style={[styles.receiptValue, styles.slotValue]}>
-                {slots.length > 0 ? formatSlotRange(slots) : "Slot not available"}
-              </Text>
-            </View>
-
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Booking ID</Text>
-              <Text style={[styles.receiptValue, { maxWidth: "58%", textAlign: "right" }]}>
-                {booking.id}
-              </Text>
-            </View>
-
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Booking Type</Text>
-              <Text style={styles.receiptValue}>Offline / Cash</Text>
-            </View>
-
-           {/* <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Arrived</Text>
-              <Text style={[styles.receiptValue, { color: booking.arrived ? "#0A7D57" : "#6B7280" }]}>
-                {booking.arrived ? "Yes ✓" : "Not yet"}
-              </Text>
-            </View>*/}
-
-            <View style={styles.dashedLine} />
-
-            {/* Payment breakdown 
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Cash Paid</Text>
-              <Text style={[styles.receiptValue, { color: "#0A7D57" }]}>
-                {fmtAmount(paidAmount)}
-              </Text>
-            </View>*/}
-
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Remaining</Text>
-              <Text style={[
-                styles.receiptValue,
-                {
-                  color: remainingAmount > 0 && !booking.remainingCollected ? "#D92D20" : "#9CA3AF",
-                  textDecorationLine: booking.remainingCollected ? "line-through" : "none",
-                },
-              ]}>
-                {fmtAmount(remainingAmount)}
-              </Text>
-            </View>
-
-            <View style={styles.receiptRow}>
-              <Text style={[styles.receiptLabel, { fontWeight: "800", color: "#111111" }]}>
-                advance
-              </Text>
-              <Text style={[styles.receiptValue, { fontSize: 18 }]}>
-                {fmtAmount(totalAmount)}
-              </Text>
-            </View>
-
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Payment Status</Text>
-              <Text style={[styles.receiptValue, { color: paymentColor }]}>{paymentLabel}</Text>
-            </View>
-
-            {booking.remainingCollected && (
-              <View style={styles.collectedBanner}>
-                <Ionicons name="checkmark-circle" size={14} color="#0A7D57" />
-                <Text style={styles.collectedBannerText}>
-                  Full amount collected at venue
+                <Text style={s.dateTitle}>{dateTitle}</Text>
+                <Text style={[s.bigTime, isCancelled && { textDecorationLine: "line-through", color: FAINT }]}>
+                  {range ? rangeTxt(range.start, range.end) : booking.slotTime || "Time not available"}
                 </Text>
+                <View style={s.pillRow}>
+                  {range && <View style={[s.pill, { backgroundColor: "#F1F5F9" }]}><Text style={[s.pillTxt, { color: SLATE }]}>{hrsTxt(range.end - range.start)}</Text></View>}
+                  <View style={[s.pill, { backgroundColor: "#EEF2FF" }]}><Text style={[s.pillTxt, { color: "#4338CA" }]}>{payLabel}</Text></View>
+                  {!!series && <View style={[s.pill, { backgroundColor: "#ECFDF5" }]}><Text style={[s.pillTxt, { color: "#047857" }]}>↻ {series}</Text></View>}
+                  {booking.rescheduled && <View style={[s.pill, { backgroundColor: "#F5F3FF" }]}><Text style={[s.pillTxt, { color: "#6D28D9" }]}>Rescheduled</Text></View>}
+                </View>
+
+                <View style={s.infoRow}>
+                  <View style={s.infoBox}>
+                    <Text style={s.infoLbl}>TURF</Text>
+                    <Text style={s.infoVal} numberOfLines={2}>{booking.turfName || turf?.name || "—"}</Text>
+                    {!!location && <Text style={s.infoSub} numberOfLines={2}>{location}</Text>}
+                  </View>
+                  <View style={s.infoBox}>
+                    <Text style={s.infoLbl}>CUSTOMER</Text>
+                    <Text style={s.infoVal} numberOfLines={2}>{name}</Text>
+                    <Text style={s.infoSub}>Walk-in</Text>
+                  </View>
+                </View>
               </View>
-            )}
 
-            <View style={styles.dashedLine} />
+              <TearLine />
 
-            <Text style={styles.receiptFooter}>Thank you for booking with Playon</Text>
-          </Animated.View>
-        </ViewShot>
+              {/* Bill */}
+              <View style={s.ticketBottom}>
+                <Text style={s.kicker}>BILL</Text>
+                <BillRow label="Total amount" value={rs(total)} strong />
+                <BillRow label={collected ? "Paid (cash)" : "Advance taken"} value={rs(paid)} color={BRAND} />
 
-        {/* ACTION BUTTONS */}
-        <Animated.View
-          entering={FadeInDown.delay(200).duration(300)}
-          style={styles.receiptCard}
-        >
-          <TouchableOpacity style={styles.shareBtn} onPress={shareReceipt}>
-            <Ionicons name="share-social-outline" size={18} color="#111111" />
-            <Text style={styles.shareBtnText}>Share Receipt</Text>
+                {isCancelled ? (
+                  <View style={[s.dueBox, { backgroundColor: "#FEF2F2", borderColor: "#FECACA" }]}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[s.dueLbl, { color: "#B91C1C" }]}>BOOKING CANCELLED</Text>
+                      <Text style={[s.dueSub, { color: "#991B1B" }]}>No game for this slot</Text>
+                    </View>
+                  </View>
+                ) : due > 0 ? (
+                  <View style={s.dueBox}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={s.dueLbl}>{status === "completed" ? "WAS DUE AT TURF" : "COLLECT AT TURF"}</Text>
+                      <Text style={s.dueSub}>{status === "completed" ? "Session has ended" : "Remaining from the customer"}</Text>
+                    </View>
+                    <Text style={s.dueAmt} numberOfLines={1} adjustsFontSizeToFit>{rs(due)}</Text>
+                  </View>
+                ) : (
+                  <View style={[s.dueBox, { backgroundColor: "#F0FDF4", borderColor: "#BBF7D0" }]}>
+                    <Ionicons name="checkmark-circle" size={22} color={BRAND} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={[s.dueLbl, { color: BRAND }]}>FULLY PAID</Text>
+                      <Text style={[s.dueSub, { color: "#166534" }]}>{collected ? "Full amount collected at the venue" : "Nothing to collect at the turf"}</Text>
+                    </View>
+                  </View>
+                )}
+
+                <View style={s.idRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.idLbl}>BOOKING ID</Text>
+                    <Text style={s.idVal} selectable numberOfLines={1}>{booking.id}</Text>
+                  </View>
+                  <Text style={s.idHint}>Show this at the turf</Text>
+                </View>
+                {!!created && <Text style={s.created}>Added by you · {created}</Text>}
+              </View>
+              <ZigZag />
+            </View>
+            <Text style={s.shotFoot}>Thank you for playing at {booking.turfName || turf?.name || "our turf"}</Text>
+          </ViewShot>
+        </View>
+
+        {/* Owner-only details (not in the shared image) */}
+        <View style={s.ownerCard}>
+          <Text style={s.kicker}>ONLY YOU SEE THIS</Text>
+          <View style={s.ownerRow}>
+            <View style={s.ownerIcon}><Ionicons name={phoneOpen ? "call-outline" : "lock-closed-outline"} size={17} color={phoneOpen ? BRAND : FAINT} /></View>
+            <View style={{ flex: 1 }}>
+              <Text style={s.ownerLbl}>{name} · phone</Text>
+              <Text style={[s.ownerVal, !phoneOpen && { color: FAINT }]}>
+                {phone || "Not added"}
+              </Text>
+            </View>
+          </View>
+          {!!booking.note && (
+            <View style={s.noteBox}><Text style={s.noteTxt}>“{booking.note}”</Text></View>
+          )}
+        </View>
+
+        {/* Actions */}
+        <View style={s.actRow}>
+          <TouchableOpacity style={[s.ghostBtn, !phoneOpen && { opacity: 0.6 }]} disabled={!phoneOpen}
+            onPress={() => Linking.openURL(`tel:${phone}`).catch(() => Alert.alert("Can't call", "Your phone could not start the call."))}>
+            <Ionicons name={phoneOpen ? "call-outline" : "lock-closed-outline"} size={16} color={phoneOpen ? INK : FAINT} />
+            <Text style={[s.ghostTxt, !phoneOpen && { color: FAINT }]}>{phoneOpen ? "Call customer" : "Call later"}</Text>
           </TouchableOpacity>
-        </Animated.View>
-
-        <View style={{ height: 40 }} />
+          <TouchableOpacity style={s.primaryBtn} onPress={share} disabled={sharing}>
+            {sharing ? <ActivityIndicator color="#fff" size="small" /> : <Ionicons name="share-outline" size={16} color="#fff" />}
+            <Text style={s.primaryTxt}>Share receipt</Text>
+          </TouchableOpacity>
+        </View>
       </ScrollView>
-    </SafeAreaView>
+    </View>
   );
 }
 
-// ── Styles ────────────────────────────────────────────────────────────────────
-const styles = StyleSheet.create({
-  safeArea:  { flex: 1, backgroundColor: "#F3F4F6" },
-  container: { flex: 1, backgroundColor: "#FFFFFF", paddingTop: 20 },
-  content:   { paddingBottom: 30 },
+// ── Pieces ──────────────────────────────────────────────────────────────────
+function Stripes() {
+  return (
+    <View style={StyleSheet.absoluteFill} pointerEvents="none">
+      <View style={{ flex: 1, flexDirection: "row", backgroundColor: BRAND }}>
+        {Array.from({ length: 16 }).map((_, i) => <View key={i} style={{ width: 40, backgroundColor: i % 2 ? STRIPE : BRAND }} />)}
+      </View>
+      <View style={s.pitchCircle} />
+    </View>
+  );
+}
+function TearLine() {
+  return (
+    <View style={s.tear}>
+      <View style={[s.notch, { left: -13 }]} />
+      <View style={[s.notch, { right: -13 }]} />
+      <View style={s.tearDash} />
+    </View>
+  );
+}
+function ZigZag() {
+  return (
+    <View style={s.zigWrap}>
+      {Array.from({ length: 40 }).map((_, i) => <View key={i} style={[s.zigTooth, { left: i * 12 - 3 }]} />)}
+    </View>
+  );
+}
+function BillRow({ label, value, color, strong }: { label: string; value: string; color?: string; strong?: boolean }) {
+  return (
+    <View style={s.billRow}>
+      <Text style={[s.billLbl, strong && { color: INK, fontWeight: "900", fontSize: 15 }]}>{label}</Text>
+      <Text style={[s.billVal, strong && { fontSize: 15 }, color ? { color } : null]}>{value}</Text>
+    </View>
+  );
+}
 
-  center: {
-    flex: 1, justifyContent: "center", alignItems: "center",
-    backgroundColor: "#F3F4F6", paddingHorizontal: 24,
-  },
-  loaderText: { marginTop: 12, color: "#4B5563", fontSize: 15, fontWeight: "600" },
-  emptyTitle: { fontSize: 22, fontWeight: "800", color: "#111111" },
+// ── Styles ──────────────────────────────────────────────────────────────────
+const s = StyleSheet.create({
+  root: { flex: 1, backgroundColor: PAGE },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: PAGE, gap: 8 },
+  loadTxt: { marginTop: 6, color: MUTED, fontSize: 15, fontWeight: "600" },
+  nfTitle: { fontSize: 17, fontWeight: "900", color: INK },
+  nfSub: { fontSize: 13, fontWeight: "600", color: MUTED },
+  nfBtn: { marginTop: 10, backgroundColor: BRAND, paddingHorizontal: 22, height: 46, borderRadius: 13, justifyContent: "center" },
+  nfBtnTxt: { color: "#fff", fontSize: 14, fontWeight: "800" },
 
-  topBar: {
-    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
-    paddingHorizontal: 16,
-    paddingTop: Platform.OS === "android" ? 12 : 8,
-    paddingBottom: 3,
-  },
-  iconBtn: {
-    width: 40, height: 40, borderRadius: 20,
-    backgroundColor: "#FFFFFF", justifyContent: "center", alignItems: "center",
-    borderWidth: 1, borderColor: "#E5E7EB",
-  },
-  iconBtnPlaceholder: { width: 40, height: 40 },
-  topBarTitle: { fontSize: 18, fontWeight: "800", color: "#111111" },
+  turf: { backgroundColor: BRAND, borderBottomLeftRadius: 28, borderBottomRightRadius: 28, overflow: "hidden", paddingBottom: 18 },
+  pitchCircle: { position: "absolute", alignSelf: "center", top: 230, width: 190, height: 190, borderRadius: 95, borderWidth: 2, borderColor: "rgba(255,255,255,0.12)" },
+  headerRow: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 16 },
+  hBtn: { width: 44, height: 44, borderRadius: 13, backgroundColor: "rgba(255,255,255,0.16)", alignItems: "center", justifyContent: "center" },
+  hKicker: { fontSize: 10, letterSpacing: 1.4, fontWeight: "800", color: ON_BRAND },
+  hTitle: { fontSize: 20, fontWeight: "900", color: "#fff" },
 
-  offlineBadgeWrap: { alignItems: "center", marginTop: 12 },
-  offlineBadge: {
-    flexDirection: "row", alignItems: "center", gap: 6,
-    backgroundColor: "#CCFBF1", borderRadius: 999,
-    paddingHorizontal: 14, paddingVertical: 6,
-    borderWidth: 1, borderColor: "#99F6E4",
-  },
-  offlineBadgeText: { fontSize: 11, fontWeight: "800", color: "#0F766E", letterSpacing: 0.8 },
+  shot: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 6, overflow: "hidden" },
+  ticketWrap: { shadowColor: INK, shadowOpacity: 0.22, shadowRadius: 18, shadowOffset: { width: 0, height: 10 }, elevation: 8 },
+  ticketTop: { backgroundColor: "#fff", borderTopLeftRadius: 22, borderTopRightRadius: 22, paddingHorizontal: 18, paddingTop: 18, paddingBottom: 8 },
+  brandRow: { flexDirection: "row", alignItems: "center", gap: 10 },
+  logo: { width: 44, height: 44 },
+  brand: { fontSize: 18, fontWeight: "900", letterSpacing: -0.2, color: INK },
+  brandSub: { fontSize: 11, fontWeight: "700", color: MUTED },
+  stamp: { height: 28, paddingHorizontal: 10, borderRadius: 999, justifyContent: "center" },
+  stampTxt: { fontSize: 11, fontWeight: "900", letterSpacing: 0.4 },
+  dateTitle: { textAlign: "center", fontSize: 12, fontWeight: "800", color: MUTED, letterSpacing: 0.8, marginTop: 18 },
+  bigTime: { textAlign: "center", fontSize: 30, fontWeight: "900", color: INK, letterSpacing: -0.6, marginTop: 4 },
+  pillRow: { flexDirection: "row", flexWrap: "wrap", justifyContent: "center", gap: 6, marginTop: 8 },
+  pill: { height: 24, paddingHorizontal: 9, borderRadius: 999, justifyContent: "center" },
+  pillTxt: { fontSize: 11, fontWeight: "800" },
+  infoRow: { flexDirection: "row", gap: 8, marginTop: 16 },
+  infoBox: { flex: 1, backgroundColor: "#F5F7FA", borderRadius: 13, paddingHorizontal: 12, paddingVertical: 10 },
+  infoLbl: { fontSize: 10, fontWeight: "800", color: MUTED, letterSpacing: 0.6 },
+  infoVal: { fontSize: 14, fontWeight: "900", color: INK, marginTop: 2 },
+  infoSub: { fontSize: 11, fontWeight: "600", color: MUTED },
 
-  receiptCard: {
-    backgroundColor: "#FFFFFF",
-    marginHorizontal: 16, marginTop: 16,
-    borderRadius: 24, padding: 18,
-    borderWidth: 1, borderColor: "#E5E7EB",
-  },
+  tear: { height: 26, backgroundColor: "#fff", justifyContent: "center" },
+  notch: { position: "absolute", top: 0, width: 26, height: 26, borderRadius: 13, backgroundColor: BRAND },
+  tearDash: { marginHorizontal: 20, borderTopWidth: 2, borderStyle: "dashed", borderColor: "#E2E8F0" },
 
-  receiptHeader: {
-    flexDirection: "row", justifyContent: "space-between", alignItems: "center",
-  },
-  receiptTitle: { fontSize: 18, fontWeight: "800", color: "#111111", letterSpacing: 1 },
-  receiptSub:   { fontSize: 13, color: "#6B7280", marginTop: 2, fontWeight: "500" },
+  ticketBottom: { backgroundColor: "#fff", paddingHorizontal: 18, paddingTop: 6, paddingBottom: 14 },
+  kicker: { fontSize: 10.5, letterSpacing: 0.9, fontWeight: "800", color: MUTED, marginBottom: 6 },
+  billRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 6, gap: 10 },
+  billLbl: { flex: 1, fontSize: 13.5, fontWeight: "700", color: SLATE },
+  billVal: { fontSize: 13.5, fontWeight: "900", color: INK },
+  dueBox: { marginTop: 10, flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: "#FFF7ED", borderWidth: 1, borderColor: "#FED7AA", borderRadius: 14, padding: 12 },
+  dueLbl: { fontSize: 10.5, fontWeight: "900", color: "#C2410C", letterSpacing: 0.6 },
+  dueSub: { fontSize: 11.5, fontWeight: "600", color: "#9A3412", marginTop: 1 },
+  dueAmt: { fontSize: 24, fontWeight: "900", color: "#9A3412", maxWidth: 140 },
+  idRow: { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 14, paddingTop: 12, borderTopWidth: 1, borderStyle: "dashed", borderColor: "#E2E8F0" },
+  idLbl: { fontSize: 10, fontWeight: "800", color: FAINT, letterSpacing: 0.6 },
+  idVal: { fontSize: 12, fontWeight: "700", color: "#334155", fontFamily: Platform.OS === "ios" ? "Courier" : "monospace" },
+  idHint: { fontSize: 10.5, fontWeight: "700", color: FAINT },
+  created: { fontSize: 10.5, fontWeight: "600", color: FAINT, marginTop: 8 },
+  zigWrap: { height: 8, overflow: "hidden" },
+  zigTooth: { position: "absolute", top: -6, width: 12, height: 12, backgroundColor: "#fff", transform: [{ rotate: "45deg" }] },
+  shotFoot: { textAlign: "center", color: ON_BRAND, fontSize: 12, fontWeight: "800", marginTop: 12, marginBottom: 6 },
 
-  dashedLine: {
-    borderStyle: "dashed", borderWidth: 1,
-    borderColor: "#D1D5DB", marginVertical: 16,
-  },
+  ownerCard: { backgroundColor: "#fff", borderRadius: 18, marginHorizontal: 16, marginTop: 16, padding: 14, shadowColor: INK, shadowOpacity: 0.06, shadowRadius: 12, shadowOffset: { width: 0, height: 2 }, elevation: 2 },
+  ownerRow: { flexDirection: "row", alignItems: "center", gap: 10 },
+  ownerIcon: { width: 38, height: 38, borderRadius: 12, backgroundColor: "#F1F5F9", alignItems: "center", justifyContent: "center" },
+  ownerLbl: { fontSize: 11.5, fontWeight: "700", color: MUTED },
+  ownerVal: { fontSize: 14.5, fontWeight: "900", color: INK },
+  noteBox: { marginTop: 10, backgroundColor: "#F5F7FA", borderRadius: 12, paddingHorizontal: 12, paddingVertical: 10 },
+  noteTxt: { fontSize: 12.5, fontWeight: "600", color: SLATE },
 
-  receiptRow: {
-    flexDirection: "row", justifyContent: "space-between",
-    alignItems: "flex-start", marginBottom: 12,
-  },
-  receiptLabel: { color: "#6B7280", fontSize: 14 },
-  receiptValue: { color: "#111111", fontSize: 14, fontWeight: "800" },
-
-  slotValue: {
-    maxWidth: "68%", textAlign: "right", lineHeight: 22, flexWrap: "wrap",
-  },
-  noteValue: {
-    maxWidth: "60%", textAlign: "right", lineHeight: 20,
-    fontWeight: "600", color: "#374151",
-  },
-
-  collectedBanner: {
-    flexDirection: "row", alignItems: "center", gap: 6,
-    backgroundColor: "#F0FDF4", borderRadius: 10,
-    paddingHorizontal: 12, paddingVertical: 8,
-    marginTop: 4, marginBottom: 4,
-    borderWidth: 1, borderColor: "#BBF7D0",
-  },
-  collectedBannerText: { fontSize: 12, color: "#0A7D57", fontWeight: "600", flex: 1 },
-
-  receiptFooter: {
-    textAlign: "center", color: "#6B7280", fontSize: 13, fontWeight: "600",
-  },
-
-  shareBtn: {
-    backgroundColor: "#FFFFFF", borderWidth: 1, borderColor: "#E5E7EB",
-    paddingVertical: 14, borderRadius: 14,
-    alignItems: "center", justifyContent: "center",
-    flexDirection: "row",
-  },
-  shareBtnText: { marginLeft: 8, color: "#111111", fontWeight: "700", fontSize: 14 },
-
-  backButton: {
-    marginTop: 16, backgroundColor: "#111111",
-    paddingHorizontal: 18, paddingVertical: 12, borderRadius: 12,
-  },
-  backButtonText: { color: "#FFFFFF", fontWeight: "700" },
+  actRow: { flexDirection: "row", gap: 8, marginHorizontal: 16, marginTop: 14 },
+  ghostBtn: { flex: 1, height: 50, borderRadius: 14, borderWidth: 1, borderColor: "#E2E8F0", backgroundColor: "#fff", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 },
+  ghostTxt: { fontSize: 14, fontWeight: "800", color: INK },
+  primaryBtn: { flex: 1, height: 50, borderRadius: 14, backgroundColor: BRAND, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 },
+  primaryTxt: { fontSize: 14, fontWeight: "800", color: "#fff" },
 });

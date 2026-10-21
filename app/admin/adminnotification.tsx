@@ -1,9 +1,10 @@
 import React, { useEffect, useState, useMemo, useCallback } from "react";
 import {
-  View, Text, StyleSheet, SafeAreaView, StatusBar, FlatList,
+  View, Text, StyleSheet, StatusBar, FlatList,
   TouchableOpacity, Alert, ActivityIndicator, RefreshControl,
   Modal, ScrollView, Platform,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { collection, getDocs, query, where, orderBy, limit, updateDoc, doc, serverTimestamp } from "firebase/firestore";
 import { db } from "../../firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
@@ -496,6 +497,7 @@ const TicketCard = React.memo(function TicketCard({ item, onPress }: {
 
 // ─── Main Screen ──────────────────────────────────────────────────────────────
 export default function AdminNotificationCenter() {
+  const insets = useSafeAreaInsets();
   const [tab,          setTab]          = useState<Tab>("cancellations");
   const [cancellations,setCancellations]= useState<CancelledBooking[]>([]);
   const [tickets,      setTickets]      = useState<SupportTicket[]>([]);
@@ -558,7 +560,7 @@ export default function AdminNotificationCenter() {
   const listData = showCancellations ? cancellations : tickets;
 
   return (
-    <SafeAreaView style={s.root}>
+    <View style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
       <FlatList
@@ -577,7 +579,7 @@ export default function AdminNotificationCenter() {
         ListHeaderComponent={
           <View>
             {/* ── Dark header ── */}
-            <View style={s.header}>
+              <View style={[s.header, { paddingTop: insets.top + 12 }]}>
               <View>
                 <Text style={s.headerTag}>Admin · Notifications</Text>
                 <Text style={s.headerTitle}>Notification Center</Text>
@@ -704,7 +706,7 @@ export default function AdminNotificationCenter() {
 
       <CancelDetailModal item={selCancel} visible={cancelModal} onClose={() => setCancelModal(false)} />
       <TicketDetailModal item={selTicket} visible={ticketModal} onClose={() => setTicketModal(false)} />
-    </SafeAreaView>
+    </View>
   );
 }
 

@@ -2,7 +2,7 @@ import {
   View,
   Text,
   StyleSheet,
-  SafeAreaView,
+  
   StatusBar,
   ScrollView,
   TouchableOpacity,
@@ -14,6 +14,7 @@ import {
   LayoutAnimation,
   UIManager,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useEffect, useRef, useState } from "react";
 import { auth, db } from "../../firebaseConfig";
 import { doc, getDoc, addDoc, collection, serverTimestamp } from "firebase/firestore";
@@ -36,7 +37,7 @@ const CONTACTS = [
     color:   "#25D366",
     bg:      "#F0FDF4",
     border:  "#BBF7D0",
-    action:  () => Linking.openURL("https://wa.me/919999999998?text=Hi%20Playon%2C%20I%20am%20a%20turf%20owner%20and%20need%20support"),
+    action:  () => Linking.openURL("https://wa.me/918055955805?text=Hi%20Playon%2C%20I%20am%20a%20turf%20owner%20and%20need%20support"),
   },
   {
     icon:    "mail-outline" as const,
@@ -45,7 +46,7 @@ const CONTACTS = [
     color:   OWNER_ACCENT,
     bg:      "#F0FDFA",
     border:  "#99F6E4",
-    action:  () => Linking.openURL("mailto:owners@playon.app?subject=Turf%20Owner%20Support%20Request"),
+    action:  () => Linking.openURL("mailto:playonsport03@gmail.com.app?subject=Turf%20Owner%20Support%20Request"),
   },
   {
     icon:    "call-outline" as const,
@@ -54,7 +55,7 @@ const CONTACTS = [
     color:   "#7C3AED",
     bg:      "#F5F3FF",
     border:  "#DDD6FE",
-    action:  () => Linking.openURL("tel:+919999999998"),
+    action:  () => Linking.openURL("tel:+918055955805"),
   },
   {
     icon:    "document-text-outline" as const,
@@ -177,6 +178,7 @@ const CATEGORIES = [
 
 // ─── Main screen ──────────────────────────────────────────────────────────────
 export default function OwnerSupport() {
+    const insets = useSafeAreaInsets();
   const router = useRouter();
 
   const [ownerName,   setOwnerName]   = useState("");
@@ -265,13 +267,13 @@ export default function OwnerSupport() {
     : FAQS.filter(f => f.category === faqCat);
 
   return (
-    <SafeAreaView style={s.root}>
+    <View style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={BRAND} />
 
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={s.scroll}>
+      <ScrollView keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive" automaticallyAdjustKeyboardInsets showsVerticalScrollIndicator={false} contentContainerStyle={s.scroll}>
 
         {/* ── Header ──────────────────────────────────────────────────── */}
-        <View style={s.header}>
+        <View style={[s.header, { paddingTop: insets.top + 12 }]}>
           <TouchableOpacity style={s.backBtn} onPress={() => router.back()} activeOpacity={0.7}>
             <Ionicons name="arrow-back" size={20} color="#fff" />
           </TouchableOpacity>
@@ -521,7 +523,7 @@ export default function OwnerSupport() {
         </View>
 
       </ScrollView>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -533,7 +535,7 @@ const s = StyleSheet.create({
   header: {
     backgroundColor: BRAND,
     paddingHorizontal: 20,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) + 12 : 16,
+    
     paddingBottom: 32,
   },
   backBtn: {

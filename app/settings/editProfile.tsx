@@ -4,7 +4,6 @@ import {
   TextInput,
   TouchableOpacity,
   StyleSheet,
-  SafeAreaView,
   StatusBar,
   ScrollView,
   ActivityIndicator,
@@ -12,14 +11,20 @@ import {
   Platform,
   KeyboardAvoidingView,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
 import { useEffect, useRef, useState } from "react";
 import { auth, db } from "../../firebaseConfig";
 import { doc, getDoc, updateDoc } from "firebase/firestore";
+import { getIdToken, signOut } from "firebase/auth";
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 
 // ─── Brand ────────────────────────────────────────────────────────────────────
 const BRAND = "#0B1220";
+
+// ─── Backend ──────────────────────────────────────────────────────────────────
+const SERVER_URL = "https://bookora-backend-95u4.onrender.com";
 
 // ─── Avatar initials ──────────────────────────────────────────────────────────
 const getInitials = (name: string) =>
@@ -98,10 +103,12 @@ function Field({
 
 // ─── Main screen ──────────────────────────────────────────────────────────────
 export default function EditProfile() {
+  const insets = useSafeAreaInsets();
   const router = useRouter();
 
-  const [loading, setLoading] = useState(true);
-  const [saving,  setSaving]  = useState(false);
+  const [loading,  setLoading]  = useState(true);
+  const [saving,   setSaving]   = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   const [name,     setName]     = useState("");
   const [phone,    setPhone]    = useState("");
@@ -169,6 +176,53 @@ export default function EditProfile() {
     }
   };
 
+  // ── Delete Account (Apple Guideline 5.1.1(v)) ──────────────────────────────
+  const handleDeleteAccount = () => {
+    Alert.alert(
+      "Delete Account?",
+      "This will permanently delete your account and profile. Your past booking records are kept for venue accounting.\n\nThis cannot be undone.",
+      [
+        { text: "Cancel", style: "cancel" },
+        { text: "Delete My Account", style: "destructive", onPress: confirmDeleteAccount },
+      ]
+    );
+  };
+
+  const confirmDeleteAccount = async () => {
+    try {
+      const user = auth.currentUser;
+      if (!user) { Alert.alert("Error", "Not logged in."); return; }
+
+      setDeleting(true);
+
+      // Get the token BEFORE deletion (account won't exist afterwards)
+      const token = await getIdToken(user);
+
+      const res = await fetch(`${SERVER_URL}/delete-my-account`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      let data: any = {};
+      try { data = await res.json(); } catch {}
+
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || "Could not delete account. Please try again.");
+      }
+
+      // Auth account is gone on the server — local signOut may throw, ignore it
+      await signOut(auth).catch(() => {});
+
+      Alert.alert("Account Deleted", "Your account has been permanently deleted.", [
+        { text: "OK", onPress: () => router.replace("/(auth)/login") },
+      ]);
+    } catch (e: any) {
+      Alert.alert("Error", e?.message || "Something went wrong. Please try again.");
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   // ── Loading ────────────────────────────────────────────────────────────────
   if (loading) {
     return (
@@ -181,20 +235,20 @@ export default function EditProfile() {
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
-    <SafeAreaView style={s.root}>
+    <View style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={BRAND} />
 
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior={Platform.OS === "ios" ? "padding" : undefined}
       >
-        <ScrollView
+        <ScrollView keyboardDismissMode="interactive"
           showsVerticalScrollIndicator={false}
           contentContainerStyle={s.scroll}
           keyboardShouldPersistTaps="handled"
         >
           {/* ── Header ──────────────────────────────────────────────────── */}
-          <View style={s.header}>
+           <View style={[s.header, { paddingTop: insets.top + 12 }]}>
             {/* Back button */}
             <TouchableOpacity
               style={s.backBtn}
@@ -305,9 +359,34 @@ export default function EditProfile() {
             </TouchableOpacity>
           </View>
 
+          {/* ── Danger Zone ─────────────────────────────────────────────── */}
+          <View style={s.dangerBlock}>
+            <Text style={s.groupLabel}>Danger Zone</Text>
+
+            <TouchableOpacity
+              style={[s.deleteBtn, deleting && s.saveBtnDisabled]}
+              onPress={handleDeleteAccount}
+              disabled={deleting || saving}
+              activeOpacity={0.85}
+            >
+              {deleting ? (
+                <ActivityIndicator size="small" color="#DC2626" />
+              ) : (
+                <>
+                  <Ionicons name="trash-outline" size={16} color="#DC2626" />
+                  <Text style={s.deleteBtnTxt}>Delete Account</Text>
+                </>
+              )}
+            </TouchableOpacity>
+
+            <Text style={s.deleteHint}>
+              Permanently deletes your account and profile. Booking history is kept for venue records.
+            </Text>
+          </View>
+
         </ScrollView>
       </KeyboardAvoidingView>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -321,13 +400,13 @@ const s = StyleSheet.create({
   header: {
     backgroundColor: BRAND,
     paddingHorizontal: 20,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) + 12 : 14,
+    
     paddingBottom: 32,
     alignItems: "center",
   },
   backBtn: {
     position: "absolute",
-    top: Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) + 12 : 14,
+    top: Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) + 20 : 25,
     left: 16,
     width: 38,
     height: 38,
@@ -412,4 +491,18 @@ const s = StyleSheet.create({
     backgroundColor: "#fff",
   },
   cancelBtnTxt: { fontSize: 15, fontWeight: "600", color: "#6B7280" },
+
+  // Danger zone
+  dangerBlock: { marginHorizontal: 16, marginTop: 32 },
+  deleteBtn: {
+    flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8,
+    paddingVertical: 14, borderRadius: 14,
+    borderWidth: 1, borderColor: "#FECACA",
+    backgroundColor: "#FEF2F2",
+  },
+  deleteBtnTxt: { fontSize: 15, fontWeight: "700", color: "#DC2626" },
+  deleteHint: {
+    fontSize: 11, color: "#9CA3AF",
+    textAlign: "center", marginTop: 8, lineHeight: 16, paddingHorizontal: 12,
+  },
 });

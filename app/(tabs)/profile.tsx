@@ -6,12 +6,13 @@ import {
   Image,
   ActivityIndicator,
   ScrollView,
-  SafeAreaView,
   StatusBar,
   Alert,
   Platform,
+  
 } from "react-native";
-import { useEffect, useMemo, useState } from "react";
+
+import { useEffect, useMemo, useState, useCallback } from "react";
 import { auth, db } from "../../firebaseConfig";
 import {
   doc,
@@ -23,10 +24,11 @@ import {
   setDoc,
 } from "firebase/firestore";
 import { signOut, onAuthStateChanged } from "firebase/auth";
-import { useRouter } from "expo-router";
+import { useRouter, useFocusEffect } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import * as Location from "expo-location";
 import { Share } from "react-native";
+import { useSafeAreaInsets, SafeAreaView } from "react-native-safe-area-context";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const isToday    = (d: Date) => d?.toDateString() === new Date().toDateString();
@@ -63,15 +65,19 @@ const MENU_ITEMS = [
 ];
 
 export default function Profile() {
+  const insets = useSafeAreaInsets();
   const [user,              setUser]              = useState<any>(null);
   const [userData,          setUserData]          = useState<any>(null);
   const [bookings,          setBookings]          = useState<any[]>([]);
   const [loading,           setLoading]           = useState(true);
   const [detectingLocation, setDetectingLocation] = useState(false);
   const [activityTab,       setActivityTab]       = useState<"today" | "upcoming" | "all">("today");
+  const [shareLink,         setShareLink]         = useState<string>("");
 
-  const [shareLink, setShareLink] = useState<string>("");
-  
+  // ── Wallet balances ──────────────────────────────────────────────────────────
+  const [pcoinBalance,  setPcoinBalance]  = useState<number>(0);
+  const [vcoinTotal,    setVcoinTotal]    = useState<number>(0);
+  const [walletLoading, setWalletLoading] = useState(false);
 
   const router = useRouter();
 
@@ -79,12 +85,20 @@ export default function Profile() {
     const unsub = onAuthStateChanged(auth, async (u) => {
       setUser(u);
       if (u) {
-  await Promise.all([fetchUser(u.uid), fetchBookings(u.uid), fetchAppConfig()]);
-}
+        await Promise.all([fetchUser(u.uid), fetchBookings(u.uid), fetchAppConfig()]);
+      }
       setLoading(false);
     });
     return unsub;
   }, []);
+
+  // ── Re-fetch wallet whenever screen comes into focus (after booking etc.) ────
+  useFocusEffect(
+    useCallback(() => {
+      const uid = auth.currentUser?.uid;
+      if (uid) fetchWalletBalances(uid);
+    }, [])
+  );
 
   const fetchUser = async (uid: string) => {
     try {
@@ -107,37 +121,54 @@ export default function Profile() {
   };
 
   const fetchAppConfig = async () => {
-  try {
-    const snap = await getDoc(doc(db, "appConfig", "general"));
-    if (snap.exists()) {
-      const rawLink = snap.data()?.shareLink || "";
-      console.log("shareLink from Firestore:", rawLink); // ← add this
-      setShareLink(rawLink.startsWith("http") ? rawLink : `https://${rawLink}`);
-    } else {
-      console.log("appConfig doc does not exist"); // ← add this
+    try {
+      const snap = await getDoc(doc(db, "appConfig", "general"));
+      if (snap.exists()) {
+        const rawLink = snap.data()?.shareLink || "";
+        setShareLink(rawLink.startsWith("http") ? rawLink : `https://${rawLink}`);
+      }
+    } catch (e) { console.error("fetchAppConfig error:", e); }
+  };
+
+  // ── Wallet fetch ──────────────────────────────────────────────────────────────
+  const fetchWalletBalances = async (uid: string) => {
+    setWalletLoading(true);
+    try {
+      // PCoin balance
+      const pcSnap = await getDoc(doc(db, "pcoinWallets", uid));
+      if (pcSnap.exists()) {
+        setPcoinBalance(Number(pcSnap.data().balance || 0));
+      } else {
+        setPcoinBalance(0);
+      }
+
+      // VCoin — sum across all turfs for this user
+      const vcSnap = await getDocs(
+        query(collection(db, "vcoinWallets"), where("uid", "==", uid))
+      );
+      const total = vcSnap.docs.reduce(
+        (sum, d) => sum + Number(d.data().balance || 0), 0
+      );
+      setVcoinTotal(total);
+    } catch (e) {
+      console.log("Wallet fetch error:", e);
+    } finally {
+      setWalletLoading(false);
     }
-  } catch (e) {
-    console.error("fetchAppConfig error:", e); // ← add this
-  }
-};
+  };
 
-const handleShare = async () => {
-  const rawLink = shareLink || "https://playon.app";
-  const link = rawLink.startsWith("http") ? rawLink : `https://${rawLink}`;
+  const handleShare = async () => {
+    const rawLink = shareLink || "https://playon.app";
+    const link    = rawLink.startsWith("http") ? rawLink : `https://${rawLink}`;
+    const message = `*PlayOn — Book Sports Venues!*\n\nFind and book turfs, courts & more near you instantly.\n\n  Download now: ${link}`;
+    try {
+      await Share.share({ message, title: "Play On — Book Sports Venues" });
+    } catch (e) {
+      Alert.alert("Error", "Unable to share right now.");
+    }
+  };
 
-  const message = `*PlayOn — Book Sports Venues!*\n\nFind and book turfs, courts & more near you instantly.\n\n  Download now: ${link}`;
-
-  try {
-    await Share.share({
-      message,
-      title: "Play On — Book Sports Venues",
-    });
-  } catch (e) {
-    Alert.alert("Error", "Unable to share right now.");
-  }
-};
-
-  // ── Location detect ──────────────────────────────────────────────────────────
+  // ── Location detect ───────────────────────────────────────────────────────────
   const getLocation = async () => {
     if (!user) return;
     setDetectingLocation(true);
@@ -157,21 +188,13 @@ const handleShare = async () => {
         const city = p.city || p.subregion || p.region || "";
         const area = p.district || p.subregion || p.street || p.name || "";
         const full = [area, city].filter(Boolean).join(", ") || city || "Unknown";
-
-        // ✅ FIX: save lat/lng so home screen can sort turfs by real distance
         await setDoc(doc(db, "users", user.uid), {
-          location:  full,
-          city,
-          area,
+          location:  full, city, area,
           latitude:  loc.coords.latitude,
           longitude: loc.coords.longitude,
         }, { merge: true });
-
         setUserData((prev: any) => ({
-          ...prev,
-          location:  full,
-          city,
-          area,
+          ...prev, location: full, city, area,
           latitude:  loc.coords.latitude,
           longitude: loc.coords.longitude,
         }));
@@ -183,23 +206,24 @@ const handleShare = async () => {
     }
   };
 
-  // ── Logout ───────────────────────────────────────────────────────────────────
+  // ── Logout ────────────────────────────────────────────────────────────────────
   const handleLogout = () => {
-    Alert.alert("Log out", "Are you sure you want to log out?", [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Log Out",
-        style: "destructive",
-        onPress: async () => {
-          try {
-            await signOut(auth);
-            router.replace("/(auth)/login");
-          } catch {
-            Alert.alert("Error", "Unable to log out. Try again.");
-          }
-        },
-      },
-    ]);
+    const doLogout = async () => {
+      try {
+        await signOut(auth);
+        router.replace("/(auth)/login");
+      } catch {
+        Alert.alert("Error", "Unable to log out. Try again.");
+      }
+    };
+    if (Platform.OS === "web") {
+      if (window.confirm("Are you sure you want to log out?")) doLogout();
+    } else {
+      Alert.alert("Log out", "Are you sure you want to log out?", [
+        { text: "Cancel", style: "cancel" },
+        { text: "Log Out", style: "destructive", onPress: doLogout },
+      ]);
+    }
   };
 
   const favoriteSport = useMemo(() => {
@@ -227,6 +251,7 @@ const handleShare = async () => {
       });
   }, [bookings, activityTab]);
 
+  // ── Loading / not logged in guards ────────────────────────────────────────────
   if (loading) {
     return (
       <SafeAreaView style={s.center}>
@@ -241,10 +266,10 @@ const handleShare = async () => {
       <SafeAreaView style={s.notLoggedIn}>
         <StatusBar barStyle="dark-content" backgroundColor="#F5F6FA" />
         <Ionicons name="person-circle-outline" size={72} color="#D1D5DB" />
-        <Text style={s.notLoggedInTitle}>You're not logged in</Text>
+        <Text style={s.notLoggedInTitle}>You're not logged in or create aacount</Text>
         <Text style={s.notLoggedInSub}>Log in to view your profile and bookings.</Text>
-        <TouchableOpacity style={s.loginBtn} onPress={() => router.replace("/(auth)/login")}>
-          <Text style={s.loginBtnTxt}>Log In</Text>
+        <TouchableOpacity style={s.loginBtn} onPress={() => router.replace("/(auth)/signup")}>
+          <Text style={s.loginBtnTxt}>Create Your Account</Text>
         </TouchableOpacity>
       </SafeAreaView>
     );
@@ -257,16 +282,17 @@ const handleShare = async () => {
     [userData?.area, userData?.city].filter(Boolean).join(", ") ||
     "Add your location";
 
-  const hasPhoto = !!userData?.photo;
+  const hasPhoto      = !!userData?.photo;
+  const totalCoins    = pcoinBalance + vcoinTotal;
 
   return (
-    <SafeAreaView style={s.root}>
+    <View style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor="#0B1220" />
 
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={s.scroll}>
 
         {/* ── Hero ── */}
-        <View style={s.hero}>
+        <View style={[s.hero, { paddingTop: insets.top + 14 }]}>
           <View style={s.heroTop}>
             <Text style={s.heroLabel}>Profile</Text>
             <TouchableOpacity
@@ -305,7 +331,6 @@ const handleShare = async () => {
                 </View>
               )}
 
-              {/* ✅ Location pill — tap to re-detect and update coords */}
               <TouchableOpacity
                 style={s.locPill}
                 onPress={getLocation}
@@ -328,9 +353,62 @@ const handleShare = async () => {
         {favoriteSport !== "—" && (
           <View style={s.sportRow}>
             <Ionicons name="trophy-outline" size={14} color="#D97706" />
-            <Text style={s.sportTxt}>Favourite sport: <Text style={{ fontWeight: "700", color: "#0B1220" }}>{favoriteSport}</Text></Text>
+            <Text style={s.sportTxt}>
+              Favourite sport: <Text style={{ fontWeight: "700", color: "#0B1220" }}>{favoriteSport}</Text>
+            </Text>
           </View>
         )}
+
+        {/* ══════════════════════════════════════════════════════════
+            WALLET CARD — tappable, opens wallet screen
+            Shows PCoin + VCoin totals at a glance
+        ══════════════════════════════════════════════════════════ */}
+        <TouchableOpacity
+          style={s.walletCard}
+          activeOpacity={0.82}
+          onPress={() => router.push("/(tabs)/wallet" as any)}
+        >
+          {/* Left: icon */}
+          <View style={s.walletIconWrap}>
+            <Text style={{ fontSize: 22 }}>🪙</Text>
+          </View>
+
+          {/* Centre: label + balances */}
+          <View style={{ flex: 1, marginLeft: 12 }}>
+            <Text style={s.walletTitle}>My Wallet</Text>
+
+            {walletLoading ? (
+              <ActivityIndicator size="small" color="#7C3AED" style={{ marginTop: 4, alignSelf: "flex-start" }} />
+            ) : totalCoins > 0 ? (
+              <>
+                <View style={s.walletPillsRow}>
+                  {pcoinBalance > 0 && (
+                    <View style={[s.walletPill, { backgroundColor: "#EDE9FE" }]}>
+                      <View style={[s.walletPillDot, { backgroundColor: "#7C3AED" }]} />
+                      <Text style={[s.walletPillTxt, { color: "#7C3AED" }]}>
+                        {pcoinBalance} PCoin
+                      </Text>
+                    </View>
+                  )}
+                  {vcoinTotal > 0 && (
+                    <View style={[s.walletPill, { backgroundColor: "#FEF3C7" }]}>
+                      <View style={[s.walletPillDot, { backgroundColor: "#D97706" }]} />
+                      <Text style={[s.walletPillTxt, { color: "#D97706" }]}>
+                        {vcoinTotal} VCoin
+                      </Text>
+                    </View>
+                  )}
+                </View>
+                
+              </>
+            ) : (
+              <Text style={s.walletEmpty}>Earn coins on your bookings</Text>
+            )}
+          </View>
+
+          {/* Right: arrow */}
+          <Ionicons name="chevron-forward" size={18} color="#D1D5DB" />
+        </TouchableOpacity>
 
         {/* ── Quick Actions ── */}
         <View style={s.section}>
@@ -341,10 +419,13 @@ const handleShare = async () => {
                 key={item.label}
                 style={[
                   s.menuRow,
-                  i === 0                      && s.menuRowFirst,
-                  i === MENU_ITEMS.length - 1  && s.menuRowLast,
+                  i === 0                     && s.menuRowFirst,
+                  i === MENU_ITEMS.length - 1 && s.menuRowLast,
                 ]}
-                onPress={() => item.tab ? router.replace(item.route as any) : router.push(item.route as any)}
+                onPress={() => item.tab
+                  ? router.replace(item.route as any)
+                  : router.push(item.route as any)
+                }
                 activeOpacity={0.7}
               >
                 <View style={s.menuIcon}>
@@ -375,22 +456,22 @@ const handleShare = async () => {
         </View>
 
         {/* ── Share App ── */}
-<TouchableOpacity
-  style={s.shareBtn}
-  onPress={handleShare}
-  activeOpacity={0.8}
->
-  <View style={s.shareBtnLeft}>
-    <View style={s.shareIconWrap}>
-      <Ionicons name="share-social-outline" size={20} color="#0B1220" />
-    </View>
-    <View>
-      <Text style={s.shareBtnTitle}>Share Playon & Earn </Text>
-      <Text style={s.shareBtnSub}>Invite friends to book sports venues</Text>
-    </View>
-  </View>
-  <Ionicons name="chevron-forward" size={16} color="#D1D5DB" />
-</TouchableOpacity>
+        <TouchableOpacity
+          style={s.shareBtn}
+          onPress={handleShare}
+          activeOpacity={0.8}
+        >
+          <View style={s.shareBtnLeft}>
+            <View style={s.shareIconWrap}>
+              <Ionicons name="share-social-outline" size={20} color="#0B1220" />
+            </View>
+            <View>
+              <Text style={s.shareBtnTitle}>Share Playon & Earn</Text>
+              <Text style={s.shareBtnSub}>Invite friends to book sports venues</Text>
+            </View>
+          </View>
+          <Ionicons name="chevron-forward" size={16} color="#D1D5DB" />
+        </TouchableOpacity>
 
         {/* ── Logout ── */}
         <TouchableOpacity style={s.logoutBtn} onPress={handleLogout} activeOpacity={0.8}>
@@ -401,7 +482,7 @@ const handleShare = async () => {
         <Text style={s.versionTxt}>Playon v1.0.1</Text>
 
       </ScrollView>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -419,16 +500,11 @@ const s = StyleSheet.create({
   loginBtn:         { marginTop: 24, backgroundColor: BRAND, paddingHorizontal: 32, paddingVertical: 13, borderRadius: 14 },
   loginBtnTxt:      { color: "#fff", fontWeight: "700", fontSize: 15 },
 
-  hero: {
-    backgroundColor: BRAND,
-    paddingHorizontal: 20,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) + 14 : 16,
-    paddingBottom: 28,
-  },
-  heroTop:    { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 20 },
-  heroLabel:  { fontSize: 13, fontWeight: "700", color: "#94A3B8", textTransform: "uppercase", letterSpacing: 0.8 },
-  editBtn:    { flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: "rgba(255,255,255,0.1)", borderWidth: 1, borderColor: "rgba(255,255,255,0.15)", paddingHorizontal: 14, paddingVertical: 7, borderRadius: 99 },
-  editBtnTxt: { fontSize: 13, fontWeight: "700", color: "#fff" },
+  hero:           { backgroundColor: BRAND, paddingHorizontal: 20, paddingBottom: 28 },
+  heroTop:        { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 20 },
+  heroLabel:      { fontSize: 13, fontWeight: "700", color: "#94A3B8", textTransform: "uppercase", letterSpacing: 0.8 },
+  editBtn:        { flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: "rgba(255,255,255,0.1)", borderWidth: 1, borderColor: "rgba(255,255,255,0.15)", paddingHorizontal: 14, paddingVertical: 7, borderRadius: 99 },
+  editBtnTxt:     { fontSize: 13, fontWeight: "700", color: "#fff" },
 
   profileRow:     { flexDirection: "row", alignItems: "flex-start", gap: 16 },
   avatar:         { width: 76, height: 76, borderRadius: 38, backgroundColor: "#1E293B", borderWidth: 2, borderColor: "rgba(255,255,255,0.15)" },
@@ -445,6 +521,36 @@ const s = StyleSheet.create({
 
   sportRow: { flexDirection: "row", alignItems: "center", gap: 6, marginHorizontal: 16, marginTop: 10, backgroundColor: "#FFFBEB", borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: "#FDE68A" },
   sportTxt:  { fontSize: 13, color: "#92400E" },
+
+  // ── Wallet card ──────────────────────────────────────────────────────────────
+  walletCard: {
+    flexDirection:   "row",
+    alignItems:      "center",
+    marginHorizontal: 16,
+    marginTop:        14,
+    backgroundColor: "#fff",
+    borderRadius:    16,
+    borderWidth:     1,
+    borderColor:     "#E5E7EB",
+    padding:         14,
+    shadowColor:     "#7C3AED",
+    shadowOpacity:   0.07,
+    shadowRadius:    8,
+    shadowOffset:    { width: 0, height: 2 },
+    elevation:       2,
+  },
+  walletIconWrap: {
+    width: 44, height: 44, borderRadius: 22,
+    backgroundColor: "#EDE9FE",
+    justifyContent: "center", alignItems: "center",
+  },
+  walletTitle:    { fontSize: 15, fontWeight: "800", color: BRAND, marginBottom: 5 },
+  walletPillsRow: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginBottom: 4 },
+  walletPill:     { flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 9, paddingVertical: 3, borderRadius: 99 },
+  walletPillDot:  { width: 6, height: 6, borderRadius: 3 },
+  walletPillTxt:  { fontSize: 11, fontWeight: "800" },
+  walletWorth:    { fontSize: 11, color: "#6B7280", fontWeight: "600" },
+  walletEmpty:    { fontSize: 12, color: "#9CA3AF", fontWeight: "600" },
 
   section:      { marginTop: 20, paddingHorizontal: 16 },
   sectionTitle: { fontSize: 16, fontWeight: "800", color: BRAND, marginBottom: 10 },
@@ -490,41 +596,13 @@ const s = StyleSheet.create({
   bookingShortcutBtnTxt: { color: "#fff", fontWeight: "700", fontSize: 13 },
 
   shareBtn: {
-  marginTop: 16,
-  marginHorizontal: 16,
-  backgroundColor: "#fff",
-  borderRadius: 16,
-  padding: 14,
-  flexDirection: "row",
-  alignItems: "center",
-  justifyContent: "space-between",
-  borderWidth: 1,
-  borderColor: "#E5E7EB",
-},
-shareBtnLeft: {
-  flexDirection: "row",
-  alignItems: "center",
-  gap: 12,
-  flex: 1,
-},
-shareIconWrap: {
-  width: 42,
-  height: 42,
-  borderRadius: 12,
-  backgroundColor: "#F0FDF4",
-  borderWidth: 1,
-  borderColor: "#BBF7D0",
-  alignItems: "center",
-  justifyContent: "center",
-},
-shareBtnTitle: {
-  fontSize: 14,
-  fontWeight: "800",
-  color: "#0B1220",
-},
-shareBtnSub: {
-  fontSize: 12,
-  color: "#9CA3AF",
-  marginTop: 2,
-},
+    marginTop: 16, marginHorizontal: 16, backgroundColor: "#fff",
+    borderRadius: 16, padding: 14, flexDirection: "row",
+    alignItems: "center", justifyContent: "space-between",
+    borderWidth: 1, borderColor: "#E5E7EB",
+  },
+  shareBtnLeft:  { flexDirection: "row", alignItems: "center", gap: 12, flex: 1 },
+  shareIconWrap: { width: 42, height: 42, borderRadius: 12, backgroundColor: "#F0FDF4", borderWidth: 1, borderColor: "#BBF7D0", alignItems: "center", justifyContent: "center" },
+  shareBtnTitle: { fontSize: 14, fontWeight: "800", color: "#0B1220" },
+  shareBtnSub:   { fontSize: 12, color: "#9CA3AF", marginTop: 2 },
 });

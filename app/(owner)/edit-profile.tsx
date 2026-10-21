@@ -2,7 +2,7 @@ import {
   View,
   Text,
   StyleSheet,
-  SafeAreaView,
+  
   StatusBar,
   ScrollView,
   TextInput,
@@ -15,8 +15,10 @@ import { useEffect, useState } from "react";
 import { auth, db } from "../../firebaseConfig";
 import { doc, getDoc, updateDoc } from "firebase/firestore";
 import { useRouter } from "expo-router";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 
 export default function EditProfile() {
+    const insets = useSafeAreaInsets(); 
   const router = useRouter();
 
   const [loading, setLoading] = useState(true);
@@ -112,10 +114,10 @@ export default function EditProfile() {
   }
 
   return (
-    <SafeAreaView style={styles.safeArea}>
+    <View style={styles.safeArea}>
       <StatusBar barStyle="light-content" backgroundColor="#081120" />
 
-      <ScrollView
+      <ScrollView keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive" automaticallyAdjustKeyboardInsets
         style={styles.container}
         showsVerticalScrollIndicator={false}
         contentContainerStyle={styles.content}
@@ -244,7 +246,7 @@ export default function EditProfile() {
           </TouchableOpacity>
         </View>
       </ScrollView>
-    </SafeAreaView>
+    </View>
   );
 }
 

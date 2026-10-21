@@ -14,6 +14,7 @@ import {
   StatusBar,
   Modal,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useState, useRef, useEffect } from "react";
 import { auth } from "../../firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
@@ -210,7 +211,8 @@ function SaveModal({
 
 // ── Main screen ───────────────────────────────────────────────────────────────
 export default function AdminNotificationCenter() {
-  const [title,        setTitle]        = useState("");
+  const insets = useSafeAreaInsets();
+ const [title,        setTitle]        = useState("");
   const [body,         setBody]         = useState("");
   const [imageUrl,     setImageUrl]     = useState("");
   const [role,         setRole]         = useState<Role>("user");
@@ -323,7 +325,7 @@ export default function AdminNotificationCenter() {
       />
 
       {/* ── Dark header ── */}
-      <Animated.View style={[s.header, { opacity: fadeAnim, transform: [{ translateY: slideAnim }] }]}>
+      <Animated.View style={[s.header, { paddingTop: insets.top + 16 }, { opacity: fadeAnim, transform: [{ translateY: slideAnim }] }]}>
         <View style={s.headerIconWrap}>
           <Ionicons name="megaphone" size={20} color={GREEN} />
         </View>
@@ -630,7 +632,7 @@ const s = StyleSheet.create({
     alignItems:        "center",
     backgroundColor:   HEADER_BG,
     paddingHorizontal: 20,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) + 16 : 20,
+    
     paddingBottom:     18,
     gap: 14,
   },

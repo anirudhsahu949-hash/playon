@@ -1,9 +1,10 @@
 import React, { useEffect, useState, useMemo, useRef, useCallback } from "react";
 import {
-  View, Text, StyleSheet, SafeAreaView, FlatList, TouchableOpacity,
+  View, Text, StyleSheet,  FlatList, TouchableOpacity,
   TextInput, Alert, ActivityIndicator, RefreshControl, StatusBar,
   Platform, Modal, KeyboardAvoidingView, Linking, ScrollView, Animated,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import {
   collection, getDocs, doc, updateDoc,
@@ -153,9 +154,11 @@ const TicketCard = React.memo(function TicketCard({ ticket, onPress }: { ticket:
 
 // ─── Detail Modal ─────────────────────────────────────────────────────────────
 function TicketDetailModal({ ticket, visible, onClose, onUpdated }: {
+  
   ticket: Ticket | null; visible: boolean;
   onClose: () => void; onUpdated: (t: Ticket) => void;
 }) {
+    const insets = useSafeAreaInsets();
   const [replyText,    setReplyText]    = useState("");
   const [sending,      setSending]      = useState(false);
   const [updating,     setUpdating]     = useState(false);
@@ -226,7 +229,7 @@ function TicketDetailModal({ ticket, visible, onClose, onUpdated }: {
         <StatusBar barStyle="dark-content" />
 
         {/* Header */}
-        <View style={dm.header}>
+        <View style={[dm.header, Platform.OS === "android" && { paddingTop: insets.top + 12 }]}>
           <TouchableOpacity style={dm.closeBtn} onPress={onClose}>
             <Ionicons name="close" size={18} color={GRAY5} />
           </TouchableOpacity>
@@ -469,6 +472,7 @@ function TicketDetailModal({ ticket, visible, onClose, onUpdated }: {
 
 // ─── Main Screen ──────────────────────────────────────────────────────────────
 export default function AdminSupport() {
+   const insets = useSafeAreaInsets(); 
   const [tickets,      setTickets]      = useState<Ticket[]>([]);
   const [loading,      setLoading]      = useState(true);
   const [refreshing,   setRefreshing]   = useState(false);
@@ -532,7 +536,7 @@ export default function AdminSupport() {
   );
 
   return (
-    <SafeAreaView style={s.root}>
+    <View style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
       <FlatList
@@ -548,7 +552,7 @@ export default function AdminSupport() {
         ListHeaderComponent={
           <View>
             {/* ── Dark header ── */}
-            <View style={s.header}>
+          <View style={[s.header, { paddingTop: insets.top + 14 }]}>
               <View>
                 <Text style={s.headerTag}>Admin · Support</Text>
                 <Text style={s.headerTitle}>Support Inbox</Text>
@@ -676,7 +680,7 @@ export default function AdminSupport() {
         onClose={() => setModalOpen(false)}
         onUpdated={onTicketUpdated}
       />
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -715,7 +719,7 @@ const cc = StyleSheet.create({
 // ─── Detail modal styles ──────────────────────────────────────────────────────
 const dm = StyleSheet.create({
   root:    { flex: 1, backgroundColor: BODY_BG },
-  header:  {  marginTop:30, flexDirection: "row", alignItems: "flex-start", paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: GRAY2, backgroundColor: WHITE, gap: 10 },
+  header:  {  flexDirection: "row", alignItems: "flex-start", paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: GRAY2, backgroundColor: WHITE, gap: 10 },
   closeBtn:{ width: 32, height: 32, borderRadius: 9, backgroundColor: GRAY1, alignItems: "center", justifyContent: "center", marginTop: 2 },
   headerTitle: { fontSize: 15, fontWeight: "800", color: DARK, marginBottom: 2 },
   headerSub:   { fontSize: 10, color: GRAY3, fontWeight: "500" },
@@ -795,7 +799,7 @@ const s = StyleSheet.create({
   header: {
     backgroundColor: DARK,
     paddingHorizontal: 20,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 14,
+    
     paddingBottom: 16,
     flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between",
   },

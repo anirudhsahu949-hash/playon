@@ -1,8 +1,9 @@
 import {
-  View, Text, StyleSheet, SafeAreaView, StatusBar,
+  View, Text, StyleSheet, StatusBar,
   ScrollView, TouchableOpacity, ActivityIndicator,
   RefreshControl, Platform, Modal, Alert, FlatList,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useEffect, useMemo, useState } from "react";
 import { db } from "../../firebaseConfig";
 import { collection, getDocs, query, where } from "firebase/firestore";
@@ -320,6 +321,7 @@ function TurfDetailModal({ visible, data, onClose }: {
 
 // ─── Main Screen ──────────────────────────────────────────────────────────────
 export default function AdminSettlementScreen() {
+  const insets = useSafeAreaInsets();
   const [bookings,   setBookings]   = useState<Booking[]>([]);
   const [owners,     setOwners]     = useState<Owner[]>([]);
   const [loading,    setLoading]    = useState(true);
@@ -473,7 +475,7 @@ export default function AdminSettlementScreen() {
   );
 
   return (
-    <SafeAreaView style={s.root}>
+    <View style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
       <ScrollView
@@ -482,7 +484,8 @@ export default function AdminSettlementScreen() {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchAll(true)} tintColor={GREEN} />}
       >
         {/* ── Dark header ── */}
-        <View style={s.header}>
+        {/* ── Hero ── */}
+<View style={[s.header, { paddingTop: insets.top + 14 }]}>
           <View>
             <Text style={s.headerTag}>Admin · Settlement</Text>
             <Text style={s.headerTitle}>Settlement Hub</Text>
@@ -760,7 +763,7 @@ export default function AdminSettlementScreen() {
       <TurfDetailModal visible={showDetail} data={detailTurf} onClose={() => setShowDetail(false)} />
 
       <AdminNavBar />
-    </SafeAreaView>
+    </View>
   );
 }
 

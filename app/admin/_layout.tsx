@@ -296,6 +296,98 @@ export default function AdminLayout() {
     ),
   }}
 />
+
+<Drawer.Screen
+  name="admin-bank-verification"
+  options={{
+    title: "bank verification",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="wallet-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
+<Drawer.Screen
+  name="admin payout"
+  options={{
+    title: "payout owner turf",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="cash-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
+
+<Drawer.Screen
+  name="import-player"
+  options={{
+    title: "update-league-profile",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="person-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
+<Drawer.Screen
+  name="create-league-owner"
+  options={{
+    title: "create-league-owner",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="person-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
+<Drawer.Screen
+  name="player-profile/{uid}"
+  options={{
+    title: "player-search",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="person-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
+<Drawer.Screen
+  name="league-users-profile-update"
+  options={{
+    title: "leage-user-profile-update",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="person-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
+<Drawer.Screen
+  name="p-coin"
+  options={{
+    drawerLabel: "PCoin Settings",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="wallet-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
+<Drawer.Screen
+  name="Adminsettlementsscreen-new"
+  options={{
+    drawerLabel: "new-settlement-screen",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="wallet-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
+<Drawer.Screen
+  name="refferl-admin_user"
+  options={{
+    drawerLabel: "refferl-admin-user",
+    drawerIcon: ({ color, size }) => (
+      <Ionicons name="wallet-outline" size={size} color={color} />
+    ),
+  }}
+/>
+
     </Drawer>
   );
 }

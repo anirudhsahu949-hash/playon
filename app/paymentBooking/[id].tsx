@@ -1,442 +1,154 @@
+/**
+ * Player booking receipt — bill style (matches the owner receipt)
+ * • Green turf-stripe backdrop + paper "bill" ticket (shared as an image)
+ * • Shows the venue offer: slot price, 🎉 offer, you saved, pay-at-turf with old amount crossed
+ * • Coins (pending / credited / cancelled), reschedule notice, refund tracker
+ * • Cancel booking with the real deadline, Directions, Book again
+ * Fixes: "Confirmed" header on cancelled bookings, late-night cancel deadline,
+ *        status = completed when the slot ends (not at midnight), coins/paid amounts.
+ */
 import {
-  View,
-  Text,
-  StyleSheet,
-  ActivityIndicator,
-  TouchableOpacity,
-  ScrollView,
-  SafeAreaView,
-  StatusBar,
-  Alert,
-  Platform,
+  View, Text, StyleSheet, ActivityIndicator, TouchableOpacity, ScrollView, StatusBar,
+  Alert, Platform, Image, Linking,
 } from "react-native";
-import { useEffect, useMemo, useState, useRef, useCallback } from "react";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { doc, getDoc } from "firebase/firestore";
 import { db, auth } from "../../firebaseConfig";
-import Animated, { FadeInDown } from "react-native-reanimated";
 import { Ionicons } from "@expo/vector-icons";
+import { LinearGradient } from "expo-linear-gradient";
 import * as Sharing from "expo-sharing";
 import ViewShot from "react-native-view-shot";
 
 const SERVER_URL = "https://bookora-backend-95u4.onrender.com";
+// Same logo as the owner receipt — file is in assets/images/
+const PLAYON_LOGO = require("../../assets/images/playon-receipt-logo.png");
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-type Booking = {
-  id: string;
-  turfName?: string;
-  turfLocation?: string;
-  dateString?: string;
-  date?: any;
-  bookingDate?: Date;
-  selectedSlots?: string[];
-  slotTime?: string;
-  slot?: string;
-  startTime?: string;
-  endTime?: string;
-  status?: string;
-  paymentStatus?: string;
-  totalAmount?: number;
-  advanceAmount?: number;
-  paidAmount?: number;
-  remainingAmount?: number;
-  bookingType?: string;
-  paymentId?: string;
-  orderId?: string;
-  userId?: string;
-  userName?: string;
-  refundStatus?: string;
-  refundAmount?: number;
-  refundId?: string;
-  cancelledAt?: any;
-  cancellationReason?: string;
-};
+// ── Palette (same as owner screens) ─────────────────────────────────────────
+const BRAND = "#15803D";
+const STRIPE = "#138A3F";
+const ON_BRAND = "#DCFCE7";
+const PAGE = "#F1F4F7";
+const INK = "#0F172A";
+const SLATE = "#475569";
+const MUTED = "#64748B";
+const FAINT = "#94A3B8";
+const LINE = "#E2E8F0";
 
-// ─── Refund status config ─────────────────────────────────────────────────────
-const REFUND_CFG: Record<string, {
-  label: string; sublabel: string; color: string;
-  bg: string; icon: string; step: number;
-}> = {
-  not_applicable: {
-    label:    "No Refund",
-    sublabel: "Advance booking — remaining was to be paid at turf.",
-    color:    "#6B7280",
-    bg:       "#F3F4F6",
-    icon:     "remove-circle-outline",
-    step:     0,
-  },
-  pending: {
-    label:    "Refund Pending",
-    sublabel: "Your refund request has been received and is being processed.",
-    color:    "#D97706",
-    bg:       "#FEF3C7",
-    icon:     "hourglass-outline",
-    step:     1,
-  },
-  initiated: {
-    label:    "Refund Initiated",
-    sublabel: "Razorpay has initiated your refund. Allow 5–7 business days.",
-    color:    "#2563EB",
-    bg:       "#DBEAFE",
-    icon:     "reload-circle-outline",
-    step:     2,
-  },
-  processed: {
-    label:    "Refund Completed",
-    sublabel: "Refund has been successfully processed. Amount usually reflects in your bank within 4–5 business days.",
-    color:    "#059669",
-    bg:       "#D1FAE5",
-    icon:     "checkmark-circle",
-    step:     3,
-  },
-  settlement_pending: {
-    label:    "Bank Transfer Pending",
-    sublabel: "Razorpay has processed your refund. Waiting for bank settlement.",
-    color:    "#2563EB",
-    bg:       "#DBEAFE",
-    icon:     "swap-horizontal-outline",
-    step:     3,
-  },
-  failed: {
-    label:    "Refund Failed",
-    sublabel: "There was an issue processing your refund. Please contact support.",
-    color:    "#DC2626",
-    bg:       "#FEE2E2",
-    icon:     "close-circle",
-    step:     -1,
-  },
-};
-
-const REFUND_STEPS = [
-  { key: "pending",   label: "Received"  },
-  { key: "initiated", label: "Initiated" },
-  { key: "processed", label: "Processed" },
-];
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-function parseTime(s: string, isEnd = false): number {
-  const parts = s.trim().split(" ");
-  const [hStr, mStr] = parts[0].split(":");
-  let h = Number(hStr);
-  const m = Number(mStr || 0);
-  const period = (parts[1] || "").toUpperCase();
-  if (period === "PM" && h !== 12) h += 12;
-  if (period === "AM" && h === 12) h = 0;
-  const val = h + m / 60;
-  if (isEnd && val === 0) return 24;
-  return val;
+// ── Helpers ─────────────────────────────────────────────────────────────────
+function toDate(v: any): Date | null {
+  if (!v) return null;
+  if (typeof v?.toDate === "function") return v.toDate();
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
 }
-
-function formatTime(v: number): string {
-  v = ((v % 24) + 24) % 24;
-  const hour = Math.floor(v);
-  const minute = Math.round((v % 1) * 60);
-  const suffix = hour >= 12 ? "PM" : "AM";
-  const h = hour % 12 === 0 ? 12 : hour % 12;
-  return `${h}:${String(minute).padStart(2, "0")} ${suffix}`;
+function dayStart(d: Date): number { const x = new Date(d); x.setHours(0, 0, 0, 0); return x.getTime(); }
+function partMins(s: string): number {
+  const m = String(s || "").trim().match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)/i);
+  if (!m) return 0;
+  let h = Number(m[1]);
+  const p = m[3].toUpperCase();
+  if (p === "PM" && h !== 12) h += 12;
+  if (p === "AM" && h === 12) h = 0;
+  return h * 60 + Number(m[2] || 0);
 }
-
-function formatDuration(hrs: number): string {
-  if (hrs <= 0) return "";
-  if (hrs < 1)  return `${Math.round(hrs * 60)} min`;
-  if (hrs === 1) return "1 hr";
-  return `${hrs % 1 === 0 ? hrs : hrs.toFixed(1)} hrs`;
-}
-
-function formatSlotRange(slots: string[] = []): string {
-  if (!Array.isArray(slots) || !slots.length) return "Slot not available";
-  const parsed = slots.map((s) => {
-    const parts = s.split(" - ");
-    if (parts.length < 2) return null;
-    return {
-      start: parseTime(parts[0].trim(), false),
-      end:   parseTime(parts[1].trim(), true),
-    };
-  }).filter(Boolean) as { start: number; end: number }[];
-
-  parsed.sort((a, b) => a.start - b.start);
-
-  const merged: { start: number; end: number }[] = [];
-  for (const slot of parsed) {
-    if (!merged.length) { merged.push({ ...slot }); continue; }
-    const last = merged[merged.length - 1];
-    if (Math.abs(slot.start - last.end) < 0.02) last.end = slot.end;
-    else merged.push({ ...slot });
-  }
-
-  return merged.map(({ start, end }) => {
-    let duration = end - start;
-    if (duration <= 0) duration += 24;
-    return `${formatTime(start)} – ${formatTime(end)} · ${formatDuration(duration)}`;
-  }).join("\n");
-}
-
-function formatDate(date: Date | null | undefined): string {
-  if (!date || !(date instanceof Date) || isNaN(date.getTime())) {
-    return "Date not available";
-  }
-  return date.toLocaleDateString("en-US", {
-    weekday: "long", day: "numeric", month: "long", year: "numeric",
+/** Start/end minutes from the booking day's midnight; late-night slots go past 1440 */
+function minsRange(slots: string[], turf: any): { start: number; end: number } | null {
+  const open = Number(turf?.openingTime ?? 6);
+  const close = Number(turf?.closingTime ?? 23) || 24;
+  const adj = (m: number) => (close > 24 && m < open * 60 ? m + 1440 : m);
+  let start = Infinity, end = -Infinity;
+  slots.forEach(s => {
+    const p = String(s).split(" - ");
+    if (p.length < 2) return;
+    const a = adj(partMins(p[0]));
+    let e = adj(partMins(p[1]));
+    if (e <= a) e += 1440;
+    start = Math.min(start, a); end = Math.max(end, e);
   });
+  return isFinite(start) ? { start, end } : null;
 }
-
-// ─── Refund Tracker Component ─────────────────────────────────────────────────
-function RefundTracker({
-  booking,
-  onRefresh,
-}: {
-  booking: Booking;
-  onRefresh: () => void;
-}) {
-  const [liveRefund,  setLiveRefund]  = useState<any>(null);
-  const [checking,    setChecking]    = useState(false);
-  const [lastChecked, setLastChecked] = useState<Date | null>(null);
-
-  // Reset live state whenever booking ID changes
-  useEffect(() => {
-    setLiveRefund(null);
-    setLastChecked(null);
-    setChecking(false);
-  }, [booking?.id]);
-
-  // Use live data if available, otherwise fall back to booking data
-  const refundStatus = liveRefund?.refundStatus ?? booking.refundStatus ?? "not_applicable";
-  const refundAmount = liveRefund?.refundAmount ?? booking.refundAmount ?? 0;
-  const cfg = REFUND_CFG[refundStatus] ?? REFUND_CFG.not_applicable;
-
-  // FIX: correct statusMap — pending stays pending, don't wrongly map to initiated
-  const checkRefundStatus = useCallback(async () => {
-    if (!booking?.id || !auth.currentUser?.uid) return;
-    setChecking(true);
-    try {
-      const res = await fetch(
-        `${SERVER_URL}/refund-status/${booking.id}?userId=${auth.currentUser.uid}`
-      );
-      const data = await res.json();
-      if (data.success) {
-        // Razorpay statuses: pending | processed | failed
-        // Our REFUND_CFG keys: pending | initiated | processed | failed
-        const statusMap: Record<string, string> = {
-          pending:    "pending",
-          initiated:  "initiated",
-          processed:  "processed",
-          failed:     "failed",
-        };
-        const normalizedStatus = statusMap[data.refundStatus] ?? data.refundStatus;
-        setLiveRefund({ ...data, refundStatus: normalizedStatus });
-        setLastChecked(new Date());
-      }
-    } catch (e) {
-      console.log("Refund check error:", e);
-    } finally {
-      setChecking(false);
-    }
-  }, [booking?.id]);
-
-  // FIX: auto-check only on booking ID change + only for online payments
-  // Removed refundStatus from deps to prevent infinite loop
-  useEffect(() => {
-    if (
-      booking?.status === "cancelled" &&
-      booking?.paymentId  // only online bookings have paymentId
-    ) {
-      checkRefundStatus();
-    }
-  }, [booking?.id]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  if (booking?.status !== "cancelled") return null;
-
-  return (
-    <Animated.View entering={FadeInDown.delay(150).duration(300)} style={rt.wrap}>
-      {/* Header */}
-      <View style={rt.header}>
-        <Ionicons name="refresh-circle-outline" size={20} color="#7C3AED" />
-        <Text style={rt.headerTitle}>Refund Status</Text>
-        <TouchableOpacity
-          style={rt.refreshBtn}
-          onPress={checkRefundStatus}
-          disabled={checking}
-        >
-          {checking
-            ? <ActivityIndicator size="small" color="#7C3AED" />
-            : <Ionicons name="refresh-outline" size={16} color="#7C3AED" />
-          }
-        </TouchableOpacity>
-      </View>
-
-      {/* Status banner */}
-      <View style={[rt.banner, { backgroundColor: cfg.bg }]}>
-        <View style={[rt.iconCircle, { backgroundColor: cfg.color + "20" }]}>
-          <Ionicons name={cfg.icon as any} size={28} color={cfg.color} />
-        </View>
-        <View style={{ flex: 1, marginLeft: 12 }}>
-          <Text style={[rt.bannerTitle, { color: cfg.color }]}>{cfg.label}</Text>
-          <Text style={[rt.bannerSub, { color: cfg.color + "BB" }]}>{cfg.sublabel}</Text>
-          {refundAmount > 0 && (
-            <Text style={[rt.refundAmt, { color: cfg.color }]}>₹{refundAmount}</Text>
-          )}
-        </View>
-      </View>
-
-      {/* Progress steps — only for online refunds */}
-      {refundStatus !== "not_applicable" && refundStatus !== "failed" && (
-        <View style={rt.stepsWrap}>
-          {REFUND_STEPS.map((step, i) => {
-            const done    = cfg.step > i + 1;
-            const current = cfg.step === i + 1;
-            return (
-              <View key={step.key} style={rt.stepRow}>
-                <View style={rt.stepLeft}>
-                  <View style={[
-                    rt.stepDot,
-                    done    && rt.stepDotDone,
-                    current && rt.stepDotCurrent,
-                  ]}>
-                    {done
-                      ? <Ionicons name="checkmark" size={11} color="#fff" />
-                      : <Text style={[rt.stepDotNum, current && { color: "#fff" }]}>{i + 1}</Text>
-                    }
-                  </View>
-                  {i < REFUND_STEPS.length - 1 && (
-                    <View style={[rt.stepLine, done && rt.stepLineDone]} />
-                  )}
-                </View>
-                <Text style={[rt.stepLabel, (done || current) && rt.stepLabelActive]}>
-                  {step.label}
-                  {current && " ⟵ Now"}
-                </Text>
-              </View>
-            );
-          })}
-        </View>
-      )}
-
-      {/* Info rows */}
-      <View style={rt.infoBlock}>
-        {booking.cancelledAt && (
-          <View style={rt.infoRow}>
-            <Text style={rt.infoLabel}>Cancelled on</Text>
-            <Text style={rt.infoVal}>
-              {(() => {
-                const d = booking.cancelledAt?.toDate?.()
-                  ?? new Date(booking.cancelledAt);
-                return isNaN(d.getTime())
-                  ? "—"
-                  : d.toLocaleDateString("en-IN", {
-                      day: "numeric", month: "short", year: "numeric",
-                    });
-              })()}
-            </Text>
-          </View>
-        )}
-        {booking.cancellationReason && (
-          <View style={rt.infoRow}>
-            <Text style={rt.infoLabel}>Reason</Text>
-            <Text style={rt.infoVal}>{booking.cancellationReason}</Text>
-          </View>
-        )}
-        {refundStatus !== "not_applicable" && (
-          <View style={rt.infoRow}>
-            <Text style={rt.infoLabel}>Refund amount</Text>
-            <Text style={[rt.infoVal, { color: "#059669", fontWeight: "800" }]}>
-              {refundAmount > 0 ? `₹${refundAmount}` : "—"}
-            </Text>
-          </View>
-        )}
-        {liveRefund?.processedAt && (
-          <View style={rt.infoRow}>
-            <Text style={rt.infoLabel}>Processed at</Text>
-            <Text style={rt.infoVal}>
-              {new Date(liveRefund.processedAt * 1000).toLocaleDateString("en-IN", {
-                day: "numeric", month: "short",
-              })}
-            </Text>
-          </View>
-        )}
-        {lastChecked && (
-          <View style={[rt.infoRow, { borderBottomWidth: 0 }]}>
-            <Text style={rt.infoLabel}>Last checked</Text>
-            <Text style={rt.infoVal}>
-              {lastChecked.toLocaleTimeString("en-IN", {
-                hour: "numeric", minute: "2-digit",
-              })}
-            </Text>
-          </View>
-        )}
-      </View>
-
-      {/* Failed refund — contact support */}
-      {refundStatus === "failed" && (
-        <View style={rt.failBox}>
-          <Ionicons name="alert-circle-outline" size={16} color="#DC2626" />
-          <Text style={rt.failTxt}>
-            Refund failed. Please contact support with your Booking ID:{" "}
-            {booking.id?.slice(0, 14)}
-          </Text>
-        </View>
-      )}
-
-      {/* Not applicable explanation */}
-      {refundStatus === "not_applicable" && (
-        <View style={rt.naBox}>
-          <Ionicons name="information-circle-outline" size={16} color="#6B7280" />
-          <Text style={rt.naTxt}>
-            You paid ₹{booking.advanceAmount || 0} online as advance. The remaining ₹
-            {booking.remainingAmount || 0} was to be paid at the turf. Since the
-            booking was cancelled, no online refund is applicable.
-          </Text>
-        </View>
-      )}
-    </Animated.View>
-  );
+function hm(min: number): string {
+  const x = ((min % 1440) + 1440) % 1440;
+  const h = Math.floor(x / 60), m = x % 60;
+  return `${h % 12 === 0 ? 12 : h % 12}:${String(m).padStart(2, "0")}`;
 }
-
-// ─── Main Screen ──────────────────────────────────────────────────────────────
-export default function BookingDetails() {
-  const { id }     = useLocalSearchParams();
-  const router     = useRouter();
-  const receiptRef = useRef<any>(null);
-
-  const [booking,    setBooking]    = useState<Booking | null>(null);
-  const [loading,    setLoading]    = useState(true);
-  const [cancelling, setCancelling] = useState(false);
-  const [cancelWindowHours, setCancelWindowHours] = useState<number>(2); // default 2
-
-  useEffect(() => {
-  fetchBooking();
-  fetchCancelWindow();
-}, []);
-
-const fetchCancelWindow = async () => {
-  try {
-    const snap = await getDoc(doc(db, "appConfig", "booking"));
-    if (snap.exists()) {
-      const hours = Number(snap.data()?.cancellationWindowHours);
-      if (!isNaN(hours) && hours >= 0 && hours <= 24) {
-        setCancelWindowHours(hours);
-      }
-    }
-  } catch (e) {
-    console.log("fetchCancelWindow error:", e);
-    // Falls back to default 2
-  }
+const per = (min: number) => ((((min % 1440) + 1440) % 1440) >= 720 ? "PM" : "AM");
+const rangeTxt = (a: number, b: number) => `${hm(a)}${per(a) !== per(b) ? ` ${per(a)}` : ""} – ${hm(b)} ${per(b)}`;
+const hrsTxt = (mins: number) => {
+  if (mins < 60) return `${mins} min`;
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return m ? `${h}h ${m}m` : `${h} hr${h === 1 ? "" : "s"}`;
 };
+const rs = (n: number) => `₹${Math.round(n).toLocaleString("en-IN")}`;
+function whenTxt(ms: number): string {
+  const d = new Date(ms);
+  const t = d.toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", hour12: true });
+  const today = dayStart(new Date());
+  const day = dayStart(d);
+  if (day === today) return `${t} today`;
+  if (day === today + 86400000) return `${t} tomorrow`;
+  return `${t}, ${d.toLocaleDateString("en-IN", { day: "numeric", month: "short" })}`;
+}
+function shortSlots(slots?: string[], turf?: any): string {
+  if (!slots?.length) return "";
+  const r = minsRange(slots, turf);
+  return r ? rangeTxt(r.start, r.end) : slots[0];
+}
+
+const STATUS = {
+  confirmed: { label: "CONFIRMED", bg: "#DCFCE7", fg: BRAND },
+  pending:   { label: "PENDING",   bg: "#FEF3C7", fg: "#B45309" },
+  cancelled: { label: "CANCELLED", bg: "#FEE2E2", fg: "#DC2626" },
+  completed: { label: "COMPLETED", bg: "#F1F5F9", fg: SLATE },
+};
+type StatusKey = keyof typeof STATUS;
+
+const REFUND_CFG: Record<string, { label: string; sub: string; fg: string; bg: string; step: number }> = {
+  not_applicable:     { label: "No refund",            sub: "",                                                fg: SLATE,     bg: "#F1F5F9", step: 0 },
+  pending:            { label: "Refund received",      sub: "We got your request and are processing it.",      fg: "#B45309", bg: "#FEF3C7", step: 1 },
+  initiated:          { label: "Refund on the way",    sub: "Back to your bank in 5–7 working days.",          fg: "#1D4ED8", bg: "#DBEAFE", step: 2 },
+  settlement_pending: { label: "Refund on the way",    sub: "Processed — waiting for your bank.",              fg: "#1D4ED8", bg: "#DBEAFE", step: 2 },
+  processed:          { label: "Refund completed",     sub: "Usually shows in your bank within 4–5 working days.", fg: "#047857", bg: "#D1FAE5", step: 3 },
+  failed:             { label: "Refund failed",        sub: "Please contact support with your booking ID.",   fg: "#DC2626", bg: "#FEE2E2", step: -1 },
+};
+const REFUND_STEPS = ["Received", "Sent by Razorpay", "In your bank"];
+
+// ─────────────────────────────────────────────────────────────────────────────
+export default function BookingDetails() {
+  const insets = useSafeAreaInsets();
+  const { id } = useLocalSearchParams();
+  const router = useRouter();
+  const shotRef = useRef<any>(null);
+
+  const [booking, setBooking] = useState<any>(null);
+  const [turf, setTurf] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [cancelling, setCancelling] = useState(false);
+  const [sharing, setSharing] = useState(false);
+  const [cancelWindowHours, setCancelWindowHours] = useState(2);
+  const [, setTick] = useState(0);
+
+  useEffect(() => { fetchBooking(); fetchCancelWindow(); }, []);
+  useEffect(() => { const t = setInterval(() => setTick(x => x + 1), 60000); return () => clearInterval(t); }, []);
+
+  const fetchCancelWindow = async () => {
+    try {
+      const snap = await getDoc(doc(db, "appConfig", "booking"));
+      const h = Number(snap.data()?.cancellationWindowHours);
+      if (snap.exists() && !isNaN(h) && h >= 0 && h <= 24) setCancelWindowHours(h);
+    } catch (e) { console.log("fetchCancelWindow error:", e); }
+  };
 
   const fetchBooking = async () => {
     try {
-      setLoading(true);
       const snap = await getDoc(doc(db, "bookings", String(id)));
-      if (snap.exists()) {
-        const data = snap.data();
-        // Convert Firestore Timestamp to JS Date
-        const bookingDate = data.date?.toDate
-          ? data.date.toDate()
-          : data.date
-          ? new Date(data.date)
-          : null;
-        setBooking({ id: snap.id, ...data, bookingDate } as Booking);
-      } else {
-        setBooking(null);
+      if (!snap.exists()) { setBooking(null); return; }
+      const b: any = { id: snap.id, ...snap.data() };
+      setBooking(b);
+      if (b.turfId && !turf) {
+        try { const t = await getDoc(doc(db, "turfs", b.turfId)); if (t.exists()) setTurf(t.data()); } catch {}
       }
     } catch (e) {
       console.log("fetchBooking error:", e);
@@ -446,74 +158,131 @@ const fetchCancelWindow = async () => {
     }
   };
 
-  // FIX: canCancelBooking — use auth.currentUser check + correct 2hr window
-  const canCancelBooking = useMemo(() => {
-    if (!booking?.bookingDate || booking.status === "cancelled") return false;
-    if (!auth.currentUser?.uid) return false;
+  const goBack = () => (router.canGoBack() ? router.back() : router.replace("/(tabs)" as any));
 
-    const slots = booking.selectedSlots || [];
-    const firstSlot = slots[0] || booking.slotTime || booking.slot || "";
-    if (!firstSlot) return false;
+  const share = async () => {
+    try {
+      setSharing(true);
+      await new Promise(r => setTimeout(r, 250));
+      const uri = await shotRef.current?.capture?.();
+      if (!uri) throw new Error("capture failed");
+      await Sharing.shareAsync(uri, { mimeType: "image/png", dialogTitle: "Share booking receipt", UTI: "public.png" });
+    } catch (e) {
+      console.log(e);
+      Alert.alert("Error", "Unable to share the receipt. Please try again.");
+    } finally {
+      setSharing(false);
+    }
+  };
 
-    const startPart = firstSlot.includes(" - ")
-      ? firstSlot.split(" - ")[0].trim()
-      : firstSlot.trim();
-
-    const timeMatch = startPart.match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)/i);
-    if (!timeMatch) return false;
-
-    let hour = parseInt(timeMatch[1]);
-    const minute = parseInt(timeMatch[2] || "0");
-    const meridiem = timeMatch[3].toUpperCase();
-    if (meridiem === "PM" && hour < 12) hour += 12;
-    if (meridiem === "AM" && hour === 12) hour = 0;
-
-    const bookingDateTime = new Date(booking.bookingDate);
-    bookingDateTime.setHours(hour, minute, 0, 0);
-
-  const hoursLeft = (bookingDateTime.getTime() - Date.now()) / (1000 * 60 * 60);
-return hoursLeft >= cancelWindowHours;  // ✅ Dynamic now
-}, [booking, cancelWindowHours]);
-
-  const cancelBooking = async () => {
-  if (!canCancelBooking) {
-    return Alert.alert(
-      "Cancellation Closed",
-      `Bookings can only be cancelled at least ${cancelWindowHours} hours before the slot.`
+  // ── Loading / not found ──
+  if (loading) {
+    return (
+      <View style={s.center}>
+        <StatusBar barStyle="dark-content" />
+        <ActivityIndicator size="large" color={BRAND} />
+        <Text style={s.loadTxt}>Loading your booking…</Text>
+      </View>
     );
   }
+  if (!booking) {
+    return (
+      <View style={[s.center, { paddingHorizontal: 32 }]}>
+        <StatusBar barStyle="dark-content" />
+        <Ionicons name="alert-circle-outline" size={44} color={FAINT} />
+        <Text style={s.nfTitle}>Booking not found</Text>
+        <Text style={s.nfSub}>This booking may have been removed or the link is invalid.</Text>
+        <TouchableOpacity style={s.nfBtn} onPress={goBack}><Text style={s.nfBtnTxt}>Go back</Text></TouchableOpacity>
+      </View>
+    );
+  }
+
+  // ── Time + status ──
+  const slots: string[] = Array.isArray(booking.selectedSlots) && booking.selectedSlots.length
+    ? booking.selectedSlots : [booking.slotTime, booking.slot].filter(Boolean);
+  const range = minsRange(slots, turf);
+  const day = toDate(booking.dateString) ?? toDate(booking.date);
+  const dayMs = day ? dayStart(day) : null;
+  const now = Date.now();
+  const startAbs = dayMs !== null && range ? dayMs + range.start * 60000 : null;
+  const endAbs = dayMs !== null ? dayMs + (range ? range.end : 1440) * 60000 : null;
+
+  let status: StatusKey = booking.status === "cancelled" ? "cancelled"
+    : booking.status === "completed" ? "completed"
+    : booking.status === "pending" ? "pending" : "confirmed";
+  // FIX: completed when the slot actually ends (late-night aware), not at midnight
+  if ((status === "confirmed" || status === "pending") && endAbs !== null && now >= endAbs) status = "completed";
+  const st = STATUS[status];
+  const isCancelled = status === "cancelled";
+  const isUpcoming = status === "confirmed" || status === "pending";
+
+  // FIX: cancel deadline uses the real (late-night aware) start time
+  const cancelBy = startAbs !== null ? startAbs - cancelWindowHours * 3600000 : null;
+  const canCancel = isUpcoming && !!auth.currentUser?.uid && cancelBy !== null && now < cancelBy;
+
+  // ── Money ──
+  const total = Number(booking.totalAmount ?? 0) || 0;
+  const offerDiscount = Number(booking.offerDiscount || 0);
+  const originalAmount = Number(booking.originalAmount || 0) || total + offerDiscount;
+  const promo = Number(booking.discount || 0);
+  const pcoins = Number(booking.pcoinsRedeemed || 0);
+  const vcoins = Number(booking.vcoinsRedeemed || 0);
+  const paidOnline = Number(booking.paidAmount ?? booking.advanceAmount ?? 0) || 0;
+  const atTurf = Math.max(Number(booking.remainingAmount ?? total - paidOnline - promo - pcoins - vcoins), 0);
+  const fullPaid = booking.bookingType === "full" || booking.paymentMode === "full_payment" || atTurf === 0;
+  const saved = offerDiscount + promo;
+  // Option A: offer comes off what you pay at the turf → show the old amount crossed
+  const oldAtTurf = offerDiscount > 0 && !fullPaid ? atTurf + offerDiscount : 0;
+
+  const turfName = booking.turfName || turf?.name || "the turf";
+  const location = booking.turfLocation || turf?.location || turf?.address || "";
+  const dateTitle = day
+    ? day.toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "long", year: "numeric" }).toUpperCase()
+    : "DATE NOT AVAILABLE";
+
+  const openDirections = () => {
+    const lat = turf?.latitude, lng = turf?.longitude;
+    const url = booking.mapLink || turf?.mapLink
+      || (lat != null && lng != null
+        ? Platform.select({ ios: `maps://?daddr=${lat},${lng}`, default: `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}` })
+        : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${turfName} ${location}`)}`);
+    Linking.openURL(String(url)).catch(() => Alert.alert("Can't open maps", "Please try again."));
+  };
+
+  const bookAgain = () => {
+    if (booking.turfId) router.push(`/turf/${booking.turfId}` as any);
+  };
+
+  const cancelBooking = () => {
+    if (!canCancel) {
+      return Alert.alert("Cancellation closed", `Bookings can only be cancelled at least ${cancelWindowHours} hours before the slot.`);
+    }
     Alert.alert(
-      "Cancel Booking",
-      "Are you sure you want to cancel? Refund will be processed according to cancellation policy.",
+      "Cancel booking?",
+      paidOnline > 0
+        ? `${turfName} · ${dateTitle.toLowerCase()}\nRefund follows the cancellation policy.`
+        : "Are you sure you want to cancel this booking?",
       [
-        { text: "Keep Booking", style: "cancel" },
+        { text: "Keep booking", style: "cancel" },
         {
-          text: "Cancel Booking",
-          style: "destructive",
+          text: "Cancel booking", style: "destructive",
           onPress: async () => {
             try {
               setCancelling(true);
-              // FIX: use auth.currentUser.uid — never trust client-sent userId
-              const uid = auth.currentUser?.uid;
-              if (!uid) throw new Error("Not logged in");
-
-              const response = await fetch(`${SERVER_URL}/cancel-booking`, {
+              const user = auth.currentUser;
+              if (!user) throw new Error("Please log in again.");
+              const token = await user.getIdToken().catch(() => "");
+              const res = await fetch(`${SERVER_URL}/cancel-booking`, {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  bookingId: booking!.id,
-                  userId:    uid,           // ← always from auth, never from booking doc
-                  reason:    "User cancelled booking",
-                }),
+                headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+                body: JSON.stringify({ bookingId: booking.id, userId: user.uid, reason: "User cancelled booking" }),
               });
-              const data = await response.json();
-              if (!response.ok || !data.success) {
-                throw new Error(data.error || "Cancellation failed");
-              }
+              const data = await res.json().catch(() => ({}));
+              if (!res.ok || !data.success) throw new Error(data.error || "Cancellation failed");
               await fetchBooking();
-              Alert.alert("Booking Cancelled", data.message || "Your booking has been cancelled.");
+              Alert.alert("Booking cancelled", data.message || "Your booking has been cancelled.");
             } catch (e: any) {
-              Alert.alert("Error", e.message || "Unable to cancel booking.");
+              Alert.alert("Error", e?.message || "Unable to cancel booking.");
             } finally {
               setCancelling(false);
             }
@@ -523,467 +292,501 @@ return hoursLeft >= cancelWindowHours;  // ✅ Dynamic now
     );
   };
 
-  const shareReceipt = async () => {
+  const payPill = isCancelled ? null : fullPaid ? "Full paid" : "Advance paid";
+
+  return (
+    <View style={s.root}>
+      <StatusBar barStyle="light-content" backgroundColor={BRAND} />
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: insets.bottom + 30 }}>
+        {/* ── Green turf area (header + ticket; ticket is shared as image) ── */}
+        <View style={s.turf}>
+          <Stripes />
+          <View style={[s.headerRow, { paddingTop: insets.top + 10 }]}>
+            <TouchableOpacity style={s.hBtn} onPress={goBack} accessibilityLabel="Back">
+              <Ionicons name="arrow-back" size={20} color="#fff" />
+            </TouchableOpacity>
+            <View style={{ flex: 1 }}>
+              <Text style={s.hKicker}>BOOKING RECEIPT</Text>
+              <Text style={s.hTitle}>My booking</Text>
+            </View>
+            <TouchableOpacity style={s.hBtn} onPress={share} disabled={sharing} accessibilityLabel="Share receipt">
+              {sharing ? <ActivityIndicator color="#fff" size="small" /> : <Ionicons name="share-outline" size={19} color="#fff" />}
+            </TouchableOpacity>
+          </View>
+
+          {booking.rescheduled && <RescheduleNotice booking={booking} turf={turf} />}
+
+          <ViewShot ref={shotRef} options={{ format: "png", quality: 1 }} style={s.shot}>
+            <Stripes />
+            <View style={s.ticketWrap}>
+              <View style={s.ticketTop}>
+                <View style={s.brandRow}>
+                  <Image source={PLAYON_LOGO} style={s.logo} resizeMode="contain" accessibilityLabel="Playon logo" />
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.brand}>Playon</Text>
+                    <Text style={s.brandSub} numberOfLines={1}>Turf & Sport Booking App</Text>
+                  </View>
+                  <View style={[s.stamp, { backgroundColor: st.bg }]}><Text style={[s.stampTxt, { color: st.fg }]}>● {st.label}</Text></View>
+                </View>
+
+                <Text style={s.dateTitle}>{dateTitle}</Text>
+                <Text style={[s.bigTime, isCancelled && { textDecorationLine: "line-through", color: FAINT }]} adjustsFontSizeToFit numberOfLines={1}>
+                  {range ? rangeTxt(range.start, range.end) : booking.slotTime || "Time not available"}
+                </Text>
+                <View style={s.pillRow}>
+                  {range && <Pill text={hrsTxt(range.end - range.start)} bg="#F1F5F9" fg={SLATE} />}
+                  {payPill && <Pill text={payPill} bg="#EFF6FF" fg="#1D4ED8" />}
+                  {offerDiscount > 0 && <Pill text="🎉 Offer" bg="#DCFCE7" fg={BRAND} />}
+                  {booking.rescheduled && <Pill text="⟳ Rescheduled" bg="#F5F3FF" fg="#6D28D9" />}
+                </View>
+
+                <View style={s.turfBox}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.infoLbl}>TURF</Text>
+                    <Text style={s.infoVal} numberOfLines={2}>{turfName}</Text>
+                    {!!location && <Text style={s.infoSub} numberOfLines={2}>{location}</Text>}
+                  </View>
+                  {!isCancelled && (
+                    <TouchableOpacity style={s.dirBtn} onPress={openDirections} accessibilityLabel="Directions to turf">
+                      <Ionicons name="navigate-outline" size={14} color={BRAND} />
+                      <Text style={s.dirTxt}>Directions</Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+              </View>
+
+              <TearLine />
+
+              <View style={s.ticketBottom}>
+                <Text style={s.kicker}>BILL</Text>
+                {offerDiscount > 0 && <BillRow label={`Slot price${range ? ` · ${hrsTxt(range.end - range.start)}` : ""}`} value={rs(originalAmount)} />}
+                {offerDiscount > 0 && <BillRow label={`🎉 ${booking.offerTitle || "Venue offer"}`} value={`− ${rs(offerDiscount)}`} color={BRAND} />}
+                {offerDiscount > 0 && <View style={s.billLine} />}
+                <BillRow label="Total" value={rs(total)} strong />
+                {promo > 0 && <BillRow label={`Promo${booking.promoCode ? ` · ${booking.promoCode}` : ""}`} value={`− ${rs(promo)}`} color={BRAND} />}
+                {pcoins > 0 && <BillRow label={`🪙 PCoin used · ${pcoins}`} value={`− ${rs(pcoins)}`} color="#7C3AED" />}
+                {vcoins > 0 && <BillRow label={`🏟️ VCoin used · ${vcoins}`} value={`− ${rs(vcoins)}`} color="#B45309" />}
+                <BillRow label={fullPaid ? "Paid online (full)" : "Paid online"} value={rs(paidOnline)} color={BRAND} />
+
+                {isCancelled ? (
+                  <View style={[s.dueBox, { backgroundColor: "#FEF2F2", borderColor: "#FECACA" }]}>
+                    <Ionicons name="close-circle" size={22} color="#DC2626" />
+                    <View style={{ flex: 1 }}>
+                      <Text style={[s.dueLbl, { color: "#B91C1C" }]}>BOOKING CANCELLED</Text>
+                      <Text style={[s.dueSub, { color: "#991B1B" }]}>See the refund status below</Text>
+                    </View>
+                  </View>
+                ) : atTurf > 0 ? (
+                  <View style={s.dueBox}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={s.dueLbl}>{status === "completed" ? "PAID AT TURF" : "PAY AT TURF"}</Text>
+                      <Text style={s.dueSub}>{status === "completed" ? "Game finished" : "Cash or UPI before the game"}</Text>
+                    </View>
+                    {oldAtTurf > 0 && <Text style={s.dueOld}>{rs(oldAtTurf)}</Text>}
+                    <Text style={s.dueAmt} numberOfLines={1} adjustsFontSizeToFit>{rs(atTurf)}</Text>
+                  </View>
+                ) : (
+                  <View style={[s.dueBox, { backgroundColor: "#F0FDF4", borderColor: "#BBF7D0" }]}>
+                    <Ionicons name="checkmark-circle" size={22} color={BRAND} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={[s.dueLbl, { color: BRAND }]}>FULLY PAID</Text>
+                      <Text style={[s.dueSub, { color: "#166534" }]}>Nothing to pay at the turf</Text>
+                    </View>
+                  </View>
+                )}
+
+                {saved > 0 && !isCancelled && (
+                  <View style={s.saveBox}><Text style={s.saveTxt}>🎉 You saved {rs(saved)} on this booking</Text></View>
+                )}
+
+                <View style={s.idRow}>
+                  <View style={s.idHead}>
+                    <Text style={s.idLbl}>BOOKING ID</Text>
+                    <Text style={s.idHint}>Show this at the turf</Text>
+                  </View>
+                  <Text style={s.idVal} selectable>{booking.id}</Text>
+                </View>
+              </View>
+              <ZigZag />
+            </View>
+            <Text style={s.shotFoot}>Thank you for playing at {turfName}</Text>
+          </ViewShot>
+        </View>
+
+        {/* ── Refund (cancelled only) ── */}
+        {isCancelled && <RefundTracker booking={booking} paidOnline={paidOnline} atTurf={atTurf} />}
+
+        {/* ── Coins ── */}
+        <CoinsCard booking={booking} cancelled={isCancelled} turfName={turfName} />
+
+        {/* ── Actions ── */}
+        {isUpcoming && cancelBy !== null && (
+          <View style={s.deadline}>
+            <Ionicons name="time-outline" size={14} color={canCancel ? MUTED : "#B45309"} />
+            <Text style={[s.deadlineTxt, !canCancel && { color: "#B45309" }]}>
+              {canCancel
+                ? `Free cancel till ${whenTxt(cancelBy)} · ${cancelWindowHours} hrs before slot`
+                : `Cancellation closed · less than ${cancelWindowHours} hrs to the game`}
+            </Text>
+          </View>
+        )}
+        <View style={s.actRow}>
+          {isUpcoming ? (
+            <TouchableOpacity style={[s.dangerBtn, (!canCancel || cancelling) && { opacity: 0.5 }]} onPress={cancelBooking} disabled={cancelling}>
+              {cancelling ? <ActivityIndicator color="#DC2626" size="small" /> : <Text style={s.dangerTxt}>Cancel booking</Text>}
+            </TouchableOpacity>
+          ) : booking.turfId ? (
+            <TouchableOpacity style={s.ghostBtn} onPress={bookAgain}>
+              <Ionicons name="refresh" size={16} color={INK} />
+              <Text style={s.ghostTxt}>Book again</Text>
+            </TouchableOpacity>
+          ) : null}
+          <TouchableOpacity style={s.primaryBtn} onPress={share} disabled={sharing}>
+            {sharing ? <ActivityIndicator color="#fff" size="small" /> : <Ionicons name="share-outline" size={16} color="#fff" />}
+            <Text style={s.primaryTxt}>Share receipt</Text>
+          </TouchableOpacity>
+        </View>
+      </ScrollView>
+    </View>
+  );
+}
+
+// ── Reschedule notice ───────────────────────────────────────────────────────
+function RescheduleNotice({ booking, turf }: { booking: any; turf: any }) {
+  const history = booking.rescheduleHistory || [];
+  const last = history.length ? history[history.length - 1] : null;
+  if (!last) return null;
+  const was = [last.fromDate, shortSlots(last.fromSlots, turf)].filter(Boolean).join(" · ");
+  const nowTxt = [last.toDate || booking.dateString, shortSlots(last.toSlots, turf)].filter(Boolean).join(" · ");
+  return (
+    <View style={rsS.wrap}>
+      <View style={rsS.head}>
+        <View style={rsS.icon}><Ionicons name="repeat" size={17} color="#7C3AED" /></View>
+        <View style={{ flex: 1 }}>
+          <Text style={rsS.title}>Moved by the venue</Text>
+          <Text style={rsS.sub} numberOfLines={2}>
+            {last.reason ? `“${last.reason}”`
+              : booking.rescheduleCount > 1 ? `Moved ${booking.rescheduleCount} times — latest change shown` : "The venue changed your date/time"}
+          </Text>
+        </View>
+      </View>
+      <View style={rsS.row}>
+        <View style={{ flex: 1 }}>
+          <Text style={rsS.lbl}>WAS</Text>
+          <Text style={rsS.old} numberOfLines={2}>{was || "—"}</Text>
+        </View>
+        <Ionicons name="arrow-forward" size={15} color="#C4B5FD" />
+        <View style={{ flex: 1 }}>
+          <Text style={[rsS.lbl, { color: "#7C3AED" }]}>NOW</Text>
+          <Text style={rsS.new} numberOfLines={2}>{nowTxt || "—"}</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+// ── Refund tracker ──────────────────────────────────────────────────────────
+function RefundTracker({ booking, paidOnline, atTurf }: { booking: any; paidOnline: number; atTurf: number }) {
+  const [live, setLive] = useState<any>(null);
+  const [checking, setChecking] = useState(false);
+  const [lastChecked, setLastChecked] = useState<Date | null>(null);
+
+  const check = useCallback(async () => {
+    const uid = auth.currentUser?.uid;
+    if (!booking?.id || !uid) return;
+    setChecking(true);
     try {
-      // Small delay to ensure ViewShot renders fully
-      await new Promise(resolve => setTimeout(resolve, 300));
-      const uri = await receiptRef.current.capture();
-      // FIX: add mimeType for Android share sheet
-      await Sharing.shareAsync(uri, {
-        mimeType:    "image/png",
-        dialogTitle: "Share Booking Receipt",
-        UTI:         "public.png",
-      });
-    } catch (e) {
-      Alert.alert("Error", "Unable to share receipt. Please try again.");
-    }
-  };
+      const res = await fetch(`${SERVER_URL}/refund-status/${booking.id}?userId=${uid}`);
+      const data = await res.json();
+      if (data.success) { setLive(data); setLastChecked(new Date()); }
+    } catch (e) { console.log("Refund check error:", e); }
+    finally { setChecking(false); }
+  }, [booking?.id]);
 
-  // FIX: bookingStatus — slot <2hrs away should NOT show as completed
-  const bookingStatus = useMemo(() => {
-    const rawStatus = booking?.status || "pending";
-    if (rawStatus === "cancelled") return "cancelled";
-    if (rawStatus === "completed") return "completed";
+  useEffect(() => { if (booking?.paymentId) check(); }, [booking?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    // Only mark completed if the booking date is fully in the past (end of that day)
-    if (booking?.bookingDate) {
-      const bookingDay = new Date(booking.bookingDate);
-      bookingDay.setHours(23, 59, 59, 999);
-      if (bookingDay < new Date()) return "completed";
-    }
+  const key = live?.refundStatus ?? booking.refundStatus ?? "not_applicable";
+  const cfg = REFUND_CFG[key] ?? REFUND_CFG.not_applicable;
+  const amount = Number(live?.refundAmount ?? booking.refundAmount ?? 0);
+  const cancelledAt = toDate(booking.cancelledAt);
 
-    return rawStatus; // "confirmed" for future/today bookings
-  }, [booking]);
+  return (
+    <View style={s.card}>
+      <View style={s.cardHead}>
+        <Text style={s.cardTitle}>Refund</Text>
+        <TouchableOpacity style={s.smallBtn} onPress={check} disabled={checking} accessibilityLabel="Check refund status">
+          {checking ? <ActivityIndicator size="small" color={SLATE} /> : <Ionicons name="refresh" size={14} color={SLATE} />}
+          <Text style={s.smallBtnTxt}>Check</Text>
+        </TouchableOpacity>
+      </View>
 
-  const statusConfig = useMemo(() => {
-    if (bookingStatus === "confirmed") return { color: "#0A7D57", bg: "#E7F8F0", label: "CONFIRMED" };
-    if (bookingStatus === "cancelled") return { color: "#D92D20", bg: "#FDECEC", label: "CANCELLED" };
-    if (bookingStatus === "completed") return { color: "#555555", bg: "#EEEEEE", label: "COMPLETED" };
-    return { color: "#B76E00", bg: "#FFF3E0", label: "PENDING" };
-  }, [bookingStatus]);
+      <View style={[rf.banner, { backgroundColor: cfg.bg }]}>
+        <View style={{ flex: 1 }}>
+          <Text style={[rf.bTitle, { color: cfg.fg }]}>{cfg.label}</Text>
+          {key === "not_applicable" ? (
+            <Text style={[rf.bSub, { color: cfg.fg }]}>
+              {paidOnline > 0
+                ? `You paid ${rs(paidOnline)} online as advance${atTurf > 0 ? ` and ${rs(atTurf)} was due at the turf` : ""}. As per the cancellation policy, no online refund applies.`
+                : "Nothing was paid online for this booking."}
+            </Text>
+          ) : (
+            <Text style={[rf.bSub, { color: cfg.fg }]}>{cfg.sub}</Text>
+          )}
+        </View>
+        {amount > 0 && <Text style={[rf.amt, { color: cfg.fg }]}>{rs(amount)}</Text>}
+      </View>
 
-  // ─── Loading ────────────────────────────────────────────────────────────────
-  if (loading) {
+      {cfg.step > 0 && (
+        <View style={{ marginTop: 10 }}>
+          {REFUND_STEPS.map((label, i) => {
+            const n = i + 1;
+            const done = cfg.step > n || cfg.step === 3;
+            const cur = cfg.step === n && cfg.step !== 3;
+            return (
+              <View key={label} style={rf.step}>
+                <View style={[rf.dot, done && { backgroundColor: "#059669" }, cur && { backgroundColor: "#2563EB" }]}>
+                  {done ? <Ionicons name="checkmark" size={12} color="#fff" /> : <Text style={[rf.dotTxt, cur && { color: "#fff" }]}>{n}</Text>}
+                </View>
+                <Text style={[rf.stepTxt, (done || cur) && { color: INK, fontWeight: "800" }]}>{label}</Text>
+              </View>
+            );
+          })}
+        </View>
+      )}
+
+      <View style={rf.foot}>
+        <Text style={rf.footTxt}>
+          {cancelledAt ? `Cancelled on ${cancelledAt.toLocaleDateString("en-IN", { day: "numeric", month: "short" })}` : "Cancelled"}
+          {booking.cancellationReason ? ` · “${booking.cancellationReason}”` : ""}
+        </Text>
+        {lastChecked && <Text style={rf.footTxt}>Checked {lastChecked.toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" })}</Text>}
+      </View>
+    </View>
+  );
+}
+
+// ── Coins card ──────────────────────────────────────────────────────────────
+function CoinsCard({ booking, cancelled, turfName }: { booking: any; cancelled: boolean; turfName: string }) {
+  const pPend = Number(booking.pcoinPending || 0);
+  const vPend = Number(booking.vcoinPending || 0);
+  const pEarn = Number(booking.pcoinEarned || 0);
+  const vEarn = Number(booking.vcoinEarned || 0);
+  if (!pPend && !vPend && !pEarn && !vEarn) return null;
+
+  if (cancelled) {
     return (
-      <SafeAreaView style={styles.center}>
-        <StatusBar barStyle="dark-content" backgroundColor="#F3F4F6" />
-        <ActivityIndicator size="large" color="#111111" />
-        <Text style={styles.loaderText}>Loading booking details...</Text>
-      </SafeAreaView>
+      <View style={[s.card, cc.row, { backgroundColor: "#FEF2F2", borderColor: "#FECACA" }]}>
+        <View style={[cc.icon, { backgroundColor: "#FEE2E2" }]}><Ionicons name="close-circle-outline" size={20} color="#DC2626" /></View>
+        <View style={{ flex: 1 }}>
+          <Text style={[cc.title, { color: "#DC2626" }]}>No coins for this booking</Text>
+          <Text style={cc.sub}>Booking cancelled — coins you used are back in your wallet</Text>
+        </View>
+      </View>
     );
   }
 
-  // ─── Not found ──────────────────────────────────────────────────────────────
-  if (!booking) {
+  if (booking.coinStatus === "credited" || pEarn > 0 || vEarn > 0) {
     return (
-      <SafeAreaView style={styles.center}>
-        <StatusBar barStyle="dark-content" backgroundColor="#F3F4F6" />
-        <Ionicons name="alert-circle-outline" size={52} color="#D1D5DB" />
-        <Text style={styles.emptyTitle}>Booking not found</Text>
-        <Text style={[styles.loaderText, { textAlign: "center", marginTop: 8 }]}>
-          This booking may have been removed or the link is invalid.
-        </Text>
-        <TouchableOpacity style={styles.backButton} onPress={() => router.back()}>
-          <Text style={styles.backButtonText}>Go Back</Text>
-        </TouchableOpacity>
-      </SafeAreaView>
+      <LinearGradient colors={["#0F5132", "#146C43", "#0B3D26"]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={cc.credit}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+          <View style={cc.live} />
+          <Text style={cc.eyebrow}>COINS CREDITED</Text>
+        </View>
+        <Text style={cc.cTitle}>🎉 Added straight to your wallet</Text>
+        <View style={cc.tiles}>
+          {pEarn > 0 && (
+            <View style={cc.tile}>
+              <Text style={cc.tLbl}>🪙 PCOIN</Text>
+              <Text style={cc.tVal}>+{pEarn}</Text>
+              <Text style={cc.tSub}>₹{pEarn} · any turf</Text>
+            </View>
+          )}
+          {vEarn > 0 && (
+            <View style={cc.tile}>
+              <Text style={cc.tLbl}>🏟️ VCOIN</Text>
+              <Text style={cc.tVal}>+{vEarn}</Text>
+              <Text style={cc.tSub} numberOfLines={1}>{turfName} only</Text>
+            </View>
+          )}
+        </View>
+      </LinearGradient>
     );
   }
 
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <StatusBar barStyle="dark-content" backgroundColor="#F3F4F6" />
-      <ScrollView
-        style={styles.container}
-        contentContainerStyle={styles.content}
-        showsVerticalScrollIndicator={false}
-      >
-
-        {/* ── Top bar ── */}
-        <Animated.View entering={FadeInDown.duration(150)} style={styles.topBar}>
-          <TouchableOpacity style={styles.iconBtn} onPress={() => router.back()}>
-            <Ionicons name="arrow-back" size={20} color="#111111" />
-          </TouchableOpacity>
-          <Text style={styles.topBarTitle}>Booking Receipt</Text>
-          <View style={styles.iconBtnPlaceholder} />
-        </Animated.View>
-
-        {/* ── Receipt (captured by ViewShot for sharing) ── */}
-        <ViewShot
-          ref={receiptRef}
-          options={{ format: "png", quality: 1 }}
-          style={{ backgroundColor: "#FFFFFF", padding: 16 }}
-        >
-          <Animated.View entering={FadeInDown.delay(100).duration(300)} style={styles.receiptCard}>
-
-            {/* Header */}
-            <View style={styles.receiptHeader}>
-              <View>
-                <Text style={styles.receiptTitle}>PLAYON</Text>
-                <Text style={styles.receiptSub}>Booking Confirmed</Text>
-              </View>
-              <Ionicons name="checkmark-circle" size={34} color="#16A34A" />
-            </View>
-
-            <View style={styles.dashedLine} />
-
-            {/* Details */}
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Venue</Text>
-              <Text style={styles.receiptValue}>{booking.turfName || "N/A"}</Text>
-            </View>
-
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Date</Text>
-              <Text style={styles.receiptValue}>
-                {formatDate(booking.bookingDate ?? null)}
-              </Text>
-            </View>
-
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Slot</Text>
-              <Text style={[styles.receiptValue, styles.slotValue]}>
-                {booking.startTime && booking.endTime
-                  ? `${booking.startTime} - ${booking.endTime}`
-                  : Array.isArray(booking.selectedSlots) && booking.selectedSlots.length > 0
-                  ? formatSlotRange(booking.selectedSlots)
-                  : booking.slotTime || "Slot not available"}
-              </Text>
-            </View>
-
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Booking ID</Text>
-              <Text style={[styles.receiptValue, { maxWidth: "58%", textAlign: "right" }]}>
-                {booking.id}
-              </Text>
-            </View>
-
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Payment Status</Text>
-              <Text style={styles.receiptValue}>
-                {booking.paymentStatus
-                  ? booking.paymentStatus.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())
-                  : "Paid"}
-              </Text>
-            </View>
-
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Booking Status</Text>
-              <Text style={[styles.receiptValue, { color: statusConfig.color }]}>
-                {statusConfig.label}
-              </Text>
-            </View>
-
-            <View style={styles.dashedLine} />
-
-            {/* Amounts */}
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Advance Paid</Text>
-              <Text style={styles.receiptValue}>₹{booking.advanceAmount || booking.paidAmount || 0}</Text>
-            </View>
-
-            <View style={styles.receiptRow}>
-              <Text style={styles.receiptLabel}>Remaining Amount</Text>
-              <Text style={styles.receiptValue}>₹{booking.remainingAmount || 0}</Text>
-            </View>
-
-            <View style={styles.receiptRow}>
-              <Text style={[styles.receiptLabel, { fontWeight: "800", color: "#111111" }]}>
-                Total Amount
-              </Text>
-              <Text style={[styles.receiptValue, { fontSize: 18 }]}>
-                ₹{booking.totalAmount || 0}
-              </Text>
-            </View>
-
-            <View style={styles.dashedLine} />
-            <Text style={styles.receiptFooter}>Thank you for booking with Playon </Text>
-          </Animated.View>
-        </ViewShot>
-
-        {/* ── Refund tracker (only shows when cancelled) ── */}
-        <RefundTracker
-          key={booking?.id}
-          booking={booking}
-          onRefresh={fetchBooking}
-        />
-
-        {/* ── Action buttons ── */}
-        <Animated.View
-          entering={FadeInDown.delay(100).duration(300)}
-          style={styles.receiptCard}
-        >
-          {bookingStatus === "confirmed" && (
-            <TouchableOpacity
-              style={[styles.cancelBtn, cancelling && { opacity: 0.6 }]}
-              onPress={cancelBooking}
-              disabled={cancelling}
-            >
-              {cancelling
-                ? <ActivityIndicator size="small" color="#fff" />
-                : <Text style={styles.btnText}>Cancel Booking</Text>
-              }
-            </TouchableOpacity>
-          )}
-
-          <TouchableOpacity style={styles.shareBtn} onPress={shareReceipt}>
-            <Ionicons name="share-social-outline" size={18} color="#111111" />
-            <Text style={styles.shareBtnText}>Share Receipt</Text>
-          </TouchableOpacity>
-        </Animated.View>
-
-      </ScrollView>
-    </SafeAreaView>
+    <View style={[s.card, cc.row, { backgroundColor: "#FFFBEB", borderColor: "#FDE68A" }]}>
+      <View style={[cc.icon, { backgroundColor: "#FEF3C7" }]}><Text style={{ fontSize: 18 }}>🪙</Text></View>
+      <View style={{ flex: 1 }}>
+        <Text style={[cc.title, { color: "#B45309" }]}>Coins on the way</Text>
+        <Text style={cc.sub}>Added to your wallet after the game</Text>
+      </View>
+      <View style={{ gap: 4, alignItems: "flex-end" }}>
+        {pPend > 0 && <View style={[cc.pill, { backgroundColor: "#EDE9FE" }]}><Text style={[cc.pillTxt, { color: "#7C3AED" }]}>+{pPend} PCoin</Text></View>}
+        {vPend > 0 && <View style={[cc.pill, { backgroundColor: "#FEF3C7" }]}><Text style={[cc.pillTxt, { color: "#B45309" }]}>+{vPend} VCoin</Text></View>}
+      </View>
+    </View>
   );
 }
 
-// ─── Refund tracker styles ────────────────────────────────────────────────────
-const rt = StyleSheet.create({
-  wrap: {
-    backgroundColor: "#FFFFFF",
-    marginHorizontal: 16,
-    marginTop: 16,
-    borderRadius: 24,
-    padding: 18,
-    borderWidth: 1,
-    borderColor: "#DDD6FE",
-  },
-  header: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginBottom: 14,
-    gap: 8,
-  },
-  headerTitle: {
-    flex: 1,
-    fontSize: 16,
-    fontWeight: "800",
-    color: "#111827",
-  },
-  refreshBtn: {
-    width: 34,
-    height: 34,
-    borderRadius: 10,
-    backgroundColor: "#F5F3FF",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  banner: {
-    flexDirection: "row",
-    alignItems: "center",
-    borderRadius: 16,
-    padding: 14,
-    marginBottom: 16,
-  },
-  iconCircle: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
-    alignItems: "center",
-    justifyContent: "center",
-    flexShrink: 0,
-  },
-  bannerTitle: {
-    fontSize: 15,
-    fontWeight: "900",
-    marginBottom: 4,
-  },
-  bannerSub: {
-    fontSize: 12,
-    lineHeight: 17,
-    fontWeight: "500",
-  },
-  refundAmt: {
-    fontSize: 20,
-    fontWeight: "900",
-    marginTop: 6,
-  },
-  stepsWrap: {
-    marginBottom: 16,
-    paddingHorizontal: 4,
-  },
-  stepRow: {
-    flexDirection: "row",
-    alignItems: "flex-start",
-    gap: 12,
-    marginBottom: 0,
-  },
-  stepLeft: {
-    alignItems: "center",
-    width: 24,
-  },
-  stepDot: {
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    backgroundColor: "#E5E7EB",
-    alignItems: "center",
-    justifyContent: "center",
-    borderWidth: 2,
-    borderColor: "#D1D5DB",
-  },
-  stepDotDone:    { backgroundColor: "#059669", borderColor: "#059669" },
-  stepDotCurrent: { backgroundColor: "#7C3AED", borderColor: "#7C3AED" },
-  stepDotNum:     { fontSize: 10, fontWeight: "800", color: "#9CA3AF" },
-  stepLine:       { width: 2, height: 20, backgroundColor: "#E5E7EB", marginTop: 2 },
-  stepLineDone:   { backgroundColor: "#059669" },
-  stepLabel:      { fontSize: 13, color: "#9CA3AF", fontWeight: "600", paddingTop: 4, paddingBottom: 20 },
-  stepLabelActive:{ color: "#111827", fontWeight: "700" },
+// ── Small pieces ────────────────────────────────────────────────────────────
+function Pill({ text, bg, fg }: { text: string; bg: string; fg: string }) {
+  return <View style={[s.pill, { backgroundColor: bg }]}><Text style={[s.pillTxt, { color: fg }]}>{text}</Text></View>;
+}
+function Stripes() {
+  return (
+    <View style={StyleSheet.absoluteFill} pointerEvents="none">
+      <View style={{ flex: 1, flexDirection: "row", backgroundColor: BRAND }}>
+        {Array.from({ length: 16 }).map((_, i) => <View key={i} style={{ width: 40, backgroundColor: i % 2 ? STRIPE : BRAND }} />)}
+      </View>
+      <View style={s.pitchCircle} />
+    </View>
+  );
+}
+function TearLine() {
+  return (
+    <View style={s.tear}>
+      <View style={[s.notch, { left: -13 }]} />
+      <View style={[s.notch, { right: -13 }]} />
+      <View style={s.tearDash} />
+    </View>
+  );
+}
+function ZigZag() {
+  return (
+    <View style={s.zigWrap}>
+      {Array.from({ length: 40 }).map((_, i) => <View key={i} style={[s.zigTooth, { left: i * 12 - 3 }]} />)}
+    </View>
+  );
+}
+function BillRow({ label, value, color, strong }: { label: string; value: string; color?: string; strong?: boolean }) {
+  return (
+    <View style={s.billRow}>
+      <Text style={[s.billLbl, strong && { color: INK, fontWeight: "900", fontSize: 15 }]} numberOfLines={1}>{label}</Text>
+      <Text style={[s.billVal, strong && { fontSize: 15 }, color ? { color } : null]}>{value}</Text>
+    </View>
+  );
+}
 
-  infoBlock: {
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-    overflow: "hidden",
-    marginBottom: 10,
-  },
-  infoRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderBottomWidth: 1,
-    borderBottomColor: "#F3F4F6",
-    backgroundColor: "#FFFFFF",
-  },
-  infoLabel: { fontSize: 12, color: "#9CA3AF", fontWeight: "600" },
-  infoVal:   { fontSize: 13, color: "#111827", fontWeight: "700" },
+// ── Styles ──────────────────────────────────────────────────────────────────
+const s = StyleSheet.create({
+  root: { flex: 1, backgroundColor: PAGE },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: PAGE, gap: 8 },
+  loadTxt: { marginTop: 6, color: MUTED, fontSize: 15, fontWeight: "600" },
+  nfTitle: { fontSize: 18, fontWeight: "900", color: INK, marginTop: 6 },
+  nfSub: { fontSize: 13, fontWeight: "600", color: MUTED, textAlign: "center" },
+  nfBtn: { marginTop: 10, backgroundColor: BRAND, paddingHorizontal: 22, height: 46, borderRadius: 13, justifyContent: "center" },
+  nfBtnTxt: { color: "#fff", fontSize: 14, fontWeight: "800" },
 
-  failBox: {
-    flexDirection: "row",
-    alignItems: "flex-start",
-    gap: 8,
-    backgroundColor: "#FEE2E2",
-    borderRadius: 12,
-    padding: 12,
-    marginTop: 4,
-  },
-  failTxt: { flex: 1, fontSize: 12, color: "#DC2626", lineHeight: 18, fontWeight: "500" },
+  turf: { backgroundColor: BRAND, borderBottomLeftRadius: 28, borderBottomRightRadius: 28, overflow: "hidden", paddingBottom: 18 },
+  pitchCircle: { position: "absolute", alignSelf: "center", top: 230, width: 190, height: 190, borderRadius: 95, borderWidth: 2, borderColor: "rgba(255,255,255,0.12)" },
+  headerRow: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 16 },
+  hBtn: { width: 44, height: 44, borderRadius: 13, backgroundColor: "rgba(255,255,255,0.16)", alignItems: "center", justifyContent: "center" },
+  hKicker: { fontSize: 10, letterSpacing: 1.4, fontWeight: "800", color: ON_BRAND },
+  hTitle: { fontSize: 20, fontWeight: "900", color: "#fff" },
 
-  naBox: {
-    flexDirection: "row",
-    alignItems: "flex-start",
-    gap: 8,
-    backgroundColor: "#F9FAFB",
-    borderRadius: 12,
-    padding: 12,
-    marginTop: 4,
-  },
-  naTxt: { flex: 1, fontSize: 12, color: "#6B7280", lineHeight: 18, fontWeight: "500" },
+  shot: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 6, overflow: "hidden" },
+  ticketWrap: { shadowColor: INK, shadowOpacity: 0.22, shadowRadius: 18, shadowOffset: { width: 0, height: 10 }, elevation: 8 },
+  ticketTop: { backgroundColor: "#fff", borderTopLeftRadius: 22, borderTopRightRadius: 22, paddingHorizontal: 18, paddingTop: 18, paddingBottom: 8 },
+  brandRow: { flexDirection: "row", alignItems: "center", gap: 10 },
+  logo: { width: 44, height: 44 },
+  brand: { fontSize: 18, fontWeight: "900", letterSpacing: -0.2, color: INK },
+  brandSub: { fontSize: 11, fontWeight: "700", color: MUTED },
+  stamp: { height: 28, paddingHorizontal: 10, borderRadius: 999, justifyContent: "center" },
+  stampTxt: { fontSize: 11, fontWeight: "900", letterSpacing: 0.4 },
+  dateTitle: { textAlign: "center", fontSize: 12, fontWeight: "800", color: MUTED, letterSpacing: 0.8, marginTop: 18 },
+  bigTime: { textAlign: "center", fontSize: 30, fontWeight: "900", color: INK, letterSpacing: -0.6, marginTop: 4 },
+  pillRow: { flexDirection: "row", flexWrap: "wrap", justifyContent: "center", gap: 6, marginTop: 8 },
+  pill: { height: 24, paddingHorizontal: 9, borderRadius: 999, justifyContent: "center" },
+  pillTxt: { fontSize: 11, fontWeight: "800" },
+  turfBox: { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: "#F5F7FA", borderRadius: 13, paddingHorizontal: 12, paddingVertical: 10, marginTop: 16 },
+  infoLbl: { fontSize: 10, fontWeight: "800", color: MUTED, letterSpacing: 0.6 },
+  infoVal: { fontSize: 14, fontWeight: "900", color: INK, marginTop: 2 },
+  infoSub: { fontSize: 11, fontWeight: "600", color: MUTED },
+  dirBtn: { flexDirection: "row", alignItems: "center", gap: 4, height: 36, paddingHorizontal: 11, borderRadius: 10, borderWidth: 1, borderColor: "#BBF7D0", backgroundColor: "#F0FDF4" },
+  dirTxt: { fontSize: 12, fontWeight: "800", color: BRAND },
+
+  tear: { height: 26, backgroundColor: "#fff", justifyContent: "center" },
+  notch: { position: "absolute", top: 0, width: 26, height: 26, borderRadius: 13, backgroundColor: BRAND },
+  tearDash: { marginHorizontal: 20, borderTopWidth: 2, borderStyle: "dashed", borderColor: LINE },
+
+  ticketBottom: { backgroundColor: "#fff", paddingHorizontal: 18, paddingTop: 6, paddingBottom: 14 },
+  kicker: { fontSize: 10.5, letterSpacing: 0.9, fontWeight: "800", color: MUTED, marginBottom: 6 },
+  billRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 6, gap: 10 },
+  billLbl: { flex: 1, fontSize: 13.5, fontWeight: "700", color: SLATE },
+  billVal: { fontSize: 13.5, fontWeight: "900", color: INK },
+  billLine: { borderTopWidth: 1, borderColor: "#EEF1F5", marginVertical: 4 },
+  dueBox: { marginTop: 10, flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: "#FFF7ED", borderWidth: 1, borderColor: "#FED7AA", borderRadius: 14, padding: 12 },
+  dueLbl: { fontSize: 10.5, fontWeight: "900", color: "#C2410C", letterSpacing: 0.6 },
+  dueSub: { fontSize: 11.5, fontWeight: "600", color: "#9A3412", marginTop: 1 },
+  dueOld: { fontSize: 13, fontWeight: "700", color: "#C2410C", opacity: 0.6, textDecorationLine: "line-through" },
+  dueAmt: { fontSize: 24, fontWeight: "900", color: "#9A3412", maxWidth: 130 },
+  saveBox: { marginTop: 10, backgroundColor: "#F0FDF4", borderWidth: 1, borderStyle: "dashed", borderColor: "#86EFAC", borderRadius: 12, paddingVertical: 10, paddingHorizontal: 12 },
+  saveTxt: { textAlign: "center", fontSize: 13, fontWeight: "800", color: BRAND },
+  idHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 10 },
+  idRow: { gap: 3, marginTop: 14, paddingTop: 12, borderTopWidth: 1, borderStyle: "dashed", borderColor: LINE },
+  idLbl: { fontSize: 10, fontWeight: "800", color: FAINT, letterSpacing: 0.6 },
+  idVal: { fontSize: 12.5, lineHeight: 18, fontWeight: "700", color: "#334155", letterSpacing: 0.3, fontFamily: Platform.OS === "ios" ? "Courier" : "monospace" },
+  idHint: { fontSize: 10.5, fontWeight: "700", color: FAINT },
+  zigWrap: { height: 8, overflow: "hidden" },
+  zigTooth: { position: "absolute", top: -6, width: 12, height: 12, backgroundColor: "#fff", transform: [{ rotate: "45deg" }] },
+  shotFoot: { textAlign: "center", color: ON_BRAND, fontSize: 12, fontWeight: "800", marginTop: 12, marginBottom: 6 },
+
+  card: { backgroundColor: "#fff", borderRadius: 18, marginHorizontal: 16, marginTop: 14, padding: 14, borderWidth: 1, borderColor: LINE },
+  cardHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  cardTitle: { fontSize: 16, fontWeight: "900", color: INK },
+  smallBtn: { flexDirection: "row", alignItems: "center", gap: 5, height: 34, paddingHorizontal: 10, borderRadius: 10, borderWidth: 1, borderColor: LINE, backgroundColor: "#fff" },
+  smallBtnTxt: { fontSize: 12, fontWeight: "800", color: SLATE },
+
+  deadline: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, marginTop: 14, marginHorizontal: 16 },
+  deadlineTxt: { fontSize: 12, fontWeight: "700", color: MUTED },
+  actRow: { flexDirection: "row", gap: 8, marginHorizontal: 16, marginTop: 10 },
+  dangerBtn: { flex: 1, height: 50, borderRadius: 14, borderWidth: 1, borderColor: "#FECACA", backgroundColor: "#fff", alignItems: "center", justifyContent: "center" },
+  dangerTxt: { fontSize: 14, fontWeight: "800", color: "#DC2626" },
+  ghostBtn: { flex: 1, height: 50, borderRadius: 14, borderWidth: 1, borderColor: LINE, backgroundColor: "#fff", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 },
+  ghostTxt: { fontSize: 14, fontWeight: "800", color: INK },
+  primaryBtn: { flex: 1, height: 50, borderRadius: 14, backgroundColor: BRAND, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 },
+  primaryTxt: { fontSize: 14, fontWeight: "800", color: "#fff" },
 });
 
-// ─── Main styles ──────────────────────────────────────────────────────────────
-const styles = StyleSheet.create({
-  safeArea:  { flex: 1, backgroundColor: "#F3F4F6" },
-  container: { flex: 1, backgroundColor: "#FFFFFF", paddingTop: 20 },
-  content:   { paddingBottom: 40 },
-  center:    {
-    flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-    backgroundColor: "#F3F4F6",
-    paddingHorizontal: 24,
-  },
-  loaderText: { marginTop: 12, color: "#4B5563", fontSize: 15, fontWeight: "600" },
-  emptyTitle: { fontSize: 22, fontWeight: "800", color: "#111111", marginTop: 12 },
+const rsS = StyleSheet.create({
+  wrap: { backgroundColor: "#fff", borderRadius: 18, marginHorizontal: 16, marginTop: 14, padding: 12, shadowColor: INK, shadowOpacity: 0.12, shadowRadius: 12, shadowOffset: { width: 0, height: 6 }, elevation: 4 },
+  head: { flexDirection: "row", alignItems: "center", gap: 10 },
+  icon: { width: 34, height: 34, borderRadius: 10, backgroundColor: "#F5F3FF", alignItems: "center", justifyContent: "center" },
+  title: { fontSize: 13.5, fontWeight: "900", color: INK },
+  sub: { fontSize: 11, fontWeight: "600", color: MUTED, marginTop: 1 },
+  row: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 10, backgroundColor: "#F8FAFC", borderRadius: 12, padding: 10 },
+  lbl: { fontSize: 9.5, fontWeight: "900", color: FAINT, letterSpacing: 0.5 },
+  old: { fontSize: 12, fontWeight: "700", color: FAINT, textDecorationLine: "line-through", marginTop: 1 },
+  new: { fontSize: 12, fontWeight: "900", color: INK, marginTop: 1 },
+});
 
-  topBar: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 16,
-    paddingTop: Platform.OS === "android" ? 12 : 8,
-    paddingBottom: 3,
-  },
-  iconBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: "#FFFFFF",
-    justifyContent: "center",
-    alignItems: "center",
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-  },
-  iconBtnPlaceholder: { width: 40, height: 40 },
-  topBarTitle: { fontSize: 18, fontWeight: "800", color: "#111111" },
+const rf = StyleSheet.create({
+  banner: { marginTop: 10, borderRadius: 14, padding: 12, flexDirection: "row", alignItems: "center", gap: 10 },
+  bTitle: { fontSize: 14, fontWeight: "900" },
+  bSub: { fontSize: 11.5, fontWeight: "600", marginTop: 2, lineHeight: 16, opacity: 0.9 },
+  amt: { fontSize: 22, fontWeight: "900" },
+  step: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 5 },
+  dot: { width: 24, height: 24, borderRadius: 12, backgroundColor: "#E2E8F0", alignItems: "center", justifyContent: "center" },
+  dotTxt: { fontSize: 11, fontWeight: "900", color: FAINT },
+  stepTxt: { fontSize: 13, fontWeight: "600", color: FAINT },
+  foot: { marginTop: 8, borderTopWidth: 1, borderColor: "#EEF1F5", paddingTop: 8, gap: 2 },
+  footTxt: { fontSize: 12, fontWeight: "600", color: MUTED },
+});
 
-  cancelBtn: {
-    backgroundColor: "#111111",
-    paddingVertical: 12,
-    borderRadius: 14,
-    alignItems: "center",
-    justifyContent: "center",
-    marginBottom: 12,
-    flexDirection: "row",
-    gap: 8,
-  },
-  btnText: { color: "#FFFFFF", fontWeight: "700", fontSize: 14 },
-
-  backButton: {
-    marginTop: 16,
-    backgroundColor: "#111111",
-    paddingHorizontal: 18,
-    paddingVertical: 12,
-    borderRadius: 12,
-  },
-  backButtonText: { color: "#FFFFFF", fontWeight: "700" },
-
-  receiptCard: {
-    backgroundColor: "#FFFFFF",
-    marginHorizontal: 16,
-    marginTop: 16,
-    borderRadius: 24,
-    padding: 18,
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-  },
-  receiptHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
-  receiptTitle: { fontSize: 18, fontWeight: "800", color: "#111111", letterSpacing: 1 },
-  receiptSub:   { fontSize: 13, color: "#6B7280", marginTop: 3 },
-
-  dashedLine: {
-    borderStyle: "dashed",
-    borderWidth: 1,
-    borderColor: "#D1D5DB",
-    marginVertical: 16,
-  },
-  receiptRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "flex-start",
-    marginBottom: 12,
-  },
-  receiptLabel: { color: "#6B7280", fontSize: 14 },
-  receiptValue: { color: "#111111", fontSize: 14, fontWeight: "800" },
-  receiptFooter: {
-    textAlign: "center",
-    color: "#6B7280",
-    fontSize: 13,
-    fontWeight: "600",
-  },
-
-  shareBtn: {
-    backgroundColor: "#FFFFFF",
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-    paddingVertical: 14,
-    borderRadius: 14,
-    alignItems: "center",
-    justifyContent: "center",
-    flexDirection: "row",
-    marginBottom: 4,
-  },
-  shareBtnText: { marginLeft: 8, color: "#111111", fontWeight: "700", fontSize: 14 },
-
-  slotValue: {
-    maxWidth: "68%",
-    textAlign: "right",
-    lineHeight: 22,
-  },
+const cc = StyleSheet.create({
+  row: { flexDirection: "row", alignItems: "center", gap: 12 },
+  icon: { width: 40, height: 40, borderRadius: 12, alignItems: "center", justifyContent: "center" },
+  title: { fontSize: 14, fontWeight: "900" },
+  sub: { fontSize: 11.5, fontWeight: "600", color: "#78716C", marginTop: 1 },
+  pill: { height: 26, paddingHorizontal: 9, borderRadius: 999, justifyContent: "center" },
+  pillTxt: { fontSize: 12, fontWeight: "800" },
+  credit: { marginHorizontal: 16, marginTop: 14, borderRadius: 20, padding: 16, overflow: "hidden" },
+  live: { width: 8, height: 8, borderRadius: 4, backgroundColor: "#4ADE80" },
+  eyebrow: { color: "rgba(255,255,255,0.8)", fontSize: 11, fontWeight: "800", letterSpacing: 0.6 },
+  cTitle: { color: "#fff", fontSize: 16, fontWeight: "900", marginTop: 6 },
+  tiles: { flexDirection: "row", gap: 8, marginTop: 12 },
+  tile: { flex: 1, backgroundColor: "rgba(255,255,255,0.12)", borderRadius: 14, padding: 11 },
+  tLbl: { color: "rgba(255,255,255,0.7)", fontSize: 10, fontWeight: "800", letterSpacing: 0.4 },
+  tVal: { color: "#fff", fontSize: 24, fontWeight: "900", marginTop: 2 },
+  tSub: { color: "rgba(255,255,255,0.65)", fontSize: 10.5, fontWeight: "600" },
 });

@@ -3,6 +3,7 @@ import * as Notifications from "expo-notifications";
 import * as Device from "expo-device";
 import Constants from "expo-constants";
 import { Platform } from "react-native";
+import { useRouter } from "expo-router";
 import { db, auth } from "../../firebaseConfig";
 import { doc, updateDoc, getDoc } from "firebase/firestore";
 
@@ -70,6 +71,48 @@ function addNotification(notif: Notifications.Notification) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Tap-to-navigate — maps the { screen, bookingId } payload server.js already
+// attaches to every push into an actual in-app route.
+//
+// CONFIRMED against existing app code:
+//   - "bookings"       → /paymentBooking/[id]   (booking-users.tsx already routes here)
+//   - "owner-bookings" → /(owner)/bookings       (index.tsx already routes here)
+//
+// BEST-GUESS — not confirmed against your real folder structure, please check:
+//   - "wallet", "refer-and-earn", "profile", "owner-gym", "owner-settlement",
+//     "memberships"
+// If any of these are wrong, tapping that notification type will either 404
+// or silently no-op depending on expo-router's behavior — safer than doing
+// nothing, but worth a 2-minute manual check on-device.
+// ─────────────────────────────────────────────────────────────────────────────
+function routeForNotification(data: Record<string, any>): string | null {
+  const screen    = data?.screen;
+  const bookingId = data?.bookingId;
+
+  switch (screen) {
+    case "bookings":
+      // Booking confirmed / cancelled / rescheduled — all send this
+      return bookingId ? `/paymentBooking/${bookingId}` : null;
+    case "owner-bookings":
+      return "/(owner)/bookings";
+    case "wallet":
+      return "/wallet";
+    case "refer-and-earn":
+      return "/refer-and-earn";
+    case "profile":
+      return "/profile";
+    case "owner-gym":
+      return "/(owner)/owner-gym";
+    case "owner-settlement":
+      return "/(owner)/settlementscreen";
+    case "memberships":
+      return "/memberships";
+    default:
+      return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // One-time setup — runs once per app session at module load
 // ─────────────────────────────────────────────────────────────────────────────
 let notificationHandlerSet = false;
@@ -106,6 +149,7 @@ if (!notificationHandlerSet) {
 // Main hook
 // ─────────────────────────────────────────────────────────────────────────────
 export function usePushNotifications() {
+  const router = useRouter();
   const notificationListener = useRef<Notifications.EventSubscription | null>(null);
   const responseListener     = useRef<Notifications.EventSubscription | null>(null);
 
@@ -126,7 +170,16 @@ export function usePushNotifications() {
       }
     });
 
-    const addNotifFromResponse = (response: Notifications.NotificationResponse) => {
+    // navDelayMs: cold-start opens (app was killed, user tapped the push to
+    // launch it) fire getLastNotificationResponseAsync() before the root
+    // navigator has necessarily finished mounting — router.push() that early
+    // can silently no-op. A live tap (app already running) doesn't need the
+    // delay since the navigator's already up, but a small delay there too is
+    // harmless and keeps this function's behavior consistent either way.
+    const addNotifFromResponse = (
+      response: Notifications.NotificationResponse,
+      navDelayMs: number = 0
+    ) => {
       const n  = response.notification;
       const id = n.request.identifier || Date.now().toString();
 
@@ -134,24 +187,38 @@ export function usePushNotifications() {
       if (_addedIds.has(id)) return;
       _addedIds.add(id);
 
+      const data = (n.request.content.data as Record<string, any>) ?? {};
+
       const notifItem: NotifItem = {
         id,
         title: n.request.content.title ?? "",
         body:  n.request.content.body  ?? "",
-        data:  (n.request.content.data as Record<string, any>) ?? {},
+        data,
         date:  Date.now(),
         read:  false,
       };
 
       _notifications = [notifItem, ..._notifications].slice(0, 50);
       _listeners.forEach((l) => l([..._notifications]));
+
+      // ── Tap-to-navigate ──────────────────────────────────────────────
+      const target = routeForNotification(data);
+      if (target) {
+        setTimeout(() => {
+          try {
+            router.push(target as any);
+          } catch (e) {
+            console.warn("⚠️ Notification navigation failed:", e);
+          }
+        }, navDelayMs);
+      }
     };
 
     // Capture notification that opened app from killed/background state
     Notifications.getLastNotificationResponseAsync()
       .then((response) => {
         if (response?.notification) {
-          addNotifFromResponse(response);
+          addNotifFromResponse(response, 400); // cold start — give the navigator time to mount
         }
       })
       .catch(() => {}); // suppress deprecation errors safely
@@ -168,7 +235,7 @@ export function usePushNotifications() {
     responseListener.current = Notifications.addNotificationResponseReceivedListener(
       (response) => {
         console.log("👆 Notification tapped:", response.notification.request.content.title);
-        addNotifFromResponse(response);
+        addNotifFromResponse(response, 0); // app already running — navigate immediately
       }
     );
 
@@ -177,7 +244,7 @@ export function usePushNotifications() {
       notificationListener.current?.remove();
       responseListener.current?.remove();
     };
-  }, []);
+  }, [router]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

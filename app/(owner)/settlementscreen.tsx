@@ -1,708 +1,533 @@
+/**
+ * (owner)/settlementscreen.tsx — Online money history (like PhonePe history)
+ * • Top: Today (collecting) and Yesterday cards
+ * • Turf chips → history of the last 15 days, "Show 15 more days" loads older
+ * • Tap a day → day receipt: you receive, bookings, PCoin, VCoin, offers, booking list
+ * Removed: payment type breakdown, fee table, custom range.
+ * Needs the fixed Settlementhelpers.ts (turf hours, late-night day end, offers).
+ */
 import {
-  View,
-  Text,
-  StyleSheet,
-  SafeAreaView,
-  StatusBar,
-  ScrollView,
-  TouchableOpacity,
-  ActivityIndicator,
-  RefreshControl,
-  Platform,
-  Modal,
-  FlatList,
+  View, Text, StyleSheet, StatusBar, ScrollView, TouchableOpacity, ActivityIndicator,
+  RefreshControl, BackHandler, Alert,
 } from "react-native";
-import { useEffect, useMemo, useState, useCallback } from "react";
-import { useRouter } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigation, useRouter } from "expo-router";
 import { auth, db } from "../../firebaseConfig";
-import { collection, getDocs, query, where } from "firebase/firestore";
+import { collection, getDocs, query, where, Timestamp, orderBy } from "firebase/firestore";
 import { Ionicons } from "@expo/vector-icons";
+import * as Sharing from "expo-sharing";
+import ViewShot from "react-native-view-shot";
+import {
+  Turf, Booking, DailySettlement, fetchTurfs, fetchSettlementRecords, buildDailySettlements,
+  fmtTurfHours, toMidnight, bookingDay, slotRange, fmtSlotRange, getOnlinePaid, getPcoinUsed,
+  getVcoinUsed, getOfferDiscount, turfHours,
+} from "../../Settlementhelpers";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SETTLEMENT SCREEN
-//
-// Shows ONLY online payments (money that went through Razorpay) for a
-// chosen date range. This is what the owner actually received in their
-// bank account (before Razorpay's 2% fee).
-//
-// Online payment = paidAmount / advanceAmount (Razorpay advance)
-// Cash at venue is NOT counted here — that's separate.
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Palette (same as other owner screens) ───────────────────────────────────
+const BRAND = "#15803D";
+const STRIPE = "#138A3F";
+const ON_BRAND = "#DCFCE7";
+const PAGE = "#F1F4F7";
+const INK = "#0F172A";
+const SLATE = "#475569";
+const MUTED = "#64748B";
+const FAINT = "#94A3B8";
+const LINE = "#E2E8F0";
 
-const DARK  = "#0A0F1E";
-const GREEN = "#22C55E";
+const PAGE_DAYS = 15;
+const DAY = 86400000;
 
-type Booking = {
-  id: string;
-  turfId?: string;
-  turfName?: string;
-  date?: any;
-  dateString?: string;
-  status?: string;
-  bookingType?: string;    // "full" | "advance"
-  paymentStatus?: string;
-  totalAmount?: number;
-  paidAmount?: number;
-  advanceAmount?: number;
-  remainingAmount?: number;
-  remainingCollected?: boolean;
-  userName?: string;
-  userPhone?: string;
-  selectedSlots?: string[];
+const rs = (n: number) => `₹${Math.round(n).toLocaleString("en-IN")}`;
+const hrs = (mins: number) => {
+  if (mins <= 0) return "—";
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return m ? `${h}h ${m}m` : `${h} hr${h === 1 ? "" : "s"}`;
+};
+const shortDate = (d: Date) => d.toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+function dayName(d: Date): string {
+  const today = toMidnight(new Date()).getTime();
+  const t = d.getTime();
+  if (t === today) return "Today";
+  if (t === today - DAY) return "Yesterday";
+  return d.toLocaleDateString("en-IN", { weekday: "long" });
+}
+
+const PILL = {
+  paid:     { label: "✓ Paid",       bg: "#DCFCE7", fg: BRAND },
+  pending:  { label: "⏱ Pending",    bg: "#FEF3C7", fg: "#B45309" },
+  today:    { label: "● Collecting", bg: "#DBEAFE", fg: "#1D4ED8" },
+  upcoming: { label: "Upcoming",     bg: "#F1F5F9", fg: SLATE },
 };
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function getSafeDate(val: any): Date | null {
-  if (!val) return null;
-  if (typeof val?.toDate === "function") return val.toDate();
-  const d = new Date(val);
-  return isNaN(d.getTime()) ? null : d;
-}
+// ─────────────────────────────────────────────────────────────────────────────
+export default function SettlementScreen() {
+  const insets = useSafeAreaInsets();
+  const router = useRouter();
+  const navigation = useNavigation();
 
-function toMidnight(d: Date): Date {
-  const c = new Date(d); c.setHours(0, 0, 0, 0); return c;
-}
+  const [bookings, setBookings] = useState<Booking[]>([]);
+  const [turfs, setTurfs] = useState<Turf[]>([]);
+  const [paidRecords, setPaidRecords] = useState<Record<string, any>>({});
+  const [days, setDays] = useState(PAGE_DAYS);
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [turfFilter, setTurfFilter] = useState<string>("all");
+  const [openKey, setOpenKey] = useState<string | null>(null);
+  const [, setTick] = useState(0);
 
-function fmtFull(n: number): string {
-  return `₹${Math.round(n).toLocaleString("en-IN")}`;
-}
+  // ── Load ──
+  const fetchBookings = useCallback(async (numDays: number) => {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return [];
+    const start = toMidnight(new Date(Date.now() - (numDays - 1) * DAY));
+    const end = new Date(); end.setHours(23, 59, 59, 999);
+    const inRange = (b: Booking) => {
+      const d = bookingDay(b);
+      return !!d && d >= start && d <= end;
+    };
+    try {
+      const snap = await getDocs(query(
+        collection(db, "bookings"),
+        where("ownerId", "==", uid),
+        where("date", ">=", Timestamp.fromDate(start)),
+        where("date", "<=", Timestamp.fromDate(end)),
+        orderBy("date", "desc"),
+      ));
+      return snap.docs.map(d => ({ id: d.id, ...(d.data() as any) } as Booking)).filter(inRange);
+    } catch (e) {
+      // Composite index (ownerId + date) missing → same result, just slower
+      console.warn("settlement: bounded query failed, using fallback", e);
+      const snap = await getDocs(query(collection(db, "bookings"), where("ownerId", "==", uid)));
+      return snap.docs.map(d => ({ id: d.id, ...(d.data() as any) } as Booking)).filter(inRange);
+    }
+  }, []);
 
-function fmtShort(n: number): string {
-  if (n >= 100000) return `₹${(n / 100000).toFixed(1)}L`;
-  if (n >= 1000)   return `₹${(n / 1000).toFixed(1)}K`;
-  return `₹${Math.round(n)}`;
-}
+  const loadAll = useCallback(async (numDays: number) => {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return;
+    const [b, t, p] = await Promise.all([
+      fetchBookings(numDays),
+      fetchTurfs(uid).catch(() => [] as Turf[]),
+      fetchSettlementRecords(uid).catch(() => ({})),
+    ]);
+    setBookings(b); setTurfs(t); setPaidRecords(p);
+  }, [fetchBookings]);
 
-// Online paid = the Razorpay advance amount (what landed in owner's bank)
-function getOnlinePaid(b: Booking): number {
-  return Number(b.paidAmount ?? b.advanceAmount ?? 0);
-}
+  useEffect(() => {
+    (async () => {
+      try { await loadAll(PAGE_DAYS); } catch (e) { console.log(e); }
+      finally { setLoading(false); }
+    })();
+  }, [loadAll]);
 
-function getTotal(b: Booking): number {
-  return Number(b.totalAmount ?? 0);
-}
+  // status changes (Collecting → Pending) when a turf closes
+  useEffect(() => { const t = setInterval(() => setTick(x => x + 1), 60000); return () => clearInterval(t); }, []);
 
-function getRemaining(b: Booking): number {
-  return Number(b.remainingAmount ?? Math.max(getTotal(b) - getOnlinePaid(b), 0));
-}
-
-// Net after Razorpay 2% fee
-
-
-function fmtDateDisplay(d: Date): string {
-  return d.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
-}
-
-function fmtDateShort(d: Date): string {
-  return d.toLocaleDateString("en-IN", { day: "numeric", month: "short" });
-}
-
-// ── Calendar picker component ─────────────────────────────────────────────────
-function CalendarPicker({
-  visible,
-  title,
-  selectedDate,
-  minDate,
-  maxDate,
-  onSelect,
-  onClose,
-}: {
-  visible: boolean;
-  title: string;
-  selectedDate: Date;
-  minDate?: Date;
-  maxDate?: Date;
-  onSelect: (d: Date) => void;
-  onClose: () => void;
-}) {
-  const [viewMonth, setViewMonth] = useState(() => {
-    const d = new Date(selectedDate);
-    d.setDate(1);
-    d.setHours(0, 0, 0, 0);
-    return d;
-  });
-
-  const today = toMidnight(new Date());
-
-  const daysInMonth = useMemo(() => {
-    const year  = viewMonth.getFullYear();
-    const month = viewMonth.getMonth();
-    const first = new Date(year, month, 1).getDay(); // 0=Sun
-    const total = new Date(year, month + 1, 0).getDate();
-    const cells: (Date | null)[] = [];
-    for (let i = 0; i < first; i++) cells.push(null);
-    for (let d = 1; d <= total; d++) cells.push(new Date(year, month, d));
-    return cells;
-  }, [viewMonth]);
-
-  const prevMonth = () => {
-    const d = new Date(viewMonth);
-    d.setMonth(d.getMonth() - 1);
-    setViewMonth(d);
-  };
-  const nextMonth = () => {
-    const d = new Date(viewMonth);
-    d.setMonth(d.getMonth() + 1);
-    setViewMonth(d);
+  const onRefresh = async () => {
+    setRefreshing(true);
+    try { await loadAll(days); } catch (e) { console.log(e); }
+    finally { setRefreshing(false); }
   };
 
-  const isDisabled = (d: Date) => {
-    if (minDate && toMidnight(d) < toMidnight(minDate)) return true;
-    if (maxDate && toMidnight(d) > toMidnight(maxDate)) return true;
-    return false;
+  const showMore = async () => {
+    const next = days + PAGE_DAYS;
+    setLoadingMore(true);
+    try { setBookings(await fetchBookings(next)); setDays(next); }
+    catch { Alert.alert("Error", "Could not load older days."); }
+    finally { setLoadingMore(false); }
   };
 
-  const isSelected = (d: Date) => toMidnight(d).getTime() === toMidnight(selectedDate).getTime();
-  const isToday    = (d: Date) => toMidnight(d).getTime() === today.getTime();
+  // ── Day receipt open: Back closes it (Android) and swipe-back is off (iPhone) ──
+  useEffect(() => {
+    navigation.setOptions?.({ gestureEnabled: !openKey } as any);
+    if (!openKey) return;
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => { setOpenKey(null); return true; });
+    return () => sub.remove();
+  }, [openKey, navigation]);
+
+  // ── Derived ──
+  const all = useMemo(
+    () => buildDailySettlements(bookings, turfs, paidRecords).filter(d => d.status !== "upcoming"),
+    [bookings, turfs, paidRecords, /* tick */ Math.floor(Date.now() / 60000)] // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const list = useMemo(() => (turfFilter === "all" ? all : all.filter(d => d.turfId === turfFilter)), [all, turfFilter]);
+
+  const todayMs = toMidnight(new Date()).getTime();
+  const sumDay = (ms: number) => {
+    const items = list.filter(d => d.date.getTime() === ms);
+    return {
+      amount: items.reduce((a, d) => a + d.payoutAmount, 0),
+      count: items.reduce((a, d) => a + d.bookingCount, 0),
+      allPaid: items.length > 0 && items.every(d => d.status === "paid"),
+      collecting: items.some(d => d.status === "today"),
+    };
+  };
+  const today = sumDay(todayMs);
+  const yesterday = sumDay(todayMs - DAY);
+
+  const rangeStart = new Date(todayMs - (days - 1) * DAY);
+  const turfChips = turfs.length > 1 ? [{ id: "all", name: "All turfs" }, ...turfs.map(t => ({ id: t.id, name: t.name || "Turf" }))] : [];
+  const opened = openKey ? all.find(d => d.key === openKey) ?? null : null;
+
+  if (loading) {
+    return (
+      <View style={s.center}>
+        <StatusBar barStyle="dark-content" />
+        <ActivityIndicator size="large" color={BRAND} />
+        <Text style={s.loadTxt}>Loading settlements…</Text>
+      </View>
+    );
+  }
+
+  if (opened) {
+    const turf = turfs.find(t => t.id === opened.turfId);
+    return <DayReceipt item={opened} turf={turf} onClose={() => setOpenKey(null)}
+      onOpenBooking={(id) => router.push(`/(owner)/booking-receipt/${id}` as any)} />;
+  }
 
   return (
-    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
-      <View style={cal.backdrop}>
-        <TouchableOpacity style={{ flex: 1 }} onPress={onClose} activeOpacity={1} />
-        <View style={cal.sheet}>
-          <View style={cal.handle} />
-          <Text style={cal.title}>{title}</Text>
-
-          {/* Month nav */}
-          <View style={cal.monthNav}>
-            <TouchableOpacity style={cal.navBtn} onPress={prevMonth}>
-              <Ionicons name="chevron-back" size={18} color="#374151" />
+    <View style={s.root}>
+      <StatusBar barStyle="light-content" backgroundColor={BRAND} />
+      <ScrollView
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={{ paddingBottom: insets.bottom + 24 }}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={BRAND} />}
+      >
+        {/* ── Header ── */}
+        <View style={[s.header, { paddingTop: insets.top + 10 }]}>
+          <View style={s.headRow}>
+            <TouchableOpacity style={s.hBtn} onPress={() => router.back()} accessibilityLabel="Back">
+              <Ionicons name="arrow-back" size={20} color="#fff" />
             </TouchableOpacity>
-            <Text style={cal.monthLabel}>
-              {viewMonth.toLocaleDateString("en-IN", { month: "long", year: "numeric" })}
-            </Text>
-            <TouchableOpacity style={cal.navBtn} onPress={nextMonth}>
-              <Ionicons name="chevron-forward" size={18} color="#374151" />
-            </TouchableOpacity>
+            <View style={{ flex: 1 }}>
+              <Text style={s.kicker}>OWNER · ONLINE MONEY</Text>
+              <Text style={s.title}>Settlement</Text>
+            </View>
           </View>
 
-          {/* Day headers */}
-          <View style={cal.weekRow}>
-            {["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"].map((w) => (
-              <Text key={w} style={cal.weekDay}>{w}</Text>
-            ))}
+          <View style={s.dayCards}>
+            <View style={[s.dayCard, { backgroundColor: "#fff" }]}>
+              <Text style={[s.dcLbl, { color: "#1D4ED8" }]}>● TODAY</Text>
+              <Text style={s.dcAmt} numberOfLines={1} adjustsFontSizeToFit>{rs(today.amount)}</Text>
+              <Text style={s.dcSub}>{today.count} booking{today.count === 1 ? "" : "s"}{today.count ? " · collecting" : ""}</Text>
+            </View>
+            <View style={[s.dayCard, { backgroundColor: "rgba(255,255,255,0.14)" }]}>
+              <Text style={[s.dcLbl, { color: ON_BRAND }]}>YESTERDAY</Text>
+              <Text style={[s.dcAmt, { color: "#fff" }]} numberOfLines={1} adjustsFontSizeToFit>{rs(yesterday.amount)}</Text>
+              <Text style={[s.dcSub, { color: yesterday.allPaid ? "#BBF7D0" : "#FDE68A" }]}>
+                {yesterday.count === 0 ? "No online bookings" : yesterday.allPaid ? "✓ Paid to your bank" : yesterday.collecting ? "● Still open" : "⏱ Payout pending"}
+              </Text>
+            </View>
           </View>
 
-          {/* Days grid */}
-          <View style={cal.grid}>
-            {daysInMonth.map((d, i) => {
-              if (!d) return <View key={`e-${i}`} style={cal.dayCell} />;
-              const disabled = isDisabled(d);
-              const selected = isSelected(d);
-              const isT      = isToday(d);
+          {turfChips.length > 0 && (
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.chipRow}>
+              {turfChips.map(c => {
+                const on = turfFilter === c.id;
+                return (
+                  <TouchableOpacity key={c.id} style={[s.chip, on && s.chipOn]} onPress={() => setTurfFilter(c.id)}>
+                    <Text style={[s.chipTxt, on && s.chipTxtOn]} numberOfLines={1}>{c.name}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+          )}
+        </View>
+
+        {/* ── History ── */}
+        <Text style={s.section}>LAST {days} DAYS · {shortDate(rangeStart)} – {shortDate(new Date())}</Text>
+
+        {list.length === 0 ? (
+          <View style={s.empty}>
+            <Ionicons name="wallet-outline" size={34} color={FAINT} />
+            <Text style={s.emptyTitle}>No online money in these days</Text>
+            <Text style={s.emptySub}>Days with app bookings show up here.</Text>
+          </View>
+        ) : (
+          <View style={s.list}>
+            {list.map(item => {
+              const p = PILL[item.status];
               return (
-                <TouchableOpacity
-                  key={i}
-                  style={[
-                    cal.dayCell,
-                    selected  && cal.dayCellSelected,
-                    isT && !selected && cal.dayCellToday,
-                  ]}
-                  onPress={() => { if (!disabled) { onSelect(d); onClose(); } }}
-                  disabled={disabled}
-                >
-                  <Text style={[
-                    cal.dayText,
-                    selected  && cal.dayTextSelected,
-                    isT && !selected && cal.dayTextToday,
-                    disabled  && cal.dayTextDisabled,
-                  ]}>
-                    {d.getDate()}
-                  </Text>
+                <TouchableOpacity key={item.key} style={s.row} activeOpacity={0.7} onPress={() => setOpenKey(item.key)}
+                  accessibilityLabel={`${dayName(item.date)} ${item.turfName} ${rs(item.payoutAmount)} ${p.label}`}>
+                  <View style={s.dateBox}>
+                    <Text style={s.dateNum}>{item.date.getDate()}</Text>
+                    <Text style={s.dateMon}>{item.date.toLocaleDateString("en-IN", { month: "short" }).toUpperCase()}</Text>
+                  </View>
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Text style={s.rowTitle}>{dayName(item.date)}</Text>
+                    <Text style={s.rowSub} numberOfLines={1}>{item.turfName} · {item.bookingCount} booking{item.bookingCount === 1 ? "" : "s"}</Text>
+                  </View>
+                  <View style={{ alignItems: "flex-end", gap: 4 }}>
+                    <Text style={s.rowAmt}>{rs(item.payoutAmount)}</Text>
+                    <View style={[s.pill, { backgroundColor: p.bg }]}><Text style={[s.pillTxt, { color: p.fg }]}>{p.label}</Text></View>
+                  </View>
+                  <Ionicons name="chevron-forward" size={18} color="#CBD5E1" />
                 </TouchableOpacity>
               );
             })}
           </View>
+        )}
 
-          <TouchableOpacity style={cal.cancelBtn} onPress={onClose}>
-            <Text style={cal.cancelText}>Cancel</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    </Modal>
+        <TouchableOpacity style={[s.moreBtn, loadingMore && { opacity: 0.6 }]} onPress={showMore} disabled={loadingMore}>
+          {loadingMore ? <ActivityIndicator color={SLATE} size="small" /> : (
+            <Text style={s.moreTxt}>
+              Show {PAGE_DAYS} more days · {shortDate(new Date(rangeStart.getTime() - PAGE_DAYS * DAY))} – {shortDate(new Date(rangeStart.getTime() - DAY))}
+            </Text>
+          )}
+        </TouchableOpacity>
+      </ScrollView>
+    </View>
   );
 }
 
-const cal = StyleSheet.create({
-  backdrop:  { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
-  sheet:     { backgroundColor: "#FFFFFF", borderTopLeftRadius: 28, borderTopRightRadius: 28, padding: 20, paddingBottom: Platform.OS === "ios" ? 36 : 24 },
-  handle:    { width: 40, height: 4, borderRadius: 2, backgroundColor: "#E5E7EB", alignSelf: "center", marginBottom: 20 },
-  title:     { fontSize: 18, fontWeight: "900", color: "#0A0F1E", marginBottom: 20, textAlign: "center" },
-  monthNav:  { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 16 },
-  navBtn:    { width: 36, height: 36, borderRadius: 10, backgroundColor: "#F3F4F6", justifyContent: "center", alignItems: "center" },
-  monthLabel:{ fontSize: 15, fontWeight: "800", color: "#111827" },
-  weekRow:   { flexDirection: "row", marginBottom: 8 },
-  weekDay:   { flex: 1, textAlign: "center", fontSize: 11, fontWeight: "700", color: "#9CA3AF" },
-  grid:      { flexDirection: "row", flexWrap: "wrap" },
-  dayCell:   { width: "14.28%", aspectRatio: 1, justifyContent: "center", alignItems: "center", padding: 2 },
-  dayCellSelected: { backgroundColor: DARK, borderRadius: 10 },
-  dayCellToday:    { backgroundColor: "#F0FDF4", borderRadius: 10, borderWidth: 1.5, borderColor: GREEN },
-  dayText:         { fontSize: 14, fontWeight: "600", color: "#374151" },
-  dayTextSelected: { color: "#FFFFFF", fontWeight: "800" },
-  dayTextToday:    { color: "#15803D", fontWeight: "800" },
-  dayTextDisabled: { color: "#D1D5DB" },
-  cancelBtn: { backgroundColor: "#F3F4F6", paddingVertical: 14, borderRadius: 16, alignItems: "center", marginTop: 16 },
-  cancelText:{ color: "#374151", fontWeight: "700", fontSize: 15 },
-});
+// ─────────────────────────────────────────────────────────────────────────────
+// Day receipt
+// ─────────────────────────────────────────────────────────────────────────────
+function DayReceipt({ item, turf, onClose, onOpenBooking }: {
+  item: DailySettlement; turf?: Turf; onClose: () => void; onOpenBooking: (id: string) => void;
+}) {
+  const insets = useSafeAreaInsets();
+  const shotRef = useRef<any>(null);
+  const [sharing, setSharing] = useState(false);
+  const p = PILL[item.status];
+  const hours = fmtTurfHours(turf);
+  const late = turfHours(turf).close > 24;
 
-// ── Quick range presets ───────────────────────────────────────────────────────
-const PRESETS: { label: string; days: number }[] = [
-  { label: "Last 7 days",  days: 7  },
-  { label: "Last 15 days", days: 15 },
-  { label: "Last 30 days", days: 30 },
-  { label: "This month",   days: -1 }, // handled specially
-];
-
-// ── Main screen ───────────────────────────────────────────────────────────────
-export default function SettlementScreen() {
-  const router = useRouter();
-
-  const [bookings, setBookings]     = useState<Booking[]>([]);
-  const [loading, setLoading]       = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-
-  // Date range state
-  const [startDate, setStartDate] = useState<Date>(() => {
-    const d = new Date(); d.setDate(d.getDate() - 6); d.setHours(0, 0, 0, 0); return d;
-  });
-  const [endDate, setEndDate] = useState<Date>(() => {
-    const d = new Date(); d.setHours(23, 59, 59, 999); return d;
-  });
-  const [showStartPicker, setShowStartPicker] = useState(false);
-  const [showEndPicker,   setShowEndPicker]   = useState(false);
-
-  useEffect(() => { fetchBookings(); }, []);
-
-  const fetchBookings = async (isRefresh = false) => {
-    const uid = auth.currentUser?.uid;
-    if (!uid) { setLoading(false); return; }
-    isRefresh ? setRefreshing(true) : setLoading(true);
+  const share = async () => {
     try {
-      const snap = await getDocs(
-        query(collection(db, "bookings"), where("ownerId", "==", uid))
-      );
-      setBookings(snap.docs.map((d) => ({ id: d.id, ...d.data() } as Booking)));
-    } catch (e) { console.log(e); }
-    finally { setLoading(false); setRefreshing(false); }
+      setSharing(true);
+      await new Promise(r => setTimeout(r, 250));
+      const uri = await shotRef.current?.capture?.();
+      if (!uri) throw new Error("capture failed");
+      await Sharing.shareAsync(uri, { mimeType: "image/png", dialogTitle: "Share day settlement", UTI: "public.png" });
+    } catch { Alert.alert("Error", "Unable to share. Please try again."); }
+    finally { setSharing(false); }
   };
 
-  const applyPreset = (days: number) => {
-    const end = new Date(); end.setHours(23, 59, 59, 999);
-    let start: Date;
-    if (days === -1) {
-      // This month
-      start = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
-      start.setHours(0, 0, 0, 0);
-    } else {
-      start = new Date();
-      start.setDate(start.getDate() - (days - 1));
-      start.setHours(0, 0, 0, 0);
-    }
-    setStartDate(start);
-    setEndDate(end);
-  };
-
-  // ── Filtered bookings: online only, within date range ─────────────────────
-  // "Online" = not cancelled, has a paidAmount > 0 (went through Razorpay)
-  const filtered = useMemo(() => {
-    const start = toMidnight(startDate);
-    const end   = new Date(endDate); end.setHours(23, 59, 59, 999);
-
-    return bookings.filter((b) => {
-      if (b.status === "cancelled") return false;
-      const d = getSafeDate(b.date || b.dateString);
-      if (!d) return false;
-      if (d < start || d > end) return false;
-      // Only include bookings where customer paid something online
-      const onlinePaid = getOnlinePaid(b);
-      return onlinePaid > 0;
-    });
-  }, [bookings, startDate, endDate]);
-
-  // ── Stats ──────────────────────────────────────────────────────────────────
-  const stats = useMemo(() => {
-    let totalOnline    = 0;
-    let fullPayOnline  = 0;   // full payment bookings — entire amount online
-    let advanceOnline  = 0;   // advance bookings — only advance paid online
-    let fullPayCount   = 0;
-    let advanceCount   = 0;
-
-    filtered.forEach((b) => {
-      const online = getOnlinePaid(b);
-      totalOnline += online;
-      if (b.bookingType === "full") {
-        fullPayOnline += online;
-        fullPayCount++;
-      } else {
-        advanceOnline += online;
-        advanceCount++;
-      }
-    });
-
-
-    return {
-      totalOnline,
-      fullPayOnline, fullPayCount,
-      advanceOnline, advanceCount,
-      
-      totalBookings: filtered.length,
-      avgPerBooking: filtered.length > 0 ? Math.round(totalOnline / filtered.length) : 0,
-    };
-  }, [filtered]);
-
-  // ── By turf breakdown ──────────────────────────────────────────────────────
- 
-
-
-
-  // ── Per-booking list (sorted newest first) ────────────────────────────────
-
-
-  const dayCount = useMemo(() => {
-    const diff = toMidnight(endDate).getTime() - toMidnight(startDate).getTime();
-    return Math.round(diff / (1000 * 60 * 60 * 24)) + 1;
-  }, [startDate, endDate]);
-
-  if (loading) return (
-    <SafeAreaView style={s.loadWrap}>
-      <StatusBar barStyle="light-content" backgroundColor={DARK} />
-      <ActivityIndicator size="large" color={GREEN} />
-      <Text style={s.loadText}>Loading settlement data...</Text>
-    </SafeAreaView>
-  );
+  const statusLine =
+    item.status === "paid" ? "✓ Paid to your bank" :
+    item.status === "pending" ? "⏱ Pending · PlayOn will send it soon" :
+    late ? `● Collecting · day ends ${item.closesAt?.toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" })}` : "● Collecting · day not finished";
 
   return (
-    <SafeAreaView style={s.safe}>
-      <StatusBar barStyle="light-content" backgroundColor={DARK} />
-
-      <ScrollView
-        showsVerticalScrollIndicator={false}
-        contentContainerStyle={s.scroll}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchBookings(true)} tintColor={GREEN} />}
-      >
-        {/* ── Hero ── */}
-        <View style={s.hero}>
-          <View style={s.glow1} /><View style={s.glow2} />
-
-          <View style={s.heroTop}>
-            <TouchableOpacity style={s.backBtn} onPress={() => router.back()}>
+    <View style={s.root}>
+      <StatusBar barStyle="light-content" backgroundColor={BRAND} />
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: insets.bottom + 30 }}>
+        <View style={r.turf}>
+          <Stripes />
+          <View style={[s.headRow, { paddingTop: insets.top + 10, paddingHorizontal: 16 }]}>
+            <TouchableOpacity style={s.hBtn} onPress={onClose} accessibilityLabel="Back">
               <Ionicons name="arrow-back" size={20} color="#fff" />
             </TouchableOpacity>
-            <View style={{ flex: 1, marginLeft: 12 }}>
-              <Text style={s.heroTag}>OWNER · SETTLEMENT</Text>
-              <Text style={s.heroTitle}>Online Settlement</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={s.kicker}>DAY SETTLEMENT</Text>
+              <Text style={s.title}>{item.date.toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short" })}</Text>
             </View>
-          </View>
-
-          {/* Info note */}
-          
-
-          {/* Total received */}
-          <View style={s.totalWrap}>
-            <Text style={s.totalLabel}>Online received · {dayCount} day{dayCount !== 1 ? "s" : ""}</Text>
-            <Text style={s.totalValue}>{fmtFull(stats.totalOnline)}</Text>
-            <Text style={s.totalSub}>
-              {stats.totalBookings} bookings · avg {fmtShort(stats.avgPerBooking)}/booking
-            </Text>
-          </View>
-
-          {/* Fee + net chips */}
-          
-        </View>
-
-        {/* ── Date range picker ── */}
-        <View style={s.card}>
-          <Text style={s.cardTitle}>Select Date Range</Text>
-          <Text style={s.cardSub}>Tap to change start or end date</Text>
-
-          <View style={s.datePickerRow}>
-            <TouchableOpacity style={s.datePill} onPress={() => setShowStartPicker(true)} activeOpacity={0.8}>
-              <Ionicons name="calendar-outline" size={15} color="#0A0F1E" />
-              <View>
-                <Text style={s.datePillLabel}>From</Text>
-                <Text style={s.datePillValue}>{fmtDateDisplay(startDate)}</Text>
-              </View>
-            </TouchableOpacity>
-
-            <View style={s.dateArrow}>
-              <Ionicons name="arrow-forward" size={16} color="#9CA3AF" />
-            </View>
-
-            <TouchableOpacity style={s.datePill} onPress={() => setShowEndPicker(true)} activeOpacity={0.8}>
-              <Ionicons name="calendar-outline" size={15} color="#0A0F1E" />
-              <View>
-                <Text style={s.datePillLabel}>To</Text>
-                <Text style={s.datePillValue}>{fmtDateDisplay(endDate)}</Text>
-              </View>
+            <TouchableOpacity style={s.hBtn} onPress={share} disabled={sharing} accessibilityLabel="Share">
+              {sharing ? <ActivityIndicator color="#fff" size="small" /> : <Ionicons name="share-outline" size={19} color="#fff" />}
             </TouchableOpacity>
           </View>
 
-          {/* Quick presets */}
-          <Text style={s.presetLabel}>Quick select</Text>
-          <View style={s.presetRow}>
-            {PRESETS.map((p) => (
-              <TouchableOpacity
-                key={p.label}
-                style={s.presetChip}
-                onPress={() => applyPreset(p.days)}
-                activeOpacity={0.20}
-              >
-                <Text style={s.presetChipText}>{p.label}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
+          <ViewShot ref={shotRef} options={{ format: "png", quality: 1 }} style={r.shot}>
+            <Stripes />
+            <View style={r.ticketWrap}>
+              <View style={r.top}>
+                <Text style={r.turfLine} numberOfLines={2}>{item.turfName.toUpperCase()}{hours ? ` · ${hours}` : ""}</Text>
+                <Text style={r.receiveLbl}>You receive</Text>
+                <Text style={r.receive} numberOfLines={1} adjustsFontSizeToFit>{rs(item.payoutAmount)}</Text>
+                <View style={[r.stamp, { backgroundColor: p.bg }]}><Text style={[r.stampTxt, { color: p.fg }]}>{statusLine}</Text></View>
+                <View style={r.boxes}>
+                  <View style={r.box}><Text style={r.boxLbl}>BOOKINGS</Text><Text style={r.boxVal}>{item.bookingCount}</Text></View>
+                  <View style={r.box}><Text style={r.boxLbl}>HOURS BOOKED</Text><Text style={r.boxVal}>{hrs(item.minutesBooked)}</Text></View>
+                </View>
+              </View>
+
+              <TearLine />
+
+              <View style={r.bottom}>
+                <Text style={r.kick}>ONLINE MONEY</Text>
+                <Row label="Players paid in the app" sub="Advance + full payments" value={rs(item.amount)} />
+                {item.pcoinUsed > 0 && <Row label="🪙 PCoin used" sub="PlayOn pays this to you" value={`+ ${rs(item.pcoinUsed)}`} color="#7C3AED" />}
+                <View style={r.line} />
+                <Row label="You receive" value={rs(item.payoutAmount)} big />
+
+                {(item.vcoinUsed > 0 || item.offerGiven > 0) && (
+                  <>
+                    <Text style={[r.kick, { marginTop: 14 }]}>DISCOUNTS THIS DAY</Text>
+                    {item.vcoinUsed > 0 && <Row label="🏟️ VCoin used by players" sub="Your reward · already taken off" value={`🪙 ${item.vcoinUsed}`} color="#B45309" />}
+                    {item.offers.map(o => (
+                      <Row key={o.title} label={`🎉 ${o.title}`} sub={`${o.count} booking${o.count === 1 ? "" : "s"} · taken off at the turf`} value={rs(o.discount)} color="#C2410C" />
+                    ))}
+                    {item.offerGiven > 0 && (
+                      <View style={r.note}><Text style={r.noteTxt}>Offers lower what players pay at the turf. Your online payout is not cut.</Text></View>
+                    )}
+                  </>
+                )}
+
+                {item.status === "paid" && (
+                  <>
+                    <Text style={[r.kick, { marginTop: 14 }]}>PAYMENT</Text>
+                    {item.paidAt && <Row label="Paid on" value={item.paidAt.toLocaleString("en-IN", { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" })} />}
+                    {!!item.reference && <Row label="UTR / reference" value={String(item.reference)} />}
+                    {!!item.note && <Row label="Note" value={String(item.note)} />}
+                  </>
+                )}
+
+                <Text style={[r.kick, { marginTop: 14 }]}>BOOKINGS ({item.bookingCount})</Text>
+                {item.bookings.map(b => <BookingLine key={b.id} b={b} turf={turf} onPress={() => onOpenBooking(b.id)} />)}
+              </View>
+              <ZigZag />
+            </View>
+            <Text style={r.foot}>Playon · Turf & Sport Booking App</Text>
+          </ViewShot>
         </View>
-
-        {/* ── Summary breakdown ── */}
-        <View style={s.card}>
-          <Text style={s.cardTitle}>Payment Type Breakdown</Text>
-          <Text style={s.cardSub}>{fmtDateDisplay(startDate)} → {fmtDateDisplay(endDate)}</Text>
-
-          <View style={s.breakdownGrid}>
-            {/* Full payment */}
-            <View style={[s.breakdownBox, s.breakdownBoxFull]}>
-              <View style={s.breakdownHeader}>
-                <View style={[s.breakdownDot, { backgroundColor: "#7C3AED" }]} />
-                <Text style={s.breakdownBoxTitle}>Full Payments</Text>
-              </View>
-              <Text style={s.breakdownAmount}>{fmtFull(stats.fullPayOnline)}</Text>
-              <Text style={s.breakdownCount}>{stats.fullPayCount} bookings</Text>
-              <Text style={s.breakdownNote}>Entire amount paid online</Text>
-            </View>
-
-            {/* Advance payment */}
-            <View style={[s.breakdownBox, s.breakdownBoxAdv]}>
-              <View style={s.breakdownHeader}>
-                <View style={[s.breakdownDot, { backgroundColor: "#2563EB" }]} />
-                <Text style={s.breakdownBoxTitle}>Advance Paid</Text>
-              </View>
-              <Text style={s.breakdownAmount}>{fmtFull(stats.advanceOnline)}</Text>
-              <Text style={s.breakdownCount}>{stats.advanceCount} bookings</Text>
-              <Text style={s.breakdownNote}>Deposit only, rest cash</Text>
-            </View>
-          </View>
-
-          {/* Total bar */}
-          <View style={s.totalBarWrap}>
-            <View style={s.totalBarRow}>
-              <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-                <View style={[s.breakdownDot, { backgroundColor: "#7C3AED" }]} />
-                <Text style={s.totalBarLabel}>Full</Text>
-              </View>
-              <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginLeft: 16 }}>
-                <View style={[s.breakdownDot, { backgroundColor: "#2563EB" }]} />
-                <Text style={s.totalBarLabel}>Advance</Text>
-              </View>
-              <Text style={[s.totalBarLabel, { marginLeft: "auto" }]}>{fmtFull(stats.totalOnline)}</Text>
-            </View>
-            <View style={s.totalBarTrack}>
-              {stats.totalOnline > 0 && (
-                <>
-                  <View style={[s.totalBarSegment, {
-                    flex: stats.fullPayOnline,
-                    backgroundColor: "#7C3AED",
-                  }]} />
-                  <View style={[s.totalBarSegment, {
-                    flex: stats.advanceOnline,
-                    backgroundColor: "#2563EB",
-                  }]} />
-                </>
-              )}
-            </View>
-          </View>
-        </View>
-
-        {/* ── Fee breakdown ── */}
-        <View style={s.card}>
-          <Text style={s.cardTitle}> Breakdown</Text>
-          <Text style={s.cardSub}>Estimated  online payments</Text>
-
-          <View style={s.feeTable}>
-            {[
-              { label: "Gross online collected",    value: fmtFull(stats.totalOnline),      color: "#111827", bold: false },
-             
-            ].map((row) => (
-              <View key={row.label} style={s.feeTableRow}>
-                <Text style={s.feeTableLabel}>{row.label}</Text>
-                <Text style={[s.feeTableValue, { color: row.color, fontWeight: row.bold ? "900" : "700" }]}>
-                  {row.value}
-                </Text>
-              </View>
-            ))}
-          </View>
-
-          
-        </View>
-
-        {/* ── By turf ── */}
-     
-
-        {/* ── Booking list ── */}
-       
-
-        <View style={{ height: 40 }} />
+        {item.status !== "paid" && <Text style={r.after}>When PlayOn pays, the date and UTR number show here.</Text>}
       </ScrollView>
-
-      {/* ── Date pickers ── */}
-      <CalendarPicker
-        visible={showStartPicker}
-        title="Select Start Date"
-        selectedDate={startDate}
-        maxDate={endDate}
-        onSelect={(d) => { setStartDate(d); }}
-        onClose={() => setShowStartPicker(false)}
-      />
-      <CalendarPicker
-        visible={showEndPicker}
-        title="Select End Date"
-        selectedDate={endDate}
-        minDate={startDate}
-        maxDate={new Date()}
-        onSelect={(d) => { const end = new Date(d); end.setHours(23, 59, 59, 999); setEndDate(end); }}
-        onClose={() => setShowEndPicker(false)}
-      />
-    </SafeAreaView>
+    </View>
   );
 }
 
-// ── Styles ────────────────────────────────────────────────────────────────────
+function BookingLine({ b, turf, onPress }: { b: Booking; turf?: Turf; onPress: () => void }) {
+  const paid = getOnlinePaid(b);
+  const full = b.bookingType === "full" || b.paymentMode === "full_payment";
+  const tags: string[] = [];
+  if (getOfferDiscount(b) > 0) tags.push("🎉 offer");
+  if (getVcoinUsed(b) > 0) tags.push(`🪙 ${getVcoinUsed(b)} VCoin`);
+  if (getPcoinUsed(b) > 0) tags.push(`🪙 ${getPcoinUsed(b)} PCoin`);
+  return (
+    <TouchableOpacity style={r.bk} onPress={onPress} activeOpacity={0.7}>
+      <View style={[r.bkBar, { backgroundColor: full ? "#8B5CF6" : "#22C55E" }]} />
+      <View style={{ flex: 1 }}>
+        <Text style={r.bkTime}>{fmtSlotRange(slotRange(b.selectedSlots, turf))}</Text>
+        <Text style={r.bkSub} numberOfLines={1}>
+          {b.userName || "Player"} · {full ? "Full" : "Advance"} {rs(paid)}{tags.length ? ` · ${tags.join(" · ")}` : ""}
+        </Text>
+      </View>
+      <Ionicons name="chevron-forward" size={16} color="#CBD5E1" />
+    </TouchableOpacity>
+  );
+}
+
+function Row({ label, value, sub, color, big }: { label: string; value: string; sub?: string; color?: string; big?: boolean }) {
+  return (
+    <View style={r.row}>
+      <View style={{ flex: 1 }}>
+        <Text style={[r.rowLbl, big && { color: INK, fontWeight: "900", fontSize: 15 }]}>{label}</Text>
+        {!!sub && <Text style={r.rowSub}>{sub}</Text>}
+      </View>
+      <Text style={[r.rowVal, big && { fontSize: 18 }, color ? { color } : null]}>{value}</Text>
+    </View>
+  );
+}
+function Stripes() {
+  return (
+    <View style={StyleSheet.absoluteFill} pointerEvents="none">
+      <View style={{ flex: 1, flexDirection: "row", backgroundColor: BRAND }}>
+        {Array.from({ length: 16 }).map((_, i) => <View key={i} style={{ width: 40, backgroundColor: i % 2 ? STRIPE : BRAND }} />)}
+      </View>
+    </View>
+  );
+}
+function TearLine() {
+  return (
+    <View style={r.tear}>
+      <View style={[r.notch, { left: -13 }]} />
+      <View style={[r.notch, { right: -13 }]} />
+      <View style={r.tearDash} />
+    </View>
+  );
+}
+function ZigZag() {
+  return (
+    <View style={r.zigWrap}>
+      {Array.from({ length: 40 }).map((_, i) => <View key={i} style={[r.zigTooth, { left: i * 12 - 3 }]} />)}
+    </View>
+  );
+}
+
+// ── Styles ──────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
-  safe:     { flex: 1, backgroundColor: "#F0F4F8" },
-  scroll:   { paddingBottom: 24 },
-  loadWrap: { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: DARK },
-  loadText: { color: "#9CA3AF", marginTop: 12, fontSize: 15, fontWeight: "600" },
+  root: { flex: 1, backgroundColor: PAGE },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: PAGE },
+  loadTxt: { marginTop: 10, color: MUTED, fontSize: 15, fontWeight: "600" },
 
-  // Hero
-  hero: {
-    backgroundColor: DARK,
-    paddingHorizontal: 20,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 20,
-    paddingBottom: 28, overflow: "hidden",
-  },
-  glow1: { position: "absolute", top: -40, right: -30, width: 200, height: 200, borderRadius: 100, backgroundColor: "rgba(34,197,94,0.10)" },
-  glow2: { position: "absolute", bottom: -80, left: -50, width: 220, height: 220, borderRadius: 110, backgroundColor: "rgba(99,102,241,0.08)" },
+  header: { backgroundColor: BRAND, borderBottomLeftRadius: 22, borderBottomRightRadius: 22, paddingHorizontal: 16, paddingBottom: 16 },
+  headRow: { flexDirection: "row", alignItems: "center", gap: 12 },
+  hBtn: { width: 44, height: 44, borderRadius: 13, backgroundColor: "rgba(255,255,255,0.16)", alignItems: "center", justifyContent: "center" },
+  kicker: { fontSize: 10, letterSpacing: 1.4, fontWeight: "800", color: ON_BRAND },
+  title: { fontSize: 21, fontWeight: "900", color: "#fff" },
 
-  heroTop:   { flexDirection: "row", alignItems: "center", marginBottom: 16 },
-  backBtn:   { width: 36, height: 36, borderRadius: 12, backgroundColor: "rgba(255,255,255,0.1)", justifyContent: "center", alignItems: "center" },
-  heroTag:   { color: "#9CA3AF", fontSize: 10, fontWeight: "800", letterSpacing: 1.2 },
-  heroTitle: { color: "#FFFFFF", fontSize: 24, fontWeight: "900", marginTop: 2 },
+  dayCards: { flexDirection: "row", gap: 8, marginTop: 14 },
+  dayCard: { flex: 1, borderRadius: 16, padding: 12 },
+  dcLbl: { fontSize: 11, fontWeight: "900", letterSpacing: 0.4 },
+  dcAmt: { fontSize: 24, fontWeight: "900", color: INK, marginTop: 2 },
+  dcSub: { fontSize: 11, fontWeight: "700", color: MUTED, marginTop: 1 },
 
-  infoNote: {
-    flexDirection: "row", alignItems: "flex-start", gap: 6,
-    backgroundColor: "rgba(96,165,250,0.1)", borderRadius: 10,
-    paddingHorizontal: 12, paddingVertical: 8, marginBottom: 20,
-    borderWidth: 1, borderColor: "rgba(96,165,250,0.2)",
-  },
-  infoNoteText: { color: "#93C5FD", fontSize: 12, fontWeight: "500", flex: 1, lineHeight: 17 },
+  chipRow: { gap: 7, marginTop: 14, paddingRight: 8 },
+  chip: { height: 34, paddingHorizontal: 13, borderRadius: 999, backgroundColor: "rgba(255,255,255,0.14)", justifyContent: "center", maxWidth: 180 },
+  chipOn: { backgroundColor: "#fff" },
+  chipTxt: { fontSize: 12.5, fontWeight: "800", color: ON_BRAND },
+  chipTxtOn: { color: BRAND },
 
-  totalWrap:  { marginBottom: 20 },
-  totalLabel: { color: "#9CA3AF", fontSize: 12, fontWeight: "600" },
-  totalValue: { color: "#FFFFFF", fontSize: 36, fontWeight: "900", marginTop: 4, letterSpacing: -0.5 },
-  totalSub:   { color: "#6B7280", fontSize: 13, marginTop: 6, fontWeight: "500" },
+  section: { fontSize: 11.5, fontWeight: "800", color: MUTED, letterSpacing: 0.6, paddingHorizontal: 16, paddingTop: 16, paddingBottom: 8 },
+  list: { backgroundColor: "#fff", borderTopWidth: 1, borderBottomWidth: 1, borderColor: LINE },
+  row: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: "#F1F5F9", minHeight: 68 },
+  dateBox: { width: 46, height: 46, borderRadius: 12, backgroundColor: "#F5F7FA", alignItems: "center", justifyContent: "center" },
+  dateNum: { fontSize: 16, fontWeight: "900", color: INK, lineHeight: 18 },
+  dateMon: { fontSize: 9.5, fontWeight: "800", color: MUTED },
+  rowTitle: { fontSize: 14, fontWeight: "900", color: INK },
+  rowSub: { fontSize: 11.5, fontWeight: "600", color: FAINT, marginTop: 1 },
+  rowAmt: { fontSize: 15.5, fontWeight: "900", color: INK },
+  pill: { borderRadius: 999, paddingHorizontal: 8, paddingVertical: 3 },
+  pillTxt: { fontSize: 10.5, fontWeight: "800" },
 
-  feeRow: { flexDirection: "row", gap: 10 },
-  feeBox: {
-    flex: 1, backgroundColor: "rgba(255,255,255,0.07)",
-    borderRadius: 14, padding: 14,
-    borderWidth: 1, borderColor: "rgba(255,255,255,0.08)",
-  },
-  feeBoxGreen: { backgroundColor: "rgba(34,197,94,0.1)", borderColor: "rgba(34,197,94,0.2)" },
-  feeLabel: { fontSize: 11, color: "#9CA3AF", fontWeight: "600", marginBottom: 6 },
-  feeValue: { fontSize: 17, fontWeight: "900", color: "#FFFFFF" },
+  empty: { alignItems: "center", paddingVertical: 40, gap: 6 },
+  emptyTitle: { fontSize: 15, fontWeight: "800", color: SLATE },
+  emptySub: { fontSize: 12.5, fontWeight: "600", color: FAINT },
 
-  // Card
-  card: {
-    backgroundColor: "#FFFFFF", marginHorizontal: 16, marginTop: 16,
-    borderRadius: 20, padding: 18,
-    borderWidth: 1, borderColor: "#E5E7EB",
-    shadowColor: "#000", shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.05, shadowRadius: 8, elevation: 2,
-  },
-  cardHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 },
-  cardTitle:  { fontSize: 16, fontWeight: "900", color: "#111827" },
-  cardSub:    { fontSize: 12, color: "#9CA3AF", fontWeight: "500", marginTop: 2 },
+  moreBtn: { marginHorizontal: 16, marginTop: 14, height: 48, borderRadius: 13, borderWidth: 1, borderColor: LINE, backgroundColor: "#fff", alignItems: "center", justifyContent: "center" },
+  moreTxt: { fontSize: 13.5, fontWeight: "800", color: "#334155" },
+});
 
-  // Date picker
-  datePickerRow: { flexDirection: "row", alignItems: "center", marginTop: 16, gap: 10 ,},
-  datePill: {
-    flex: 1, flexDirection: "row", alignItems: "center", gap: 10,
-    backgroundColor: "#F9FAFB", borderRadius: 14, padding: 14,
-    borderWidth: 1.5, borderColor: "#E5E7EB",
-  },
-  datePillLabel: { fontSize: 10, color: "#9CA3AF", fontWeight: "700", textTransform: "uppercase" },
-  datePillValue: { fontSize: 14, color: "#111827", fontWeight: "800", marginTop: 2 },
-  dateArrow:     { alignItems: "center", justifyContent: "center" },
+const r = StyleSheet.create({
+  turf: { backgroundColor: BRAND, borderBottomLeftRadius: 28, borderBottomRightRadius: 28, overflow: "hidden", paddingBottom: 16 },
+  shot: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 6, overflow: "hidden" },
+  ticketWrap: { shadowColor: INK, shadowOpacity: 0.22, shadowRadius: 18, shadowOffset: { width: 0, height: 10 }, elevation: 8 },
+  top: { backgroundColor: "#fff", borderTopLeftRadius: 22, borderTopRightRadius: 22, padding: 18, paddingBottom: 8, alignItems: "center" },
+  turfLine: { fontSize: 12, fontWeight: "800", color: MUTED, letterSpacing: 0.6, textAlign: "center" },
+  receiveLbl: { fontSize: 12.5, fontWeight: "700", color: SLATE, marginTop: 10 },
+  receive: { fontSize: 38, fontWeight: "900", color: INK, letterSpacing: -1 },
+  stamp: { marginTop: 6, borderRadius: 999, paddingHorizontal: 11, paddingVertical: 5 },
+  stampTxt: { fontSize: 12, fontWeight: "800" },
+  boxes: { flexDirection: "row", gap: 8, marginTop: 16, alignSelf: "stretch" },
+  box: { flex: 1, backgroundColor: "#F5F7FA", borderRadius: 13, padding: 10 },
+  boxLbl: { fontSize: 10, fontWeight: "800", color: MUTED, letterSpacing: 0.4 },
+  boxVal: { fontSize: 18, fontWeight: "900", color: INK, marginTop: 1 },
 
-  presetLabel: { fontSize: 11, color: "#9CA3AF", fontWeight: "700", textTransform: "uppercase", marginTop: 20, marginBottom: 10 },
-  presetRow:   { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  presetChip:  { paddingHorizontal: 14, paddingVertical: 8, backgroundColor: DARK, borderRadius: 999 },
-  presetChipText: { color: "#FFFFFF", fontSize: 12, fontWeight: "700" },
+  tear: { height: 26, backgroundColor: "#fff", justifyContent: "center" },
+  notch: { position: "absolute", top: 0, width: 26, height: 26, borderRadius: 13, backgroundColor: BRAND },
+  tearDash: { marginHorizontal: 20, borderTopWidth: 2, borderStyle: "dashed", borderColor: LINE },
 
-  // Breakdown grid
-  breakdownGrid: { flexDirection: "row", gap: 10, marginTop: 16 },
-  breakdownBox:  { flex: 1, borderRadius: 16, padding: 14, borderWidth: 1 },
-  breakdownBoxFull: { backgroundColor: "#F5F3FF", borderColor: "#DDD6FE" },
-  breakdownBoxAdv:  { backgroundColor: "#EFF6FF", borderColor: "#BFDBFE" },
-  breakdownHeader:  { flexDirection: "row", alignItems: "center", gap: 6, marginBottom: 10 },
-  breakdownDot:     { width: 8, height: 8, borderRadius: 4 },
-  breakdownBoxTitle:{ fontSize: 12, fontWeight: "800", color: "#374151" },
-  breakdownAmount:  { fontSize: 20, fontWeight: "900", color: "#111827" },
-  breakdownCount:   { fontSize: 11, color: "#6B7280", fontWeight: "600", marginTop: 4 },
-  breakdownNote:    { fontSize: 10, color: "#9CA3AF", fontWeight: "500", marginTop: 3 },
+  bottom: { backgroundColor: "#fff", paddingHorizontal: 18, paddingTop: 4, paddingBottom: 14 },
+  kick: { fontSize: 10.5, letterSpacing: 0.9, fontWeight: "800", color: MUTED, marginBottom: 2 },
+  row: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 7 },
+  rowLbl: { fontSize: 13.5, fontWeight: "700", color: SLATE },
+  rowSub: { fontSize: 11, fontWeight: "600", color: FAINT, marginTop: 1 },
+  rowVal: { fontSize: 14, fontWeight: "900", color: INK, maxWidth: 170, textAlign: "right" },
+  line: { borderTopWidth: 1, borderColor: "#EEF1F5", marginVertical: 4 },
+  note: { marginTop: 6, backgroundColor: "#F0FDF4", borderRadius: 10, padding: 9 },
+  noteTxt: { fontSize: 11.5, fontWeight: "700", color: "#166534" },
 
-  // Total bar
-  totalBarWrap:    { marginTop: 16, paddingTop: 16, borderTopWidth: 1, borderTopColor: "#F3F4F6" },
-  totalBarRow:     { flexDirection: "row", alignItems: "center", marginBottom: 10 },
-  totalBarLabel:   { fontSize: 12, fontWeight: "700", color: "#374151" },
-  totalBarTrack:   { height: 10, borderRadius: 5, flexDirection: "row", overflow: "hidden", backgroundColor: "#F3F4F6" },
-  totalBarSegment: { height: 10 },
+  bk: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 9, borderBottomWidth: 1, borderStyle: "dashed", borderColor: LINE },
+  bkBar: { width: 5, height: 30, borderRadius: 3 },
+  bkTime: { fontSize: 13, fontWeight: "900", color: INK },
+  bkSub: { fontSize: 11, fontWeight: "600", color: FAINT, marginTop: 1 },
 
-  // Fee table
-  feeTable:   { marginTop: 16, gap: 0 },
-  feeTableRow:{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 13, borderBottomWidth: 1, borderBottomColor: "#F3F4F6" },
-  feeTableLabel: { fontSize: 13, color: "#6B7280", fontWeight: "600" },
-  feeTableValue: { fontSize: 15, fontWeight: "800" },
-
-  feeNote: {
-    flexDirection: "row", alignItems: "flex-start", gap: 7,
-    backgroundColor: "#FFFBEB", borderRadius: 10, padding: 10, marginTop: 14,
-    borderWidth: 1, borderColor: "#FDE68A",
-  },
-  feeNoteText: { fontSize: 11, color: "#92400E", fontWeight: "500", flex: 1, lineHeight: 17 },
-
-  // Turf rows
-  turfRow:     { flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between" },
-  turfName:    { fontSize: 14, fontWeight: "800", color: "#111827" },
-  turfMeta:    { fontSize: 11, color: "#9CA3AF", marginTop: 2, fontWeight: "500" },
-  turfOnline:  { fontSize: 15, fontWeight: "900", color: "#111827" },
-  turfNet:     { fontSize: 11, color: "#6B7280", fontWeight: "600", marginTop: 2 },
-  turfBar:     { height: 6, borderRadius: 3, flexDirection: "row", overflow: "hidden", marginTop: 10 },
-  turfBarFull: { backgroundColor: "#7C3AED" },
-  turfBarAdv:  { backgroundColor: "#2563EB" },
-
-  // Booking list rows
-  txRow: {
-    flexDirection: "row", alignItems: "flex-start",
-    paddingVertical: 14,
-    borderBottomWidth: 1, borderBottomColor: "#F3F4F6",
-    marginTop: 4,
-  },
-  txBar:      { width: 3, height: "100%", minHeight: 60, borderRadius: 2, marginTop: 2 },
-  txTopRow:   { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  txMidRow:   { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: 3 },
-  txBottomRow:{ flexDirection: "row", alignItems: "center", gap: 8, marginTop: 6 },
-  txName:     { fontSize: 14, fontWeight: "800", color: "#111827" },
-  txAmount:   { fontSize: 15, fontWeight: "900", color: "#111827" },
-  txMeta:     { fontSize: 11, color: "#9CA3AF", fontWeight: "500" },
-  txNet:      { fontSize: 11, color: "#6B7280", fontWeight: "600" },
-  txPill:     { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 999 },
-  txPillFull: { backgroundColor: "#F5F3FF" },
-  txPillAdv:  { backgroundColor: "#EFF6FF" },
-  txPillText: { fontSize: 10, fontWeight: "800" },
-  txTotalNote:{ fontSize: 11, color: "#9CA3AF", fontWeight: "500" },
-
-  // Empty
-  empty:      { alignItems: "center", paddingVertical: 36, gap: 10 },
-  emptyTitle: { fontSize: 15, fontWeight: "800", color: "#374151" },
-  emptySub:   { fontSize: 13, color: "#9CA3AF", fontWeight: "500" },
+  zigWrap: { height: 8, overflow: "hidden" },
+  zigTooth: { position: "absolute", top: -6, width: 12, height: 12, backgroundColor: "#fff", transform: [{ rotate: "45deg" }] },
+  foot: { textAlign: "center", color: ON_BRAND, fontSize: 12, fontWeight: "800", marginTop: 12, marginBottom: 6 },
+  after: { textAlign: "center", color: FAINT, fontSize: 12, fontWeight: "700", marginTop: 12, paddingHorizontal: 24 },
 });

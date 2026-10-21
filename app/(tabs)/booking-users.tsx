@@ -5,12 +5,14 @@ import {
   StyleSheet,
   ActivityIndicator,
   TouchableOpacity,
-  SafeAreaView,
   StatusBar,
   RefreshControl,
   Platform,
+  
 } from "react-native";
-import PagerView from "react-native-pager-view";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
+// import PagerView from "react-native-pager-view"; // ← REMOVED - not supported on web
 import {
   collection,
   query,
@@ -319,11 +321,12 @@ const TabPage = ({ data, tabKey, refreshing, onRefresh, router }: {
 
 // ─── Main Screen ──────────────────────────────────────────────────────────────
 export default function UserBookings() {
+  const insets = useSafeAreaInsets();
   const [bookings,   setBookings]   = useState<Booking[]>([]);
   const [loading,    setLoading]    = useState(true);
   const [activeTab,  setActiveTab]  = useState(0);
   const [refreshing, setRefreshing] = useState(false);
-  const pagerRef = useRef<any>(null);
+  // const pagerRef = useRef<any>(null); // ← REMOVED - not needed without PagerView
   const router   = useRouter();
 
   useEffect(() => {
@@ -406,7 +409,7 @@ export default function UserBookings() {
 
   const goToTab = useCallback((index: number) => {
     setActiveTab(index);
-    pagerRef.current?.setPage(index);
+    // pagerRef.current?.setPage(index); // ← REMOVED - not needed without PagerView
   }, []);
 
   const TAB_KEYS: TabKey[] = ["today", "upcoming", "past", "cancelled", "all"];
@@ -420,11 +423,11 @@ export default function UserBookings() {
   );
 
   return (
-    <SafeAreaView style={s.root}>
+    <View style={s.root}>
       <StatusBar barStyle="dark-content" backgroundColor="#fff" />
 
       {/* Header */}
-      <View style={s.header}>
+       <View style={[s.header, { paddingTop: insets.top + 14 }]}>
         <View style={{ flex: 1 }}>
           <Text style={s.headerTitle}>All Bookings</Text>
           <Text style={s.headerSub}>Your complete booking history</Text>
@@ -454,11 +457,10 @@ export default function UserBookings() {
         })}
       </View>
 
-      {/* Swipeable pages */}
-      <PagerView ref={pagerRef} style={{ flex: 1 }} initialPage={0}
-        onPageSelected={e => setActiveTab(e.nativeEvent.position)} overdrag>
+      {/* Tab content - show only active tab (no swipe on web) */}
+      <View style={{ flex: 1 }}>
         {TAB_KEYS.map((key, index) => (
-          <View key={key} style={{ flex: 1 }}>
+          <View key={key} style={{ display: activeTab === index ? "flex" : "none", flex: 1 }}>
             <TabPage
               data={tabData[key]} tabKey={key}
               refreshing={refreshing && activeTab === index}
@@ -466,8 +468,8 @@ export default function UserBookings() {
             />
           </View>
         ))}
-      </PagerView>
-    </SafeAreaView>
+      </View>
+    </View>
   );
 }
 
@@ -478,12 +480,14 @@ const s = StyleSheet.create({
   loadingText:      { marginTop: 12, fontSize: 14, color: "#6B7280" },
   listContent:      { paddingBottom: 120, paddingTop: 4 },
   listContentEmpty: { flexGrow: 1 },
-  header: {
-    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
-    backgroundColor: "#fff", paddingHorizontal: 20,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) + 14 : 16,
-    paddingBottom: 14,
-  },
+
+header: {
+  flexDirection: "row", alignItems: "center", justifyContent: "space-between",
+  backgroundColor: "#fff", paddingHorizontal: 20,
+  
+  paddingBottom: 14,
+},
+
   headerTitle: { fontSize: 22, fontWeight: "800", color: "#0B1220", letterSpacing: -0.3 },
   headerSub:   { fontSize: 13, color: "#9CA3AF", marginTop: 2 },
   pillRow:     { flexDirection: "row", gap: 8 },

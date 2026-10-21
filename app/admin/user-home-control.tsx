@@ -1,9 +1,9 @@
-
 import {
-  View, Text, StyleSheet, SafeAreaView, StatusBar, ScrollView,
+  View, Text, StyleSheet, StatusBar, ScrollView,
   TouchableOpacity, TextInput, Alert, ActivityIndicator,
   Switch, Modal, FlatList, Platform, RefreshControl,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useEffect, useState } from "react";
 import { db } from "../../firebaseConfig";
 import {
@@ -21,7 +21,7 @@ const DARK  = "#0A0F1E";
 const ACCENT = "#0EA5A4";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
-type SectionType = "manual" | "sport" | "location" | "nearby" | "all" | "highlights";
+type SectionType = "manual" | "sport" | "location" | "nearby" | "all" | "highlights" | "offers";
 
 type FeaturedSection = {
   id: string;
@@ -47,7 +47,7 @@ type HighlightCard = {
   icon: string;
   color: string;
   iconBg: string;
-  action: "explore" | "sport" | "turf" | "link" | "profile"; 
+  action: "explore" | "sport" | "turf" | "link" | "profile" | "toss"; 
   actionValue: string;
   active: boolean;
   order: number;
@@ -82,6 +82,7 @@ const EMPTY_CARD = (): Omit<HighlightCard,"id"> => ({
 
 // ─────────────────────────────────────────────────────────────────────────────
 export default function AdminHomeControl() {
+  const insets = useSafeAreaInsets();
   const router = useRouter();
   const [tab, setTab] = useState<"sections"|"highlights">("sections");
 
@@ -189,6 +190,30 @@ const fetchAll = async (isRefresh = false) => {
     const next = !s.active;
     await updateDoc(doc(db, "featuredSections", s.id), { active: next });
     setSections(prev => prev.map(x => x.id === s.id ? { ...x, active: next } : x));
+  };
+
+  // ── 🔥 Offers Today row — one tap to add it ───────────────────────────────
+  const hasOffersRow = sections.some(x => x.type === "offers");
+  const addOffersRow = async () => {
+    setSaving(true);
+    try {
+      const data: Omit<FeaturedSection, "id"> = {
+        ...EMPTY_SECTION(),
+        title: "Offers today",
+        subtitle: "Discount applied automatically when you book",
+        icon: "🔥",
+        type: "offers",
+        maxItems: 10,
+        order: 0,
+      };
+      // put it at the top, push the others down by one
+      const batch = writeBatch(db);
+      sections.forEach((x, i) => batch.update(doc(db, "featuredSections", x.id), { order: i + 1 }));
+      await batch.commit();
+      const ref = await addDoc(collection(db, "featuredSections"), { ...data, createdAt: serverTimestamp() });
+      setSections(prev => [{ id: ref.id, ...data }, ...prev.map((x, i) => ({ ...x, order: i + 1 }))]);
+    } catch (e: any) { Alert.alert("Error", e.message); }
+    finally { setSaving(false); }
   };
 
   // ── Reorder sections via drag ─────────────────────────────────────────────
@@ -300,7 +325,8 @@ const addTurfToSection = (id: string) => {
   // ── Shared header rendered above either list ─────────────────────────────
   const ListHeader = (
     <View>
-      <View style={s.hero}>
+      {/* ── Hero ── */}
+<View style={[s.hero, { paddingTop: insets.top + 14 }]}>
         <TouchableOpacity style={s.backBtn} onPress={() => router.back()}>
           <Ionicons name="arrow-back" size={20} color="#fff" />
         </TouchableOpacity>
@@ -317,6 +343,18 @@ const addTurfToSection = (id: string) => {
           </TouchableOpacity>
         ))}
       </View>
+      {tab === "sections" && !hasOffersRow && (
+        <View style={s.offerRowBox}>
+          <Text style={{ fontSize: 24 }}>🔥</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={s.offerRowTitle}>"Offers today" row is OFF</Text>
+            <Text style={s.offerRowSub}>Players won't see the row of turfs giving a discount today. Add it to show it on the home screen.</Text>
+          </View>
+          <TouchableOpacity style={[s.offerRowBtn, saving && { opacity: 0.6 }]} onPress={addOffersRow} disabled={saving}>
+            <Text style={s.offerRowBtnTxt}>Add</Text>
+          </TouchableOpacity>
+        </View>
+      )}
       <View style={[s.listHeader, { paddingHorizontal: 16, paddingTop: 16 }]}>
         <Text style={s.listHeaderTxt}>
           {tab === "sections" ? "Long-press to drag & reorder" : "Long-press to drag & reorder"}
@@ -330,7 +368,7 @@ const addTurfToSection = (id: string) => {
   );
 
   return (
-    <SafeAreaView style={s.safe}>
+    <View style={s.safe}>
       <StatusBar barStyle="light-content" backgroundColor={DARK} />
 
         {tab === "sections" ? (
@@ -395,14 +433,17 @@ const addTurfToSection = (id: string) => {
 
                         
                       
+                            item.type === "offers" ? { backgroundColor: "#FFEDD5" } :
                             item.type === "nearby" ? s.metaNearby :
                             item.type === "all"    ? s.metaAll    : {}
                           ]}>
                             <Text style={[s.metaChipTxt,
+                              item.type === "offers" ? { color: "#C2410C" } :
                               item.type === "nearby" ? { color: "#0369A1" } :
                               item.type === "all"    ? { color: "#7C3AED" } : {}
                             ]}>
-                              {item.type === "nearby"   ? "📍 Near You" :
+                              {item.type === "offers"   ? "🔥 Offers Today" :
+                               item.type === "nearby"   ? "📍 Near You" :
                                item.type === "all"      ? "🏟 All Venues" :
                                item.type === "manual"   ? "✋ Manual" :
                                item.type === "sport"    ? "⚽ By Sport" :
@@ -418,7 +459,7 @@ const addTurfToSection = (id: string) => {
                               <Text style={s.metaChipTxt}>{item.turfIds.length} turfs</Text>
                             </View>
                           )}
-                          {(item.type === "nearby" || item.type === "all") && (
+                          {(item.type === "nearby" || item.type === "all" || item.type === "offers") && (
                             <View style={s.metaChip}>
                               <Text style={s.metaChipTxt}>Max {item.maxItems ?? 6}</Text>
                             </View>
@@ -469,6 +510,18 @@ const addTurfToSection = (id: string) => {
                             <Ionicons name="color-palette-outline" size={13} color="#6B7280" />
                             <Text style={s.systemSectionPreviewTxt}>
                               Shows the coloured Top Pick cards. Manage card content in the Highlights tab.
+                            </Text>
+                          </View>
+                        )}
+
+                        {/* Preview for offers row */}
+                        {item.type === "offers" && (
+                          <View style={s.systemSectionPreview}>
+                            <Ionicons name="pricetag-outline" size={13} color="#6B7280" />
+                            <Text style={s.systemSectionPreviewTxt}>
+                              {item.active
+                                ? `Shows up to ${item.maxItems ?? 10} turfs giving a discount today. Hides itself on days with no offers.`
+                                : "Switched off — players don't see the Offers today row."}
                             </Text>
                           </View>
                         )}
@@ -647,14 +700,20 @@ const addTurfToSection = (id: string) => {
   { key: "sport",    label: "⚽ By Sport",    desc: "Auto-filter by sport" },
   { key: "location", label: "📌 By Location", desc: "Auto-filter by city" },
   { key: "highlights", label: "🎁 Top Picks", desc: "Show highlight cards" },
+  { key: "offers",   label: "🔥 Offers Today", desc: "Turfs with a discount today" },
 ] as const)
-  .filter(({ key }) => !(sectionForm.venueType === "gym" && key === "sport"))  // ✅ Hide sport for gyms
+  .filter(({ key }) => !(sectionForm.venueType === "gym" && (key === "sport" || key === "offers")))  // ✅ Hide sport for gyms
   .map(({ key, label, desc }) => (
   <TouchableOpacity
     key={key}
     
                     style={[s.typeBtn, sectionForm.type === key && s.typeBtnActive]}
-                    onPress={() => setSectionForm(f => ({ ...f, type: key as SectionType }))}
+                    onPress={() => setSectionForm(f => key === "offers"
+                      ? { ...f, type: "offers", venueType: "turf", style: "horizontal",
+                          title: f.title || "Offers today",
+                          subtitle: f.subtitle || "Discount applied automatically when you book",
+                          icon: f.icon || "🔥", maxItems: f.maxItems ?? 10 }
+                      : { ...f, type: key as SectionType })}
                   >
                     <Text style={[s.typeTxt, sectionForm.type === key && s.typeTxtActive]}>{label}</Text>
                   </TouchableOpacity>
@@ -671,6 +730,8 @@ const addTurfToSection = (id: string) => {
                     ? "You handpick exact turfs and control their position with ↑ ↓ arrows. Position 1 = shown first."
                     : sectionForm.type === "sport"
                     ? "Auto-shows all turfs matching the sport you pick below. Updates automatically when new turfs are added."
+                    : sectionForm.type === "offers"
+                    ? "Shows turfs that have a live offer today (e.g. 20% OFF). Fills itself automatically from owners' approved offers and hides itself on days with no offers. Turn it off to hide it completely."
                     : sectionForm.type === "highlights"
                     ? "Shows the Top Pick highlight cards — the colourful mini-cards users can tap to explore. Manage the cards in the Highlights tab."
                     : "Auto-shows turfs whose location text contains your keyword. e.g. 'Amravati' shows all Amravati turfs."}
@@ -678,7 +739,7 @@ const addTurfToSection = (id: string) => {
               </View>
 
               {/* maxItems — only for nearby and all */}
-              {(sectionForm.type === "nearby" || sectionForm.type === "all") && (
+              {(sectionForm.type === "nearby" || sectionForm.type === "all" || sectionForm.type === "offers") && (
                 <View>
                   <Text style={s.fieldLabel}>Max Turfs to Show</Text>
                   <View style={s.typeRow}>
@@ -693,7 +754,9 @@ const addTurfToSection = (id: string) => {
                     ))}
                   </View>
                   <Text style={s.hint}>
-                    {sectionForm.type === "nearby"
+                    {sectionForm.type === "offers"
+                      ? `Show up to ${sectionForm.maxItems ?? 6} turfs with offers, nearest first.`
+                      : sectionForm.type === "nearby"
                       ? `Show the ${sectionForm.maxItems ?? 6} closest turfs to the user.`
                       : `Show ${sectionForm.maxItems ?? 6} turfs from the full list.`}
                   </Text>
@@ -701,6 +764,7 @@ const addTurfToSection = (id: string) => {
               )}
 
               {/* Style */}
+              {sectionForm.type !== "offers" && (<>
               <Text style={s.fieldLabel}>Display Style</Text>
               <View style={s.typeRow}>
                 {(["horizontal","grid"] as const).map(t => (
@@ -712,6 +776,7 @@ const addTurfToSection = (id: string) => {
                   </TouchableOpacity>
                 ))}
               </View>
+              </>)}
 
               {/* Manual turf picker — only for manual */}
               {sectionForm.type === "manual" && (
@@ -937,7 +1002,7 @@ const addTurfToSection = (id: string) => {
 
               <Text style={s.fieldLabel}>Tap Action</Text>
               <View style={s.typeRow}>
-                {(["explore","sport","turf","link","profile"] as const).map(a => (
+                {(["explore","sport","turf","link","profile","toss"] as const).map(a => (
                   <TouchableOpacity key={a} style={[s.typeBtn, cardForm.action === a && s.typeBtnActive]}
                     onPress={() => setCardForm(f => ({ ...f, action: a, actionValue: "" }))}>
                     <Text style={[s.typeTxt, cardForm.action === a && s.typeTxtActive]}>{a}</Text>
@@ -1008,7 +1073,7 @@ const addTurfToSection = (id: string) => {
           </View>
         </View>
       </Modal>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -1017,7 +1082,7 @@ const s = StyleSheet.create({
   loadWrap:{ flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: DARK },
   loadText:{ marginTop: 12, color: "#9CA3AF", fontSize: 15, fontWeight: "600" },
 
-  hero: { backgroundColor: DARK, paddingHorizontal: 20, paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) + 14 : 18, paddingBottom: 20, overflow: "hidden" },
+  hero: { backgroundColor: DARK, paddingHorizontal: 20,paddingBottom: 20, overflow: "hidden" },
   backBtn:  { width: 36, height: 36, borderRadius: 12, backgroundColor: "rgba(255,255,255,0.1)", justifyContent: "center", alignItems: "center", marginBottom: 12 },
   heroTag:  { color: "#6EE7B7", fontSize: 11, fontWeight: "800", letterSpacing: 1.5, textTransform: "uppercase" },
   heroTitle:{ color: "#fff", fontSize: 26, fontWeight: "900", marginTop: 4 },
@@ -1121,6 +1186,12 @@ const s = StyleSheet.create({
   cardPreviewTitle:{ fontSize: 13, fontWeight: "800", color: "#111827" },
   cardPreviewSub:  { fontSize: 11, color: "#6B7280", marginTop: 3 },
   cardPreviewIcon: { width: 44, height: 44, borderRadius: 14, alignItems: "center", justifyContent: "center", marginTop: 14 },
+
+  offerRowBox:    { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: "#FFF7ED", borderWidth: 1, borderColor: "#FED7AA", borderRadius: 16, padding: 12, marginHorizontal: 16, marginTop: 14 },
+  offerRowTitle:  { fontSize: 14, fontWeight: "800", color: "#9A3412" },
+  offerRowSub:    { fontSize: 11, color: "#C2410C", marginTop: 2, lineHeight: 16 },
+  offerRowBtn:    { backgroundColor: "#EA580C", paddingHorizontal: 16, paddingVertical: 9, borderRadius: 10 },
+  offerRowBtnTxt: { color: "#fff", fontWeight: "800", fontSize: 13 },
 
   toggleRow:   { flexDirection: "row", justifyContent: "space-between", alignItems: "center", backgroundColor: "#F9FAFB", borderRadius: 14, padding: 14, marginTop: 16, borderWidth: 1, borderColor: "#E5E7EB" },
   toggleLabel: { fontSize: 15, fontWeight: "700", color: "#111827" },

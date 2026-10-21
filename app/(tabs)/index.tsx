@@ -1,10 +1,12 @@
 import {
   View, Text, TouchableOpacity, Image, StyleSheet,
-  ScrollView, RefreshControl, SafeAreaView, StatusBar,
+  ScrollView, RefreshControl, StatusBar,        // ← remove SafeAreaView here
   ActivityIndicator, Dimensions, Linking, Alert, Platform,
 } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+// ← add this line
 import { useEffect, useMemo, useState } from "react";
-import { collection, getDocs, doc, getDoc, orderBy, query } from "firebase/firestore";
+import { collection, getDocs, doc, getDoc, orderBy, query,where } from "firebase/firestore";
 import { db, auth } from "../../firebaseConfig";
 import { useRouter } from "expo-router";
 import Carousel from "react-native-reanimated-carousel";
@@ -34,6 +36,54 @@ const SPORT_STYLE: Record<string, { color: string; icon: keyof typeof Ionicons.g
 const SPORT_FALLBACK = { color: "#6B7280", icon: "ellipse-outline" as const };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// OTHER PLAYON PRODUCTS — shown in the "Explore more" section at the bottom
+// of the home screen. Purely client-side (not admin/Firestore controlled) —
+// add a new entry here any time a new standalone tool ships.
+// ─────────────────────────────────────────────────────────────────────────────
+type OtherProduct = { id: string; title: string; subtitle: string; icon: string; color: string; route: string; image?: any };
+const OTHER_PRODUCTS: OtherProduct[] = [
+  {
+    id: "toss",
+    title: "Playon Toss",
+    subtitle: "Flip a fair coin before your match starts",
+    icon: "🪙",
+    color: "#F59E0B",
+    route: "/(tabs)/toss",
+    // custom badge — the cricket-pitch coin logo. Drop the file at this path.
+    image: require("../../assets/images/toss-badge.png"),
+  },
+  {
+    id: "scorer",
+    title: "PlayOn Scorer",
+    subtitle: "Score gully cricket matches, fully offline",
+    icon: "🏏",
+    color: "#16A34A",
+    route: "/GullyScorer",
+    image:require("../../assets/images/scroer.png"),
+  },
+
+   {
+    id: "refer-venue",
+    title: "Refer Your Venue",
+    subtitle: "Refer Turfs & venue and get 500 rupess coin" ,
+    icon: "🎁",
+    color: "#16A34A",
+    route: "/refer-venue",
+    
+  },
+  {
+    id: "refer-and-earn",
+    title: "Refer & Earn",
+    subtitle: "Invite friends and earn PCoins on their first booking",
+    icon: "🎁",
+    color: "#7C3AED",
+    route: "/refer-earn-user",
+  },
+
+ 
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MODULE-LEVEL CACHE
 // Lives outside the component so it survives tab switches and re-mounts.
 // Each cache entry stores the data + the timestamp it was fetched.
@@ -54,6 +104,22 @@ function isFresh(entry: CacheEntry<any>): boolean {
   return Date.now() - entry.fetchedAt < CACHE_TTL;
 }
 
+// ── Offer badges (from the server's /turf-offers) ───────────────────────────
+// Same shape Explore uses. Cached 5 min; pull-to-refresh bypasses.
+type OfferBadge = {
+  offerId: string; title: string; tag?: string;
+  type: "flat" | "percent"; value: number; maxDiscount?: number;
+  badge: string;      // "20% OFF" | "₹150 OFF"
+  qualifier: string;  // "6 AM–10 AM · min ₹500" or ""
+  offerCount: number;
+};
+const SERVER_URL = "https://bookora-backend-95u4.onrender.com";
+const OFFERS_TTL = 5 * 60 * 1000;
+let _offersCache: { data: Record<string, OfferBadge>; fetchedAt: number } | null = null;
+const isPhoneOnly = (t: any) => t?.bookingMode === "phone" && !!t?.bookingPhone;
+const offerSaving = (o: OfferBadge) =>
+  o.type === "flat" ? `Save ₹${o.value}` : Number(o.maxDiscount) > 0 ? `Save up to ₹${o.maxDiscount}` : `${o.value}% off`;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
 type FeaturedSection = {
@@ -61,10 +127,11 @@ type FeaturedSection = {
   title: string;
   subtitle?: string;
   icon: string;
-  venueType?: "turf" | "gym";      // ✅ NEW — which venue type to show (default "turf")
-  type: "manual" | "sport" | "location" | "nearby" | "all" | "highlights";
+  venueType?: "turf" | "gym" | "ball_machine";      // ✅ NEW — which venue type to show (default "turf")
+  type: "manual" | "sport" | "location" | "nearby" | "all" | "highlights" | "offers";
   turfIds: string[];
   gymIds?: string[];                 // ✅ NEW — for manual gym sections
+  ballMachineIds?: string[];         // ✅ NEW — for manual Ball Machine sections
   filter?: { sport?: string; location?: string };
   maxItems?: number;
   active: boolean;
@@ -129,12 +196,13 @@ function SportTag({ sport }: { sport: string }) {
 // PopCard
 // ─────────────────────────────────────────────────────────────────────────────
 function PopCard({
-  item, userCoords, onPress, label,
+  item, userCoords, onPress, label, offer,
 }: {
   item: any;
   userCoords: { lat: number; lng: number } | null;
   onPress: () => void;
   label?: string;
+  offer?: OfferBadge;
 }) {
   const dist = userCoords && item.latitude != null
     ? haversine(userCoords.lat, userCoords.lng, item.latitude, item.longitude)
@@ -152,6 +220,12 @@ function PopCard({
             {label ?? "🔥 Popular"}
           </Text>
         </View>
+        {!!offer && (
+          <View style={pc.offerBadge}>
+            <Ionicons name="pricetag" size={11} color="#fff" />
+            <Text style={pc.offerBadgeTxt}>{offer.badge}</Text>
+          </View>
+        )}
       </View>
 
       <View style={pc.body}>
@@ -219,43 +293,96 @@ const pc = StyleSheet.create({
 sportTag:    { flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 99, borderWidth: 1 },
 sportTagTxt: { fontSize: 11, fontWeight: "700" },
   price:     { fontSize: 14, fontWeight: "900", color: BRAND },
+  machineMeta: { fontSize: 12, color: "#6B7280", fontWeight: "600" },
+  offerBadge:    { position: "absolute", top: 10, right: 10, flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: "#16A34A", paddingHorizontal: 9, paddingVertical: 5, borderRadius: 99 },
+  offerBadgeTxt: { fontSize: 11.5, fontWeight: "800", color: "#fff" },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FullCard
+// BallMachineCard — for venueType "ball_machine". Same visual language as
+// PopCard, but shows "From ₹X" (cheapest package) instead of a ₹/hr rate,
+// since these venues have no hourly slot price at all.
 // ─────────────────────────────────────────────────────────────────────────────
-function FullCard({
+function BallMachineCard({
   item, userCoords, onPress,
 }: {
   item: any;
   userCoords: { lat: number; lng: number } | null;
   onPress: () => void;
 }) {
-  const dist   = userCoords && item.latitude != null
+  const sport = getSport(item);
+  const rating = getRating(item);
+  const packages = Array.isArray(item.ballMachinePackages) ? item.ballMachinePackages : [];
+  const cheapest = packages.length > 0
+    ? Math.min(...packages.map((p: any) => Number(p.price) || Infinity))
+    : null;
+  const machineCount = Number(item.ballMachineCount || 1);
+
+  return (
+    <TouchableOpacity style={pc.card} onPress={onPress} activeOpacity={0.9}>
+      <View style={pc.imgWrap}>
+        <Image source={{ uri: getTurfImage(item) }} style={pc.img} resizeMode="cover" />
+        <View style={pc.topLeft}>
+          <Text style={pc.topLeftTxt}>🎯 Ball Machine</Text>
+        </View>
+      </View>
+
+      <View style={pc.body}>
+        <Text numberOfLines={1} style={pc.name}>{item.name}</Text>
+
+        <View style={pc.locRow}>
+          <Ionicons name="location-outline" size={12} color="#9CA3AF" />
+          <Text numberOfLines={1} style={pc.locTxt}>{item.location || "—"}</Text>
+          {rating && (
+            <View style={pc.ratingInline}>
+              <Ionicons name="star" size={11} color={GREEN} />
+              <Text style={pc.ratingInlineTxt}>{rating}</Text>
+            </View>
+          )}
+        </View>
+
+        <View style={pc.footer}>
+          <View style={pc.sportsRow}>
+            {sport.map((sp, index) => (
+              <SportTag key={index} sport={sp} />
+            ))}
+          </View>
+          <Text style={pc.price}>
+            {cheapest != null && isFinite(cheapest) ? `From ₹${cheapest}` : "View packages"}
+          </Text>
+        </View>
+        <Text style={[pc.machineMeta, { marginTop: 6 }]}>
+          {machineCount} machine{machineCount === 1 ? "" : "s"} available
+        </Text>
+      </View>
+    </TouchableOpacity>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FullCard
+// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// FullCard
+// ─────────────────────────────────────────────────────────────────────────────
+function FullCard({
+  item, userCoords, onPress, offer,
+}: {
+  item: any;
+  userCoords: { lat: number; lng: number } | null;
+  onPress: () => void;
+  offer?: OfferBadge;
+}) {
+  const dist  = userCoords && item.latitude != null
     ? haversine(userCoords.lat, userCoords.lng, item.latitude, item.longitude)
     : null;
-  const sport  = getSport(item);
-  const rating = getRating(item);
+  const sport = getSport(item);
 
   return (
     <TouchableOpacity style={fc.card} onPress={onPress} activeOpacity={0.92}>
       <View style={fc.imgWrap}>
         <Image source={{ uri: getTurfImage(item) }} style={fc.img} resizeMode="cover" />
         <View style={fc.gradient} />
-
-       {sport.length > 0 && (
-  <View style={fc.sportBadge}>
-    {sport.map((sp, index) => {
-      const cfg = SPORT_STYLE[sp] ?? SPORT_FALLBACK;
-      return (
-        <View key={index} style={fc.sportBadgeItem}>
-          <Ionicons name={cfg.icon} size={11} color="#fff" />
-          <Text style={fc.sportTxt}>{sp}</Text>
-        </View>
-      );
-    })}
-  </View>
-)}
 
         {dist != null && (
           <View style={fc.distBadge}>
@@ -265,33 +392,61 @@ function FullCard({
         )}
 
         <View style={fc.topOverlay}>
-          <Text numberOfLines={1} style={fc.name}>
-            {item.name}
-          </Text>
+          <Text numberOfLines={1} style={fc.name}>{item.name}</Text>
         </View>
+
+        {!!offer && (
+          <View style={pc.offerBadge}>
+            <Ionicons name="pricetag" size={11} color="#fff" />
+            <Text style={pc.offerBadgeTxt}>{offer.badge}</Text>
+          </View>
+        )}
 
         <View style={fc.bottomOverlay}>
           <View style={fc.locationBadge}>
             <Ionicons name="location-outline" size={13} color="#fff" />
-            <Text numberOfLines={1} style={fc.locTxt}>
-              {item.location || "—"}
-            </Text>
+            <Text numberOfLines={1} style={fc.locTxt}>{item.location || "—"}</Text>
           </View>
         </View>
       </View>
 
+      {/* ── Bottom bar: Night | Day | divider | sports | Book Now ── */}
       <View style={fc.bottom}>
-        <View>
-          <Text style={fc.bottomLabel}>Night price</Text>
+        {/* Night price */}
+        <View style={fc.priceCol}>
+          <Text style={fc.bottomLabel}>Night</Text>
           <Text style={fc.bottomPrice}>₹{getNightPrice(item)}/hr</Text>
         </View>
-        <View style={fc.bottomRight}>
-          <Text style={fc.dayPrice}>Day ₹{getDayPrice(item)}/hr</Text>
-          <TouchableOpacity style={fc.bookBtn} onPress={onPress} activeOpacity={0.85}>
-            <Text style={fc.bookBtnTxt}>Book Now</Text>
-            <Ionicons name="arrow-forward" size={12} color="#fff" />
-          </TouchableOpacity>
+
+        {/* Day price */}
+        <View style={fc.priceCol}>
+          <Text style={fc.bottomLabel}>Day</Text>
+          <Text style={fc.dayPriceValue}>₹{getDayPrice(item)}/hr</Text>
         </View>
+
+        {/* Divider */}
+        <View style={fc.dividerV} />
+
+        {/* Sport icon + name */}
+        <View style={fc.sportsBottom}>
+          {sport.slice(0, 2).map((sp, i) => {
+            const cfg = SPORT_STYLE[sp] ?? SPORT_FALLBACK;
+            return (
+              <View key={i} style={fc.sportItem}>
+                <View style={[fc.sportCircle, { borderColor: cfg.color }]}>
+                  <Ionicons name={cfg.icon} size={12} color={cfg.color} />
+                </View>
+                <Text numberOfLines={1} style={fc.sportName}>{sp}</Text>
+              </View>
+            );
+          })}
+        </View>
+
+        {/* Book Now */}
+        <TouchableOpacity style={fc.bookBtn} onPress={onPress} activeOpacity={0.85}>
+          <Text style={fc.bookBtnTxt}>Book Now</Text>
+          <Ionicons name="arrow-forward" size={12} color="#fff" />
+        </TouchableOpacity>
       </View>
     </TouchableOpacity>
   );
@@ -303,38 +458,32 @@ const fc = StyleSheet.create({
   img:     { width: "100%", height: "100%", backgroundColor: "#fff" },
   gradient:{ position: "absolute", bottom: 0, left: 0, right: 0, top: 0, backgroundColor: "rgba(0,0,0,0.03)" },
 
-  priceBadge: { position: "absolute", top: 12, left: 12, backgroundColor: "#16A34A", paddingHorizontal: 10, paddingVertical: 5, borderRadius: 99 },
-  priceTxt:   { fontSize: 12, fontWeight: "800", color: "#fff" },
-
- sportBadge:     { position: "absolute", top: 8, right: 10, flexDirection: "row", alignItems: "center", gap: 8, backgroundColor: "rgba(0,0,0,0.55)", paddingHorizontal: 10, paddingVertical: 5, borderRadius: 99, borderWidth: 1, borderColor: "rgba(255,255,255,0.15)" },
-sportBadgeItem: { flexDirection: "row", alignItems: "center", gap: 3 },
-sportTxt:       { fontSize: 11, fontWeight: "700", color: "#fff" },
-
   distBadge: { position: "absolute", bottom: 10, right: 12, flexDirection: "row", alignItems: "center", gap: 3, backgroundColor: "rgba(11,18,32,0.75)", paddingHorizontal: 8, paddingVertical: 4, borderRadius: 99 },
   distTxt:   { fontSize: 11, fontWeight: "700", color: "#fff" },
 
-  ratingBadge: { position: "absolute", bottom: 60, left: 12, flexDirection: "row", alignItems: "center", gap: 3, backgroundColor: "rgba(0,0,0,0.65)", paddingHorizontal: 8, paddingVertical: 4, borderRadius: 99 },
-  ratingTxt:   { fontSize: 11, fontWeight: "800", color: "#fff" },
-
-  overlay: { position: "absolute", bottom: 0, left: 0, right: 0, padding: 14, backgroundColor: "rgba(0,0,0,0.008)" },
-  topOverlay: { position: "absolute", top: 12, left: 14, right: 90 },
+  topOverlay:    { position: "absolute", top: 12, left: 14, right: 90 },
   bottomOverlay: { position: "absolute", bottom: 8, left: 8, right: 100 },
-  name: { fontSize: 19, fontWeight: "900", color: "#fff", letterSpacing: -0.3 },
-  locRow: { flexDirection: "row", alignItems: "center", gap: 4 },
-  locTxt: { fontSize: 12, color: "#fff", fontWeight: "700", maxWidth: 180 },
+  name:    { fontSize: 19, fontWeight: "900", color: "#fff", letterSpacing: -0.3 },
+  locTxt:  { fontSize: 12, color: "#fff", fontWeight: "700", maxWidth: 180 },
   locationBadge: {
     flexDirection: "row", alignItems: "center", gap: 4, alignSelf: "flex-start",
     backgroundColor: "rgba(0,0,0,0.55)", paddingHorizontal: 10, paddingVertical: 6,
     borderRadius: 999, borderWidth: 1, borderColor: "rgba(255,255,255,0.12)",
   },
 
-  bottom:       { flexDirection: "row", alignItems: "center", justifyContent: "space-between", backgroundColor: "#fff", paddingHorizontal: 14, paddingVertical: 12 },
-  bottomLabel:  { fontSize: 10, color: "#9CA3AF", fontWeight: "500", textTransform: "uppercase", letterSpacing: 0.4 },
-  bottomPrice:  { fontSize: 15, fontWeight: "900", color: BRAND, marginTop: 1 },
-  bottomRight:  { flexDirection: "row", alignItems: "center", gap: 10 },
-  dayPrice:     { fontSize: 12, color: "#9CA3AF", fontWeight: "500" },
-  bookBtn:      { flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: "#178c42", paddingHorizontal: 14, paddingVertical: 9, borderRadius: 10 },
-  bookBtnTxt:   { fontSize: 12, fontWeight: "800", color: "#fff" },
+  // ── bottom bar ──
+  bottom:        { flexDirection: "row", alignItems: "center", backgroundColor: "#fff", paddingHorizontal: 12, paddingVertical: 12 },
+  priceCol:      { marginRight:6 },
+  bottomLabel:   { fontSize: 10, color: "#9CA3AF", fontWeight: "500", textTransform: "uppercase", letterSpacing: 0.4 },
+  bottomPrice:   { fontSize: 15, fontWeight: "900", color: BRAND, marginTop: 1 },
+  dayPriceValue: { fontSize: 13, fontWeight: "600", color: "#6B7280", marginTop: 1 },
+  dividerV:      { width: 1, height: 30, backgroundColor: "#E5E7EB", marginRight: 5 },
+  sportsBottom:  { flex: 1, flexDirection: "row", alignItems: "center", gap: 5, marginRight: 8 },
+  sportItem:     { alignItems: "center", maxWidth: 46 },
+  sportCircle:   { width: 24, height: 24, borderRadius: 12, borderWidth: 1.5, alignItems: "center", justifyContent: "center", backgroundColor: "#fff" },
+  sportName:     { fontSize: 9.5, color: "#374151", fontWeight: "600", marginTop: 3 },
+  bookBtn:       { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: "#178c42", paddingHorizontal: 14, paddingVertical: 9, borderRadius: 10 },
+  bookBtnTxt:    { fontSize: 12, fontWeight: "800", color: "#fff" },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -347,33 +496,41 @@ function FeaturedSectionRow({
   section, 
   allTurfs, sortedTurfs,
   allGyms, sortedGyms,
+  allBallMachines, sortedBallMachines,
   allHighlights, 
   userCoords, 
   onTurf, 
   onGym,
+  onBallMachine,
   onExplore, 
   onHighlight,
+  offersByTurf = {},
 }: {
+  offersByTurf?: Record<string, OfferBadge>;
   section: FeaturedSection;
   allTurfs: any[];
   sortedTurfs: any[];
   allGyms: any[];
   sortedGyms: any[];
+  allBallMachines: any[];
+  sortedBallMachines: any[];
   allHighlights: HighlightCard[];
   userCoords: { lat: number; lng: number } | null;
   onTurf: (id: string) => void;
   onGym: (id: string) => void;
+  onBallMachine: (id: string) => void;
   onExplore: () => void;
   onHighlight: (card: HighlightCard) => void;
 }) {
-  // ✅ Determine if this section shows gyms
+  // ✅ Determine which venue type this section shows
   const isGymSection = section.venueType === "gym";
+  const isBallMachineSection = section.venueType === "ball_machine";
 
   // ✅ Pick the right data sources based on venueType
-  const allVenues    = isGymSection ? allGyms    : allTurfs;
-  const sortedVenues = isGymSection ? sortedGyms : sortedTurfs;
-  const manualIds    = isGymSection ? (section.gymIds || []) : section.turfIds;
-  const onTap        = isGymSection ? onGym : onTurf;
+  const allVenues    = isGymSection ? allGyms    : isBallMachineSection ? allBallMachines    : allTurfs;
+  const sortedVenues = isGymSection ? sortedGyms : isBallMachineSection ? sortedBallMachines : sortedTurfs;
+  const manualIds    = isGymSection ? (section.gymIds || []) : isBallMachineSection ? (section.ballMachineIds || []) : section.turfIds;
+  const onTap        = isGymSection ? onGym : isBallMachineSection ? onBallMachine : onTurf;
 
   const venuesToShow = useMemo(() => {
     const max = section.maxItems ?? 6;
@@ -472,6 +629,22 @@ function FeaturedSectionRow({
             />
           ))}
         </ScrollView>
+      ) : isBallMachineSection ? (
+        // ── Ball Machine sections always use horizontal scroll with BallMachineCard ──
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={{ gap: 12, paddingRight: 4 }}
+        >
+          {venuesToShow.map((item: any) => (
+            <BallMachineCard
+              key={item.id}
+              item={item}
+              userCoords={userCoords}
+              onPress={() => onTap(item.id)}
+            />
+          ))}
+        </ScrollView>
       ) : section.style === "horizontal" ? (
         // ── Turf horizontal: PopCard ──
         <ScrollView
@@ -485,6 +658,7 @@ function FeaturedSectionRow({
               item={item}
               userCoords={userCoords}
               onPress={() => onTap(item.id)}
+              offer={isPhoneOnly(item) ? undefined : offersByTurf[item.id]}
             />
           ))}
         </ScrollView>
@@ -492,7 +666,7 @@ function FeaturedSectionRow({
         // ── Turf grid: FullCard ──
         <View>
           {venuesToShow.map((item: any) => (
-            <FullCard key={item.id} item={item} userCoords={userCoords} onPress={() => onTap(item.id)} />
+            <FullCard key={item.id} item={item} userCoords={userCoords} onPress={() => onTap(item.id)} offer={isPhoneOnly(item) ? undefined : offersByTurf[item.id]} />
           ))}
         </View>
       )}
@@ -501,9 +675,138 @@ function FeaturedSectionRow({
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// OfferTodayCard — "Offers today" row on the home screen
+// ─────────────────────────────────────────────────────────────────────────────
+function OfferTodayCard({ item, offer, userCoords, onPress }: {
+  item: any; offer: OfferBadge; userCoords: { lat: number; lng: number } | null; onPress: () => void;
+}) {
+  const dist = userCoords && item.latitude != null
+    ? haversine(userCoords.lat, userCoords.lng, item.latitude, item.longitude) : null;
+  return (
+    <TouchableOpacity style={oc.card} onPress={onPress} activeOpacity={0.9}
+      accessibilityLabel={`${item.name}, ${offer.badge} today`}>
+      <View style={oc.imgWrap}>
+        <Image source={{ uri: getTurfImage(item) }} style={oc.img} resizeMode="cover" />
+        <View style={oc.badge}>
+          <Ionicons name="pricetag" size={12} color="#fff" />
+          <Text style={oc.badgeTxt}>{offer.badge} today</Text>
+        </View>
+        <View style={oc.tag}>
+          <Text style={oc.tagTxt} numberOfLines={1}>🎉 {offer.tag || offer.title}</Text>
+        </View>
+      </View>
+      <View style={oc.body}>
+        <Text style={oc.name} numberOfLines={1}>{item.name}</Text>
+        <Text style={oc.loc} numberOfLines={1}>
+          {item.location || "—"}{dist != null ? ` · ${fmtDist(dist)}` : ""}
+        </Text>
+        <View style={oc.saveRow}>
+          <Text style={oc.save}>{offerSaving(offer)}</Text>
+          <Text style={oc.qual} numberOfLines={1}>· {offer.qualifier || "all day"}</Text>
+        </View>
+      </View>
+    </TouchableOpacity>
+  );
+}
+
+const oc = StyleSheet.create({
+  card:    { width: 270, backgroundColor: "#fff", borderRadius: 18, overflow: "hidden", borderWidth: 1, borderColor: "#E5E7EB", shadowColor: "#000", shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.08, shadowRadius: 8, elevation: 3 },
+  imgWrap: { width: "100%", height: 140 },
+  img:     { width: "100%", height: "100%", backgroundColor: "#E5E7EB" },
+  badge:   { position: "absolute", top: 10, left: 10, flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: "#16A34A", paddingHorizontal: 10, paddingVertical: 5, borderRadius: 99 },
+  badgeTxt:{ fontSize: 12, fontWeight: "800", color: "#fff" },
+  tag:     { position: "absolute", bottom: 10, left: 10, maxWidth: 240, backgroundColor: "rgba(11,18,32,0.78)", paddingHorizontal: 9, paddingVertical: 4, borderRadius: 99 },
+  tagTxt:  { fontSize: 11, fontWeight: "700", color: "#fff" },
+  body:    { padding: 12 },
+  name:    { fontSize: 15, fontWeight: "800", color: BRAND },
+  loc:     { fontSize: 12, color: "#9CA3AF", marginTop: 3 },
+  saveRow: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 8 },
+  save:    { fontSize: 13, fontWeight: "800", color: "#15803D" },
+  qual:    { flex: 1, fontSize: 11, fontWeight: "700", color: "#6B7280" },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OtherProductsSection — static "Explore more from PlayOn" row, bottom of home
+// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// OtherProductsSection — static "Explore more from PlayOn" grid, bottom of home
+// 2 cards per row, wraps to the next line
+// ─────────────────────────────────────────────────────────────────────────────
+function OtherProductsSection({ router }: { router: ReturnType<typeof useRouter> }) {
+  return (
+    <View style={[s.section, { marginTop: 26 }]}>
+      <View style={s.sectionTitleWrap}>
+        <Text style={s.sectionEmoji}>🚀</Text>
+        <View>
+          <Text style={s.sectionTitle}>Explore More from PlayOn</Text>
+          <Text style={s.sectionSubtitle}>Other tools built for players like you</Text>
+        </View>
+      </View>
+
+      <View style={pd.grid}>
+        {OTHER_PRODUCTS.map((p) => (
+          <TouchableOpacity
+            key={p.id}
+            style={pd.card}
+            activeOpacity={0.9}
+            onPress={() => router.push(p.route as any)}
+          >
+            {p.image ? (
+              <Image source={p.image} style={pd.iconImage} resizeMode="contain" />
+            ) : (
+              <View style={[pd.iconBadge, { backgroundColor: p.color + "20" }]}>
+                <Text style={{ fontSize: 24 }}>{p.icon}</Text>
+              </View>
+            )}
+            <Text style={pd.title} numberOfLines={1}>{p.title}</Text>
+            <Text style={pd.subtitle} numberOfLines={2}>{p.subtitle}</Text>
+            <View style={pd.openRow}>
+              <Text style={[pd.openTxt, { color: p.color }]}>Open</Text>
+              <Ionicons name="arrow-forward" size={12} color={p.color} />
+            </View>
+          </TouchableOpacity>
+        ))}
+      </View>
+    </View>
+  );
+}
+
+// Section has paddingHorizontal: 16 (32 total) and a 12px gutter between columns
+const PRODUCT_CARD_W = (SCREEN_W - 32 - 12) / 2;
+
+const pd = StyleSheet.create({
+  grid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 12,
+    marginTop: 12,
+  },
+  card: {
+    width: PRODUCT_CARD_W,
+    backgroundColor: "#fff",
+    borderRadius: 18,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 6,
+    elevation: 2,
+  },
+  iconBadge: { width: 46, height: 46, borderRadius: 14, alignItems: "center", justifyContent: "center", marginBottom: 10 },
+  iconImage: { width: 46, height: 46, marginBottom: 10 },
+  title:     { fontSize: 14.5, fontWeight: "800", color: BRAND },
+  subtitle:  { fontSize: 11.5, color: "#9CA3AF", marginTop: 4, lineHeight: 15, minHeight: 30 },
+  openRow:   { flexDirection: "row", alignItems: "center", gap: 4, marginTop: "auto", paddingTop: 10 },
+  openTxt:   { fontSize: 12, fontWeight: "800" },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main Home Screen
 // ─────────────────────────────────────────────────────────────────────────────
 export default function Home() {
+    const insets = useSafeAreaInsets();  
   const [turfs,      setTurfs]      = useState<any[]>([]);
   const [banners,    setBanners]    = useState<any[]>([]);
   const [sections,   setSections]   = useState<FeaturedSection[]>([]);
@@ -517,6 +820,8 @@ export default function Home() {
   const [activeDot,   setActiveDot]   = useState(0);
   const [notifCount,  setNotifCount]  = useState(0);
   const [userCoords,  setUserCoords]  = useState<{ lat: number; lng: number } | null>(null);
+  const [walletBalance, setWalletBalance] = useState<number>(0);
+  const [offersByTurf, setOffersByTurf] = useState<Record<string, OfferBadge>>(_offersCache?.data ?? {});
   const router = useRouter();
 
   
@@ -546,6 +851,7 @@ export default function Home() {
   fetchSections(forceRefresh),
   fetchHighlights(forceRefresh),
 ]);
+      fetchOffers(forceRefresh);   // not awaited — badges are a decoration
     } catch (e) { console.error(e); }
     finally { setLoading(false); }
   };
@@ -612,6 +918,27 @@ const data = snap.docs
     setHighlights(data);
   };
 
+  // ─── fetchOffers — never blocks the home screen, never shows an error ─────
+  const fetchOffers = async (forceRefresh = false) => {
+    if (!forceRefresh && _offersCache && Date.now() - _offersCache.fetchedAt < OFFERS_TTL) {
+      setOffersByTurf(_offersCache.data);
+      return;
+    }
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);   // server cold start
+      const res = await fetch(`${SERVER_URL}/turf-offers`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}), signal: controller.signal,
+      });
+      clearTimeout(timer);
+      const data = await res.json();
+      const map = (data?.offers ?? {}) as Record<string, OfferBadge>;
+      _offersCache = { data: map, fetchedAt: Date.now() };
+      setOffersByTurf(map);
+    } catch { /* silent on purpose */ }
+  };
+
   // ─── fetchUser — single doc read, no cache needed ────────────────────────
   // User doc is per-user so it's already 1 read. No change needed here.
   const fetchUser = async (uid: string) => {
@@ -624,6 +951,17 @@ const data = snap.docs
         if (d.photoURL) setUserAvatar(d.photoURL);
         if (d.latitude != null && d.longitude != null)
           setUserCoords({ lat: d.latitude, lng: d.longitude });
+
+        // Wallet balance
+        try {
+          const pcSnap = await getDoc(doc(db, "pcoinWallets", uid));
+          const pc = pcSnap.exists() ? Number(pcSnap.data().balance || 0) : 0;
+          const vcSnap = await getDocs(
+            query(collection(db, "vcoinWallets"), where("uid", "==", uid))
+          );
+          const vc = vcSnap.docs.reduce((s: number, d: any) => s + Number(d.data().balance || 0), 0);
+          setWalletBalance(pc + vc);
+        } catch {}
       }
     } catch (e) { console.error(e); }
   };
@@ -643,16 +981,9 @@ const data = snap.docs
     catch { Alert.alert("Error", "Unable to open this link."); }
   };
 
-  const goToTurf = (id: string) => {
-    if (!auth.currentUser) {
-      Alert.alert("Login required", "Please log in to book.", [
-        { text: "Cancel", style: "cancel" },
-        { text: "Log In", onPress: () => router.push("/(auth)/login") },
-      ]);
-      return;
-    }
+ const goToTurf = (id: string) => {
     router.push(`/turf/${id}`);
-  };
+};
 
   const onHighlightTap = (card: HighlightCard) => {
     if (card.action === "explore") router.push("/(tabs)/explore");
@@ -660,21 +991,31 @@ const data = snap.docs
     else if (card.action === "turf" && card.actionValue) goToTurf(card.actionValue);
     else if (card.action === "link" && card.actionValue) openBannerLink(card.actionValue);
     else if (card.action === "profile") router.push("/(tabs)/profile");
+    else if (card.action === "toss") router.push("/(tabs)/toss");
   };
 
   const activeBanners = useMemo(() => banners.filter(b => b.active !== false), [banners]);
 
-// ─── Split turfs from gyms based on venueType ──────────────────────────
+// ─── Split turfs from gyms and Ball Machine venues based on venueType ────
   // ALL venues live in `turfs` collection now; we filter by venueType here.
-  // - actualTurfs = anything that's NOT a gym (turf, court, pool, club, other, or no type)
-  // - actualGyms  = only docs with venueType === "gym"
+  // - actualTurfs        = anything that's NOT a gym or Ball Machine venue
+  // - actualGyms         = only docs with venueType === "gym"
+  // - actualBallMachines = only docs with venueType === "ball_machine"
+  //   (previously these fell into actualTurfs and got the turf card + the
+  //   /turf/[id] slot-booking route — but they have no slots/hourly price
+  //   at all, so that showed ₹0/hr and opened the wrong booking flow.)
   const actualTurfs = useMemo(
-    () => turfs.filter((t: any) => t.venueType !== "gym"),
+    () => turfs.filter((t: any) => t.venueType !== "gym" && t.venueType !== "ball_machine"),
     [turfs]
   );
 
   const actualGyms = useMemo(
     () => turfs.filter((t: any) => t.venueType === "gym"),
+    [turfs]
+  );
+
+  const actualBallMachines = useMemo(
+    () => turfs.filter((t: any) => t.venueType === "ball_machine"),
     [turfs]
   );
 
@@ -706,6 +1047,26 @@ const data = snap.docs
     });
   }, [actualGyms, userCoords]);
 
+  // ─── Sort Ball Machine venues by distance ──────────────────────────────
+  const sortedBallMachines = useMemo(() => {
+    if (!userCoords) return actualBallMachines;
+    return [...actualBallMachines].sort((a, b) => {
+      const hasA = a.latitude != null && a.longitude != null;
+      const hasB = b.latitude != null && b.longitude != null;
+      if (!hasA && !hasB) return 0;
+      if (!hasA) return 1;
+      if (!hasB) return -1;
+      return haversine(userCoords.lat, userCoords.lng, a.latitude, a.longitude) -
+             haversine(userCoords.lat, userCoords.lng, b.latitude, b.longitude);
+    });
+  }, [actualBallMachines, userCoords]);
+
+  // ─── Turfs with an offer running today (online-bookable only) ─────────
+  const offerTurfs = useMemo(
+    () => sortedTurfs.filter((t: any) => !!offersByTurf[t.id] && !isPhoneOnly(t)),
+    [sortedTurfs, offersByTurf]
+  );
+
 
 
 const goToGym = (id: string) => {
@@ -719,6 +1080,14 @@ const goToGym = (id: string) => {
   router.push(`/turf/gym-details/${id}`);
 };
 
+// ⚠️ Destination screen not built yet — this route will 404 until the Ball
+// Machine booking screen (package picker → time grid → Razorpay) ships.
+// Routing here now (instead of the turf slot-booking screen) at least stops
+// Ball Machine venues from opening the wrong flow in the meantime.
+const goToBallMachine = (id: string) => {
+  router.push(`/turf/ball-machine-details/${id}`);
+};
+
   if (loading) return (
     <SafeAreaView style={s.center}>
       <StatusBar barStyle="dark-content" backgroundColor="#F5F5F5" />
@@ -728,7 +1097,7 @@ const goToGym = (id: string) => {
   );
 
   return (
-    <SafeAreaView style={s.root}>
+    <View style={s.root}>
       <StatusBar barStyle="dark-content" backgroundColor="#F5F5F5" />
       <ScrollView
         showsVerticalScrollIndicator={false}
@@ -737,7 +1106,7 @@ const goToGym = (id: string) => {
       >
         {/* ── Header ── */}
         <View style={s.fixedHeader}>
-          <View style={s.header}>
+            <View style={[s.header, { paddingTop: insets.top + 12 }]}>
             <View style={s.headerTextBlock}>
               <Text style={s.appTitle}>Playon</Text>
               <TouchableOpacity style={s.locationRow} activeOpacity={0.7} onPress={() => router.push("/(tabs)/explore")}>
@@ -754,10 +1123,15 @@ const goToGym = (id: string) => {
                 <Ionicons name="notifications-outline" size={21} color={BRAND} />
                 {notifCount > 0 && <View style={s.badge}><Text style={s.badgeTxt}>{notifCount}</Text></View>}
               </TouchableOpacity>
-              <TouchableOpacity style={s.avatarWrap} onPress={() => user ? router.push("/(tabs)/profile") : router.push("/(auth)/login")} activeOpacity={0.85}>
-                {userAvatar
-                  ? <Image source={{ uri: userAvatar }} style={s.avatarImg} />
-                  : <View style={s.avatarFallback}><Text style={s.avatarTxt}>{userInitial}</Text></View>}
+               <TouchableOpacity
+                style={s.walletBtn}
+                onPress={() => user ? router.push("/wallet" as any) : router.push("/(auth)/login")}
+                activeOpacity={0.85}
+              >
+                <Text style={{ fontSize: 14 }}>🪙</Text>
+                <Text style={s.walletBtnTxt}>
+                  {walletBalance > 0 ? walletBalance : "0"}
+                </Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -767,7 +1141,7 @@ const goToGym = (id: string) => {
         {activeBanners.length > 0 && (
           <View style={s.bannerSection}>
             <Carousel
-              width={SCREEN_W} height={190} autoPlay autoPlayInterval={3500}
+              width={SCREEN_W} height={190} autoPlay autoPlayInterval={2500}
               scrollAnimationDuration={700} data={activeBanners}
               onSnapToItem={i => setActiveDot(i)} mode="parallax"
               pagingEnabled snapEnabled loop enabled
@@ -806,7 +1180,32 @@ const goToGym = (id: string) => {
         )}
 
         {/* ── All sections — fully controlled by admin ── */}
-     {sections.map(section => (
+     {sections.map(section => section.type === "offers" ? (
+  // 🔥 "Offers today" row — admin turns it on/off and moves it in Home Control.
+  // Hides itself automatically when no turf has an offer today.
+  offerTurfs.length === 0 ? null : (
+    <View key={section.id} style={s.section}>
+      <View style={s.sectionRow}>
+        <View style={s.sectionTitleWrap}>
+          <Text style={s.sectionEmoji}>{section.icon || "🔥"}</Text>
+          <View>
+            <Text style={s.sectionTitle}>{section.title || "Offers today"}</Text>
+            {section.subtitle ? <Text style={s.sectionSubtitle}>{section.subtitle}</Text> : null}
+          </View>
+        </View>
+        <TouchableOpacity style={s.seeAllBtn} onPress={() => router.push({ pathname: "/(tabs)/explore", params: { sport: "Offers" } } as any)} activeOpacity={0.7}>
+          <Text style={s.seeAllTxt}>See all</Text>
+          <Ionicons name="arrow-forward" size={13} color={BRAND} />
+        </TouchableOpacity>
+      </View>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 12, paddingRight: 4 }}>
+        {offerTurfs.slice(0, section.maxItems ?? 10).map((t: any) => (
+          <OfferTodayCard key={t.id} item={t} offer={offersByTurf[t.id]} userCoords={userCoords} onPress={() => goToTurf(t.id)} />
+        ))}
+      </ScrollView>
+    </View>
+  )
+) : (
   <FeaturedSectionRow
     key={section.id}
     section={section}
@@ -814,19 +1213,59 @@ const goToGym = (id: string) => {
     sortedTurfs={sortedTurfs}
     allGyms={actualGyms}            // ✅ NEW
     sortedGyms={sortedGyms}         // ✅ NEW
+    allBallMachines={actualBallMachines}     // ✅ NEW
+    sortedBallMachines={sortedBallMachines}  // ✅ NEW
     allHighlights={highlights}
     userCoords={userCoords}
     onTurf={goToTurf}
     onGym={goToGym}                 // ✅ NEW
+    onBallMachine={goToBallMachine} // ✅ NEW
     onExplore={() => router.push("/(tabs)/explore")}
     onHighlight={onHighlightTap}
+    offersByTurf={offersByTurf}
   />
 ))}
 
       {/** gym code */}
-    
+
+      {/* ── Ball Machine — not admin-section-driven yet, so shown here
+           directly whenever any Ball Machine venues exist, the same way
+           "Explore more" below is a static block rather than a Firestore
+           section. Once there's a "ball_machine" featuredSections doc,
+           this can be removed in favor of the admin-controlled one above. ── */}
+      {actualBallMachines.length > 0 && (
+        <View style={s.section}>
+          <View style={s.sectionRow}>
+            <View style={s.sectionTitleWrap}>
+              <Text style={s.sectionEmoji}>🎯</Text>
+              <View>
+                <Text style={s.sectionTitle}>Ball Machine Practice</Text>
+                <Text style={s.sectionSubtitle}>Pay per over — no slot booking needed</Text>
+              </View>
+            </View>
+          </View>
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={{ gap: 12, paddingRight: 4 }}
+          >
+            {sortedBallMachines.slice(0, 10).map((item: any) => (
+              <BallMachineCard
+                key={item.id}
+                item={item}
+                userCoords={userCoords}
+                onPress={() => goToBallMachine(item.id)}
+              />
+            ))}
+          </ScrollView>
+        </View>
+      )}
+
+      {/* ── Explore more from PlayOn — Toss, Scorer, and future tools ── */}
+      <OtherProductsSection router={router} />
+
       </ScrollView>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -836,10 +1275,10 @@ const s = StyleSheet.create({
   center: { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: "#F5F5F5" },
   loadTxt:{ marginTop: 12, fontSize: 14, color: "#6B7280" },
   scroll: { paddingBottom: 110 },
+  
+fixedHeader: {
+  backgroundColor: "#F5F5F5",
 
-  fixedHeader: {
-    backgroundColor: "#F5F5F5",
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) + 6 : 6,
     paddingBottom: 8,
     shadowColor: "#000", shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.05, shadowRadius: 5, elevation: 5, zIndex: 10,
@@ -861,7 +1300,7 @@ const s = StyleSheet.create({
   bannerSection: { marginTop: 5 },
   bannerCard:    { width: SCREEN_W - 12, alignSelf: "center", borderRadius: 22, overflow: "hidden", backgroundColor: "#0F172A" },
   bannerImg:     { width: "100%", height: 190, backgroundColor: "#1E293B" },
-  bannerOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(5,12,24,0.15)" },
+  bannerOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(5,12,24,0.10)" },
   bannerContent: { position: "absolute", left: 16, right: 16, bottom: 16 },
   bannerBadge:   { alignSelf: "flex-start", backgroundColor: GREEN, paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6, marginBottom: 6 },
   bannerBadgeTxt:{ fontSize: 10, fontWeight: "800", color: "#fff", letterSpacing: 0.8, textTransform: "uppercase" },
@@ -894,4 +1333,22 @@ const s = StyleSheet.create({
   empty:      { backgroundColor: "#fff", borderRadius: 16, padding: 32, alignItems: "center", borderWidth: 1, borderColor: "#E5E7EB" },
   emptyTitle: { fontSize: 16, fontWeight: "800", color: BRAND, marginTop: 10 },
   emptySub:   { fontSize: 13, color: "#9CA3AF", marginTop: 6, textAlign: "center" },
+
+  //wallet
+  walletBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    backgroundColor: "#393b40",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 99,
+    borderWidth: 1,
+    borderColor: "#1E293B",
+  },
+  walletBtnTxt: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#fff",
+  },
 });
