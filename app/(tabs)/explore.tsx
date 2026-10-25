@@ -11,15 +11,17 @@ import {
   Platform,
   ScrollView,
   Alert,
-    RefreshControl,
+  RefreshControl,
   Modal,
 } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { db, auth } from "../../firebaseConfig";
-import { collection, getDocs, query, where, doc, getDoc } from "firebase/firestore";
+import { collection, getDocs, query, where, doc, getDoc, setDoc, arrayUnion, arrayRemove } from "firebase/firestore";
 import { onAuthStateChanged } from "firebase/auth";
-import { useRouter, useLocalSearchParams } from "expo-router";
+import { useRouter, useLocalSearchParams, useFocusEffect } from "expo-router";
+import { getSavedCity, getSavedCoords } from "../../utils/cities";   // 🏙️ all-India
+import { DEFAULT_TURF_IMAGE, hasPrice } from "../../utils/turfDisplay";   // no photo / no price
 import { Ionicons } from "@expo/vector-icons";
 import GymCardGrid from "../../components/screen-gym/gym-card-grid";  // ✅ Grid version for explore
 
@@ -47,6 +49,29 @@ function getSportCfg(sport: string) {
 
 function toTitleCase(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+}
+
+// ── One place to read a turf's sports ────────────────────────────────────────
+// Handles every shape stored in Firestore:
+//   ["Cricket", "Football"]  → array
+//   "Cricket, Football"      → comma string
+//   "cricket"                → single string
+// Returns clean, Title Case, de-duplicated names: ["Cricket", "Football"]
+function getSports(t: { sport?: string | string[] }): string[] {
+  const raw: string[] = Array.isArray(t.sport)
+    ? t.sport.flatMap(s => String(s).split(","))
+    : typeof t.sport === "string"
+      ? t.sport.split(",")
+      : [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const r of raw) {
+    const name = toTitleCase(r.trim());
+    if (!name || seen.has(name.toLowerCase())) continue;
+    seen.add(name.toLowerCase());
+    out.push(name);
+  }
+  return out;
 }
 
 function haversine(lat1: number, lng1: number, lat2: number, lng2: number): number {
@@ -89,16 +114,15 @@ type Turf = {
   images?: string[];
   openingTime?: number;
   closingTime?: number;
-    lateCutoffHours?: number;
+  lateCutoffHours?: number;
   slots?: Slot[];
   slotsLoading?: boolean;
   latitude?: number | null;
   longitude?: number | null;
-    distanceKm?: number | null;
+  distanceKm?: number | null;
   bookingMode?: "online" | "phone" | "both";
   bookingPhone?: string;
-
-  
+  facilities?: string[];
 };
 
 
@@ -256,8 +280,7 @@ function buildSlots(
 }
 
 const getTurfImage = (t: Turf) =>
-  (Array.isArray(t.images) && t.images.length > 0 ? t.images[0] : t.image) ||
-  "https://images.unsplash.com/photo-1575361204480-aadea25e6e68?auto=format&fit=crop&w=800&q=80";
+  (Array.isArray(t.images) && t.images.length > 0 ? t.images[0] : t.image) || DEFAULT_TURF_IMAGE;
 
 const getBasePrice = (t: Turf) => t.dayPrice || t.nightPrice || t.price || 0;
 // ── Admin-set booking mode (missing = old turf = online) ──
@@ -296,27 +319,64 @@ function windowPrice(t: Turf, start: number, end: number): number {
   );
 }
 
+// ── Slot chip: time only (no price). Booked / blocked are crossed out;
+//    the legend at the top of the list explains the colors. ──
 function SlotChip({ slot }: { slot: Slot }) {
   const bk = slot.status === "booked";
   const bl = slot.status === "blocked";
-  const ps = slot.status === "past";
-  const bg     = bk ? "#FEE2E2" : bl ? "#FEF3C7" : ps ? "#F9FAFB" : "#F0FDF4";
-  const border = bk ? "#FECACA" : bl ? "#FDE68A" : ps ? "#E5E7EB" : "#86EFAC";
-  const clr    = bk ? "#DC2626" : bl ? "#92400E" : ps ? "#D1D5DB" : "#15803D";
-  const sub    = bk ? "Booked"  : bl ? "Locked"  : ps ? ""        : `₹${slot.price}`;
-  const subClr = bk ? "#EF4444" : bl ? "#B45309" : "#15803D";
+  const bg     = bk ? "#FEF2F2" : bl ? "#FFFBEB" : "#F0FDF4";
+  const border = bk ? "#FECACA" : bl ? "#FDE68A" : "#86EFAC";
+  const clr    = bk ? "#B91C1C" : bl ? "#92400E" : "#15803D";
+  const status = bk ? "booked" : bl ? "blocked" : "available";
   return (
-    <View style={[sc.chip, { backgroundColor: bg, borderColor: border }]}>
-      <Text style={[sc.time, { color: clr }]}>{slot.label}</Text>
-      {!!sub && <Text style={[sc.sub, { color: subClr }]}>{sub}</Text>}
+    <View
+      style={[sc.chip, { backgroundColor: bg, borderColor: border }]}
+      accessibilityLabel={`${slot.label} ${status}`}
+    >
+      <Text style={[sc.time, { color: clr }, (bk || bl) && sc.crossed]}>{slot.label}</Text>
     </View>
   );
 }
 
 const sc = StyleSheet.create({
-  chip: { width: 60, paddingVertical: 7, borderRadius: 8, borderWidth: 1, alignItems: "center", marginRight: 6 },
-  time: { fontSize: 12, fontWeight: "700" },
-  sub:  { fontSize: 10, fontWeight: "600", marginTop: 2 },
+  chip:    { height: 32, paddingHorizontal: 10, borderRadius: 8, borderWidth: 1, alignItems: "center", justifyContent: "center" },
+  time:    { fontSize: 12, fontWeight: "700" },
+  crossed: { textDecorationLine: "line-through" },
+});
+
+// ── Sport pills on the turf card ─────────────────────────────────────────────
+// Shows up to 2 sports, then "+N" for the rest, so a turf with 5 sports
+// still fits on one line and never pushes the card wider.
+const MAX_SPORT_PILLS = 2;
+
+function SportPills({ sports }: { sports: string[] }) {
+  if (sports.length === 0) return null;
+  const shown = sports.slice(0, MAX_SPORT_PILLS);
+  const extra = sports.length - shown.length;
+  return (
+    <View style={sp.row} accessibilityLabel={`Sports: ${sports.join(", ")}`}>
+      {shown.map(name => {
+        const cfg = getSportCfg(name);
+        return (
+          <View key={name} style={sp.pill}>
+            <Ionicons name={cfg.icon} size={11} color={cfg.color} />
+            <Text style={sp.txt} numberOfLines={1}>{name}</Text>
+          </View>
+        );
+      })}
+      {extra > 0 && (
+        <View style={sp.pill}>
+          <Text style={sp.txt}>+{extra}</Text>
+        </View>
+      )}
+    </View>
+  );
+}
+
+const sp = StyleSheet.create({
+  row:  { flexDirection: "row", flexWrap: "nowrap", gap: 5, marginTop: 3 },
+  pill: { flexDirection: "row", alignItems: "center", gap: 3, flexShrink: 1, backgroundColor: "#F3F4F6", borderRadius: 999, paddingHorizontal: 8, paddingVertical: 3 },
+  txt:  { fontSize: 11, fontWeight: "700", color: "#374151", flexShrink: 1 },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -337,7 +397,7 @@ function applySlotCache(turfs: Turf[]): Turf[] {
 }
 
 export default function Explore() {
-  const insets = useSafeAreaInsets(); 
+  const insets = useSafeAreaInsets();
   const [turfs,      setTurfs]      = useState<Turf[]>([]);
   const [turfsBase,  setTurfsBase]  = useState<Turf[]>([]);
   const [search,     setSearch]     = useState("");
@@ -345,21 +405,44 @@ export default function Explore() {
   const [liked,      setLiked]      = useState<Set<string>>(new Set());
   const [loading,    setLoading]    = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-    const [userCoords, setUserCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const [userCoords, setUserCoords] = useState<{ lat: number; lng: number } | null>(null);
   const [offersByTurf, setOffersByTurf] = useState<Record<string, OfferBadge>>(
     _offersCache?.data ?? {}
   );
 
+  // 🏙️ City — same as Home (set by GPS on Home, or Profile → City Picker).
+  // cityId "" + cityName = PlayOn isn't live there (coming soon).
+  const [cityId,   setCityId]   = useState("");
+  const [cityName, setCityName] = useState("");
+  const comingSoon = !cityId && !!cityName;
+
   const router    = useRouter();
   const searchRef = useRef<TextInput>(null);
 
-  // Home "See all" / highlight cards can open Explore on a filter (e.g. Offers)
+  // Re-read the city every time Explore is opened (it may have changed on Home)
+  useFocusEffect(
+    useCallback(() => {
+      (async () => {
+        const [saved, coords] = await Promise.all([getSavedCity(), getSavedCoords()]);
+        if (coords) setUserCoords(coords);
+        if (saved) {
+          setCityId(saved.id);
+          setCityName(saved.name);
+        }
+      })();
+    }, [])
+  );
+
+  // Home "See all" / highlight cards can open Explore on a filter (e.g. Cricket).
+  // The Offers filter was removed, so an old "Offers" link just opens "All".
   const params = useLocalSearchParams<{ sport?: string }>();
   useEffect(() => {
-    if (params.sport) setSport(String(params.sport));
+    if (!params.sport) return;
+    const p = String(params.sport);
+    setSport(p.toLowerCase() === "offers" ? "All" : p);
   }, [params.sport]);
 
-    // ── Time filter ──
+  // ── Time filter ──
   const [timeFilter,    setTimeFilter]    = useState<{ start: number; end: number } | null>(null);
   const [showTimeSheet, setShowTimeSheet] = useState(false);
   const [draftStart,    setDraftStart]    = useState<number | null>(null);
@@ -383,17 +466,29 @@ export default function Explore() {
 
   useEffect(() => {
     const unsubAuth = onAuthStateChanged(auth, async (u) => {
-      if (u) {
-        try {
-          const snap = await getDoc(doc(db, "users", u.uid));
-          if (snap.exists()) {
-            const d = snap.data();
-            if (d.latitude != null && d.longitude != null) {
-              setUserCoords({ lat: d.latitude, lng: d.longitude });
-            }
-          }
-        } catch { /* non-fatal */ }
+      if (!u) {
+        setLiked(new Set());          // logged out → no saved turfs
+        return;
       }
+      try {
+        const snap = await getDoc(doc(db, "users", u.uid));
+        if (snap.exists()) {
+          const d = snap.data();
+          if (d.latitude != null && d.longitude != null) {
+            setUserCoords(prev => prev ?? { lat: d.latitude, lng: d.longitude });
+          }
+          // 🏙️ No city saved on this phone yet → use the account's city
+          if (!(await getSavedCity()) && d.cityId) {
+            setCityId(d.cityId);
+            setCityName(d.cityName || d.city || "");
+          }
+          // Saved turfs live on the user doc, so they survive app restarts
+          // and show on every phone the user logs in on.
+          if (Array.isArray(d.savedTurfs)) {
+            setLiked(new Set(d.savedTurfs as string[]));
+          }
+        }
+      } catch { /* non-fatal */ }
     });
 
     fetchAll();
@@ -482,7 +577,7 @@ export default function Explore() {
     }
   };
 
-    // ─── fetchOffers ─────────────────────────────────────────────────────────
+  // ─── fetchOffers ─────────────────────────────────────────────────────────
   // Fire-and-forget. Never awaited by the render path, never throws upward.
   // Explore worked before offers existed and must keep working if this fails.
   const fetchOffers = async (forceRefresh = false) => {
@@ -530,13 +625,13 @@ export default function Explore() {
       } else {
         // Cache miss or forced refresh — fetch from Firestore
         const turfSnap = await getDocs(collection(db, "turfs"));
-       raw = turfSnap.docs
-  .map(d => ({ id: d.id, ...d.data(), slotsLoading: true } as Turf))
-  .filter((t: any) => t.active !== false); 
+        raw = turfSnap.docs
+          .map(d => ({ id: d.id, ...d.data(), slotsLoading: true } as Turf))
+          .filter((t: any) => t.active !== false);
         _turfsCache = { data: raw, fetchedAt: Date.now() };
       }
 
-          setTurfsBase(raw);
+      setTurfsBase(raw);
 
       // Not awaited — badges land whenever they land.
       fetchOffers(isRefresh);
@@ -564,12 +659,39 @@ export default function Explore() {
     }
   };
 
-  const toggleLike = (id: string) => {
-    setLiked(prev => {
-      const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
-      return next;
-    });
+  // ─── Save / unsave a turf ────────────────────────────────────────────────
+  // Updates the star instantly, then writes users/{uid}.savedTurfs.
+  // If the write fails, the star goes back to how it was.
+  const toggleLike = async (id: string) => {
+    const user = auth.currentUser;
+    if (!user) {
+      Alert.alert("Login required", "Please log in to save turfs.", [
+        { text: "Cancel", style: "cancel" },
+        { text: "Log In", onPress: () => router.push("/(auth)/login") },
+      ]);
+      return;
+    }
+
+    const wasSaved = liked.has(id);
+    const flip = (save: boolean) =>
+      setLiked(prev => {
+        const next = new Set(prev);
+        save ? next.add(id) : next.delete(id);
+        return next;
+      });
+
+    flip(!wasSaved);
+    try {
+      await setDoc(
+        doc(db, "users", user.uid),
+        { savedTurfs: wasSaved ? arrayRemove(id) : arrayUnion(id) },
+        { merge: true }
+      );
+    } catch (e) {
+      console.error("toggleLike error:", e);
+      flip(wasSaved);
+      Alert.alert("Couldn't update", "Please check your internet and try again.");
+    }
   };
 
   const handleBook = (id: string) => {
@@ -583,43 +705,45 @@ export default function Explore() {
     router.push(`/turf/${id}`);
   };
 
-const sportFilters = useMemo<string[]>(() => {
-  // Get sports from turfs only (skip gyms — they have no sport field)
-  const raw = turfs
-    .filter((t: any) => t.venueType !== "gym")
-    .flatMap(t => Array.isArray(t.sport) ? t.sport : t.sport ? [t.sport] : []);
-  
-  const seen = new Set<string>();
-  const unique: string[] = [];
-  for (const s of raw) {
-    const normalized = toTitleCase(s.trim());
-    if (!seen.has(normalized.toLowerCase())) {
-      seen.add(normalized.toLowerCase());
-      unique.push(normalized);
-    }
-  }
+  // 🏙️ Venues in the current city only. Coming soon → none. No city yet → all.
+  const cityTurfs = useMemo(
+    () => comingSoon ? [] : cityId ? turfs.filter((t: any) => t.cityId === cityId) : turfs,
+    [turfs, cityId, comingSoon]
+  );
 
-  // ✅ Check if any gyms exist — if yes, add "Gym" chip at the end
-    const hasGyms = turfs.some((t: any) => t.venueType === "gym");
+  const sportFilters = useMemo<string[]>(() => {
+    // Sports from turfs only (gyms have no sport field). getSports already
+    // splits "Cricket, Football", trims, Title Cases and de-dupes per turf.
+    const seen = new Set<string>();
+    const unique: string[] = [];
+    cityTurfs
+      .filter((t: any) => t.venueType !== "gym")
+      .flatMap(getSports)
+      .forEach(name => {
+        if (!seen.has(name.toLowerCase())) {
+          seen.add(name.toLowerCase());
+          unique.push(name);
+        }
+      });
 
-  // Only offer the filter when there is something behind it. A chip that leads
-  // to an empty list reads as a broken app, not as "no deals today".
-    const hasOffers = turfs.some(t => !!offersByTurf[t.id] && !isPhoneOnly(t));
+    // ✅ Check if any gyms exist — if yes, add "Gym" chip at the end
+    const hasGyms = cityTurfs.some((t: any) => t.venueType === "gym");
 
-  return [
-    "All",
-    ...(hasOffers ? ["Offers"] : []),
-    ...unique.sort(),
-    ...(hasGyms ? ["Gym"] : []),
-  ];
-}, [turfs, offersByTurf]);
-
-  const likedTurfs = useMemo(() => turfs.filter(t => liked.has(t.id)), [turfs, liked]);
+    // "Saved" (star only) is always shown, last in the row; its empty state explains the star.
+    return [
+      "All",
+      ...unique.sort(),
+      ...(hasGyms ? ["Gym"] : []),
+      "Saved",
+    ];
+  }, [cityTurfs]);
 
   const filtered = useMemo<Turf[]>(() => {
     const q = search.trim().toLowerCase();
 
-    const withDist = turfs.map(t => {
+    // Saved shows everything the player starred, in any city
+    const base = sport === "Saved" ? turfs : cityTurfs;
+    const withDist = base.map(t => {
       let distanceKm: number | null = null;
       if (userCoords && t.latitude != null && t.longitude != null) {
         distanceKm = haversine(userCoords.lat, userCoords.lng, t.latitude, t.longitude);
@@ -634,45 +758,52 @@ const sportFilters = useMemo<string[]>(() => {
       return a.distanceKm - b.distanceKm;
     });
 
-           return sorted.filter((t: any) => {
-  // ── Time filter: only turfs free for the whole window ──
-  if (timeFilter) {
-    if (t.venueType === "gym") return false;
-    if (t.slotsLoading) return false;
-    if (!isFreeAt(t, timeFilter.start, timeFilter.end)) return false;
-  }
+    return sorted.filter((t: any) => {
+      // ── Time filter: only turfs free for the whole window ──
+      if (timeFilter) {
+        if (t.venueType === "gym") return false;
+        if (t.slotsLoading) return false;
+        if (!isFreeAt(t, timeFilter.start, timeFilter.end)) return false;
+      }
 
-  // Offers filter — turfs and gyms both, since an offer is an offer.
-   if (sport === "Offers") {
-    if (!offersByTurf[t.id] || isPhoneOnly(t)) return false;
-  } else if (sport === "Gym") {
-    if (t.venueType !== "gym") return false;
-  } else if (sport === "All") {
-    // "All" shows only turfs (not gyms)
-    if (t.venueType === "gym") return false;
-  } else {
-    // Specific sport filter — turfs only with matching sport
-    if (t.venueType === "gym") return false;
-    const sports = Array.isArray(t.sport) ? t.sport : t.sport ? [t.sport] : [];
-    if (!sports.some((s: string) => s.toLowerCase() === sport.toLowerCase())) return false;
-  }
+      // Saved filter — everything the user starred (turfs and gyms)
+      if (sport === "Saved") {
+        if (!liked.has(t.id)) return false;
+      } else if (sport === "Gym") {
+        if (t.venueType !== "gym") return false;
+      } else if (sport === "All") {
+        // "All" shows only turfs (not gyms)
+        if (t.venueType === "gym") return false;
+      } else {
+        // Specific sport filter — a multi-sport turf shows under EACH of its sports
+        if (t.venueType === "gym") return false;
+        if (!getSports(t).some(s => s.toLowerCase() === sport.toLowerCase())) return false;
+      }
 
-  if (!q) return true;
+      if (!q) return true;
 
-  const sportStr = Array.isArray(t.sport)
-    ? t.sport.join(" ").toLowerCase()
-    : (t.sport ?? "").toLowerCase();
-  const amenityStr = Array.isArray(t.amenities)
-    ? t.amenities.join(" ").toLowerCase()
-    : "";
-  return [
-    (t.name ?? "").toLowerCase(),
-    (t.location ?? "").toLowerCase(),
-    sportStr,
-    amenityStr,
-  ].some(v => v.includes(q));
-});
-   }, [turfs, search, sport, userCoords, offersByTurf, timeFilter]);
+      const sportStr = getSports(t).join(" ").toLowerCase();
+      const amenityStr = Array.isArray(t.amenities)
+        ? t.amenities.join(" ").toLowerCase()
+        : "";
+      return [
+        (t.name ?? "").toLowerCase(),
+        (t.location ?? "").toLowerCase(),
+        sportStr,
+        amenityStr,
+      ].some(v => v.includes(q));
+    });
+  }, [turfs, cityTurfs, search, sport, userCoords, offersByTurf, timeFilter, liked]);
+
+  // Searched something that isn't in this city → show matches from other cities
+  const otherCityHits = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q || filtered.length > 0 || !cityId) return [];
+    return turfs
+      .filter((t: any) => t.cityId !== cityId && t.venueType !== "gym")
+      .filter((t: any) => [t.name, t.location, t.cityName].some((v: any) => String(v || "").toLowerCase().includes(q)))
+      .slice(0, 5);
+  }, [search, filtered, turfs, cityId]);
 
   if (loading) {
     return (
@@ -701,23 +832,23 @@ const sportFilters = useMemo<string[]>(() => {
             tintColor="#0B1220"
             colors={["#0B1220"]}
           />
-          
         }
-            
 
         ListHeaderComponent={
           <View>
             <View style={[s.header, { paddingTop: insets.top + 12 }]}>
-              <View>
+              <View style={{ flex: 1, minWidth: 0 }}>
                 <Text style={s.title}>Explore</Text>
-                <Text style={s.sub}>
-                  {userCoords ? "Sorted by distance from you" : "Find your perfect venue"}
+                <Text style={s.sub} numberOfLines={1}>
+                  {cityName
+                    ? `${comingSoon ? "Coming soon to" : "Turfs in"} ${cityName}${userCoords && !comingSoon ? " · nearest first" : ""}`
+                    : userCoords ? "Sorted by distance from you" : "Find your perfect venue"}
                 </Text>
               </View>
-              {userCoords && (
-                <View style={s.nearBadge}>
+              {!!cityName && (
+                <View style={s.nearBadge} accessibilityLabel={`City ${cityName}`}>
                   <Ionicons name="location" size={13} color="#15803D" />
-                  <Text style={s.nearBadgeTxt}>Near you</Text>
+                  <Text style={s.nearBadgeTxt} numberOfLines={1}>{cityName}</Text>
                 </View>
               )}
             </View>
@@ -727,7 +858,7 @@ const sportFilters = useMemo<string[]>(() => {
                 <Ionicons name="search-outline" size={18} color="#6B7280" />
                 <TextInput
                   ref={searchRef}
-                  placeholder="Search turfs, sports, locations..."
+                  placeholder={cityName && !comingSoon ? `Search turfs in ${cityName}...` : "Search turfs, sports, locations..."}
                   placeholderTextColor="#9CA3AF"
                   value={search}
                   onChangeText={setSearch}
@@ -738,7 +869,7 @@ const sportFilters = useMemo<string[]>(() => {
                   <TouchableOpacity onPress={() => setSearch("")} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
                     <Ionicons name="close-circle" size={18} color="#9CA3AF" />
                   </TouchableOpacity>
-                                ) : (
+                ) : (
                   <TouchableOpacity
                     style={[s.searchFilter, timeFilter && s.searchFilterOn]}
                     onPress={openTimeSheet}
@@ -751,24 +882,37 @@ const sportFilters = useMemo<string[]>(() => {
             </View>
 
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.chips}>
-         {sportFilters.map(f => {
-  const active = sport === f;
-  
-  // ✅ Special configs for "All" and "Gym"
-  const cfg = 
-    f === "All" ? { color: "#374151", icon: "grid-outline" as const } :
-    f === "Gym" ? { color: "#7C3AED", icon: "barbell-outline" as const } :
-    getSportCfg(f);
+              {sportFilters.map(f => {
+                const active = sport === f;
 
-  return (
-    <TouchableOpacity key={f} style={[s.chip, active && s.chipOn]} onPress={() => setSport(f)} activeOpacity={0.7}>
-      <Ionicons name={cfg.icon} size={14} color={active ? "#fff" : cfg.color} />
-      <Text style={[s.chipTxt, active && s.chipTxtOn]}>{f}</Text>
-    </TouchableOpacity>
-  );
-})}
+                // ✅ Special configs for "All" and "Gym"
+                const cfg =
+                  f === "All"   ? { color: "#374151", icon: "grid-outline" as const } :
+                  f === "Saved" ? { color: "#FACC15", icon: "star" as const } :
+                  f === "Gym"   ? { color: "#7C3AED", icon: "barbell-outline" as const } :
+                  getSportCfg(f);
+
+                return (
+                  <TouchableOpacity
+                    key={f}
+                    style={[s.chip, active && s.chipOn]}
+                    onPress={() => setSport(f)}
+                    activeOpacity={0.7}
+                    accessibilityLabel={f === "Saved" ? "Saved turfs" : f}
+                  >
+                    <Ionicons name={cfg.icon} size={f === "Saved" ? 16 : 14} color={f === "Saved" ? (active ? "#FACC15" : "#CA8A04") : active ? "#fff" : cfg.color} />
+                    {/* Saved chip is icon-only: just the star */}
+                    {f !== "Saved" && <Text style={[s.chipTxt, active && s.chipTxtOn]}>{f}</Text>}
+                    {f === "Saved" && liked.size > 0 && (
+                      <View style={[s.chipCount, active && s.chipCountOn]}>
+                        <Text style={[s.chipCountTxt, active && s.chipCountTxtOn]}>{liked.size}</Text>
+                      </View>
+                    )}
+                  </TouchableOpacity>
+                );
+              })}
             </ScrollView>
-                           {timeFilter && (
+            {timeFilter && (
               <View style={s.timePillRow}>
                 <TouchableOpacity style={s.timePill} onPress={openTimeSheet} activeOpacity={0.85}>
                   <Ionicons name="time" size={13} color="#15803D" />
@@ -781,52 +925,81 @@ const sportFilters = useMemo<string[]>(() => {
                 </TouchableOpacity>
               </View>
             )}
-          <View style={s.legendRow}>
-  {sport !== "Gym" && (
-    <>
-      <View style={s.legendItem}>
-        <View style={[s.legendDot, { backgroundColor: "#F0FDF4", borderColor: "#86EFAC" }]} />
-        <Text style={s.legendTxt}>Available</Text>
-      </View>
-      <View style={s.legendItem}>
-        <View style={[s.legendDot, { backgroundColor: "#FEE2E2", borderColor: "#FECACA" }]} />
-        <Text style={s.legendTxt}>Booked</Text>
-      </View>
-      <View style={s.legendItem}>
-        <View style={[s.legendDot, { backgroundColor: "#FEF3C7", borderColor: "#FDE68A" }]} />
-        <Text style={s.legendTxt}>Blocked</Text>
-      </View>
-    </>
-  )}
-  <View style={{ flex: 1 }} />
-  <Text style={s.listCount}>
-        {filtered.length} {sport === "Gym" ? "gyms" : sport === "Offers" ? "with offers" : "venues"}
-  </Text>
-</View>
+            <View style={s.legendRow}>
+              {sport !== "Gym" && (
+                <>
+                  <View style={s.legendItem}>
+                    <View style={[s.legendDot, { backgroundColor: "#F0FDF4", borderColor: "#86EFAC" }]} />
+                    <Text style={s.legendTxt}>Available</Text>
+                  </View>
+                  <View style={s.legendItem}>
+                    <View style={[s.legendDot, { backgroundColor: "#FEE2E2", borderColor: "#FECACA" }]} />
+                    <Text style={s.legendTxt}>Booked</Text>
+                  </View>
+                  <View style={s.legendItem}>
+                    <View style={[s.legendDot, { backgroundColor: "#FEF3C7", borderColor: "#FDE68A" }]} />
+                    <Text style={s.legendTxt}>Blocked</Text>
+                  </View>
+                </>
+              )}
+              <View style={{ flex: 1 }} />
+              <Text style={s.listCount}>
+                {filtered.length} {sport === "Gym" ? "gyms" : sport === "Saved" ? "saved" : "venues"}
+              </Text>
+            </View>
 
-            {likedTurfs.length > 0 && (
-              <View style={s.likedSection}>
-                <Text style={s.sectionTitle}>⭐ Saved</Text>
-                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.likedRow}>
-                  {likedTurfs.map(t => (
-                    <TouchableOpacity key={t.id} style={s.likedCard} onPress={() => handleBook(t.id)} activeOpacity={0.85}>
-                      <Image source={{ uri: getTurfImage(t) }} style={s.likedImg} resizeMode="cover" />
-                      <View style={s.likedInfo}>
-                        <Text numberOfLines={1} style={s.likedName}>{t.name}</Text>
-                        <Text style={s.likedPrice}>₹{getBasePrice(t)}/hr</Text>
-                      </View>
-                    </TouchableOpacity>
-                  ))}
-                </ScrollView>
-              </View>
-            )}
           </View>
         }
 
         ListEmptyComponent={
+          sport === "Saved" && !search && !timeFilter ? (
+            <View style={s.empty}>
+              <Ionicons name="star-outline" size={48} color="#D1D5DB" />
+              <Text style={s.emptyTitle}>
+                {auth.currentUser ? "No saved turfs yet" : "Log in to see saved turfs"}
+              </Text>
+              <Text style={s.emptySub}>
+                {auth.currentUser
+                  ? "Tap the star on any turf photo to save it here for quick booking."
+                  : "Your saved turfs are kept on your account."}
+              </Text>
+              <TouchableOpacity
+                style={s.emptyBtn}
+                onPress={() => auth.currentUser ? setSport("All") : router.push("/(auth)/login")}
+              >
+                <Text style={s.emptyBtnTxt}>{auth.currentUser ? "Browse turfs" : "Log In"}</Text>
+              </TouchableOpacity>
+            </View>
+          ) : comingSoon && sport !== "Saved" ? (
+            <View style={s.empty}>
+              <Ionicons name="time-outline" size={48} color="#F59E0B" />
+              <Text style={s.emptyTitle}>PlayOn is coming to {cityName}</Text>
+              <Text style={s.emptySub}>No turfs here yet. Know one? Add it and we'll bring PlayOn to {cityName}.</Text>
+              <TouchableOpacity style={s.emptyBtn} onPress={() => router.push("/add-a-turf" as any)}>
+                <Text style={s.emptyBtnTxt}>Add a turf</Text>
+              </TouchableOpacity>
+            </View>
+          ) : otherCityHits.length > 0 ? (
+            <View style={s.empty}>
+              <Ionicons name="search-outline" size={40} color="#D1D5DB" />
+              <Text style={s.emptyTitle}>Not in {cityName}</Text>
+              <Text style={s.emptySub}>Found in other cities:</Text>
+              <View style={{ alignSelf: "stretch", marginTop: 10, gap: 8 }}>
+                {otherCityHits.map((t: any) => (
+                  <TouchableOpacity key={t.id} style={s.otherRow} onPress={() => router.push(`/turf/${t.id}` as any)} activeOpacity={0.85}>
+                    <View style={{ flex: 1, minWidth: 0 }}>
+                      <Text style={s.otherName} numberOfLines={1}>{t.name}</Text>
+                      <Text style={s.otherCity} numberOfLines={1}>{t.cityName || t.location || ""}</Text>
+                    </View>
+                    <Ionicons name="chevron-forward" size={16} color="#6B7280" />
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </View>
+          ) : (
           <View style={s.empty}>
             <Ionicons name="search-outline" size={48} color="#D1D5DB" />
-                       <Text style={s.emptyTitle}>
+            <Text style={s.emptyTitle}>
               {timeFilter ? "No free turfs at that time" : "No venues found"}
             </Text>
             <Text style={s.emptySub}>
@@ -841,147 +1014,162 @@ const sportFilters = useMemo<string[]>(() => {
               <Text style={s.emptyBtnTxt}>{timeFilter ? "Change time" : "Show all"}</Text>
             </TouchableOpacity>
           </View>
+          )
         }
 
         renderItem={({ item }) => {
-  // ✅ If it's a gym, render the GymCard
-  if ((item as any).venueType === "gym") {
-  return (
-    <View style={{ marginHorizontal: 10, marginBottom: 14 }}>
-      <GymCardGrid
-        item={item}
-        userCoords={userCoords ? { lat: userCoords.lat, lng: userCoords.lng } : null}
-        onPress={() => {
-          if (!auth.currentUser) {
-            Alert.alert("Login required", "Please log in to view memberships.", [
-              { text: "Cancel", style: "cancel" },
-              { text: "Log In", onPress: () => router.push("/(auth)/login") },
-            ]);
-            return;
+          // ✅ If it's a gym, render the GymCard
+          if ((item as any).venueType === "gym") {
+            return (
+              <View style={{ marginHorizontal: 10, marginBottom: 14 }}>
+                <GymCardGrid
+                  item={item}
+                  userCoords={userCoords ? { lat: userCoords.lat, lng: userCoords.lng } : null}
+                  onPress={() => {
+                    if (!auth.currentUser) {
+                      Alert.alert("Login required", "Please log in to view memberships.", [
+                        { text: "Cancel", style: "cancel" },
+                        { text: "Log In", onPress: () => router.push("/(auth)/login") },
+                      ]);
+                      return;
+                    }
+                    router.push(`/turf/gym-details/${item.id}`);
+                  }}
+                />
+              </View>
+            );
           }
-          router.push(`/turf/gym-details/${item.id}`);
-        }}
-      />
-    </View>
-  );
-}
 
- 
-    
-          const img        = getTurfImage(item);
-          const basePrice  = getBasePrice(item);
-          const sportArray = Array.isArray(item.sport)
-            ? item.sport
-            : typeof item.sport === "string" && item.sport.includes(",")
-              ? item.sport.split(",").map(s => s.trim())
-              : item.sport ? [item.sport] : [];
-         const firstSport    = sportArray[0] ?? "";
-const firstSportCfg = firstSport ? getSportCfg(firstSport) : SPORT_FALLBACK;
-const isLiked       = liked.has(item.id);
-const phoneOnly = isPhoneOnly(item);
-const callToo   = hasCallOption(item) && !phoneOnly;
-const offer     = phoneOnly ? undefined : offersByTurf[item.id];   // offers are online-only
+          const img       = getTurfImage(item);
+          const basePrice = getBasePrice(item);
+          const sports    = getSports(item);          // ["Cricket", "Football", ...]
+          const isLiked   = liked.has(item.id);
+          const phoneOnly = isPhoneOnly(item);
+          const offer     = phoneOnly ? undefined : offersByTurf[item.id];   // offers are online-only
 
-                   const slotPreview = (item.slots ?? [])
-            .filter(sl => sl.status !== "past")
-            .filter(sl => !timeFilter || sl.start >= timeFilter.start)   // start the row at the chosen time
-            .slice(0, 10);
+          const upcoming = (item.slots ?? []).filter(sl => sl.status !== "past");
+          const freeCount = upcoming.filter(sl => sl.status === "available").length;
+          const slotPreview = upcoming
+            .filter(sl => !timeFilter || sl.start >= timeFilter.start);  // all upcoming slots (row scrolls sideways)
           const winPrice = timeFilter ? windowPrice(item, timeFilter.start, timeFilter.end) : 0;
 
           return (
+            // Card itself is NOT tappable — only the photo, the name block, the
+            // phone box and the button open the turf. The slot row sits outside
+            // every touchable, so swiping it only scrolls.
             <View style={s.card}>
+              {/* ── Left: photo (tap → turf) — clean photo, no sport badge ── */}
               <TouchableOpacity style={s.imgWrap} activeOpacity={0.9} onPress={() => handleBook(item.id)}>
                 <Image source={{ uri: img }} style={s.img} resizeMode="cover" />
-                <View style={s.sportBadge}>
-  <Ionicons name={firstSportCfg.icon} size={12} color="#fff" />
-  <Text style={s.sportBadgeTxt}>
-    {sportArray.slice(0, 2).map(s => toTitleCase(s.trim())).join(" · ") || "Venue"}
-  </Text>
-</View>
-                <TouchableOpacity style={s.heart} onPress={() => toggleLike(item.id)} activeOpacity={0.8} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
-                  <Ionicons name={isLiked ? "star" : "star-outline"} size={18} color={isLiked ? "#000000" : "#fff"} />
+
+                {/* Offer: corner tag, flush top-left. Big number, small "OFF" under it.
+                    "20% OFF" → 20% / OFF,  "₹150 OFF" → ₹150 / OFF.
+                    Fixed size so every card's tag looks the same; long values shrink to fit. */}
+                {!!offer && (() => {
+                  const hasOff = /\s*OFF\s*$/i.test(offer.badge);
+                  const value  = offer.badge.replace(/\s*OFF\s*$/i, "").trim() || offer.badge;
+                  return (
+                    <View style={s.offerBadge} accessibilityLabel={`Offer: ${offer.badge}`}>
+                      <Text style={s.offerBadgeNum} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.6}>
+                        {value}
+                      </Text>
+                      {hasOff && <Text style={s.offerBadgeOff}>OFF</Text>}
+                    </View>
+                  );
+                })()}
+
+                <TouchableOpacity style={s.heart} onPress={() => toggleLike(item.id)} activeOpacity={0.8} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} accessibilityLabel={isLiked ? "Remove from saved" : "Save turf"}>
+                  <Ionicons name={isLiked ? "star" : "star-outline"} size={14} color={isLiked ? "#FACC15" : "#fff"} />
                 </TouchableOpacity>
-                                <View style={s.imgPrice}>
-                                   <Text style={s.imgPriceTxt}>
-                    {timeFilter
-                      ? `₹${winPrice} · ${hourLabel(timeFilter.start)}–${hourLabel(timeFilter.end)}`
-                      : `₹${basePrice}/hr`}
-                  </Text>
-                </View>
-                                {!!offer && (
-                  <View style={s.offerBadge}>
-                    <Ionicons name="pricetag" size={11} color="#fff" />
-                    <Text style={s.offerBadgeTxt}>{offer.badge}</Text>
-                  </View>
-                )}
-              </TouchableOpacity>
 
-              <View style={s.infoRow}>
-                <View style={{ flex: 1, marginRight: 10 }}>
-                                    <Text numberOfLines={1} style={s.turfName}>{item.name ?? "Turf"}</Text>
-                                   {!!offer && (
-                    <Text numberOfLines={1} style={s.offerLine}>
-                      {offer.title}
-                      {offer.qualifier ? ` · ${offer.qualifier}` : ""}
-                      {offer.offerCount > 1 ? ` · +${offer.offerCount - 1} more` : ""}
-                    </Text>
-                  )}
-                  <View style={s.locRow}>
-                    <Ionicons name="location-outline" size={12} color="#9CA3AF" />
-                    <Text numberOfLines={1} style={s.locTxt}> {item.location ?? "—"}</Text>
-                    {item.distanceKm != null && (
-                      <Text style={s.distInline}> · {fmtDist(item.distanceKm)} away</Text>
-                    )}
-                  </View>
-
-                                    {callToo && (
-                    <View style={s.callLine}>
-                      <Ionicons name="call" size={11} color="#15803D" />
-                      <Text style={s.callLineTxt}>Also bookable by call</Text>
+                {/* Bottom: distance (right) */}
+                <View style={s.imgBottom}>
+                  {item.distanceKm != null && (
+                    <View style={s.distBadge}>
+                      <Text style={s.distBadgeTxt}>{fmtDist(item.distanceKm)}</Text>
                     </View>
                   )}
                 </View>
-                               <TouchableOpacity style={[s.bookBtn, phoneOnly && s.bookBtnPhone]} onPress={() => handleBook(item.id)} activeOpacity={0.85}>
-                  {phoneOnly && <Ionicons name="call" size={12} color="#fff" />}
-                  <Text style={s.bookBtnTxt}>{phoneOnly ? "Call to Book" : "Book Now"}</Text>
-                </TouchableOpacity>
-              </View>
+              </TouchableOpacity>
 
-                            {phoneOnly ? (
-                <TouchableOpacity style={s.phoneStrip} onPress={() => handleBook(item.id)} activeOpacity={0.85}>
-                  <View style={s.phoneStripIcon}>
-                    <Ionicons name="call-outline" size={15} color="#15803D" />
+              {/* ── Right: details ── */}
+              <View style={s.body}>
+                <TouchableOpacity style={{ gap: 3 }} activeOpacity={0.7} onPress={() => handleBook(item.id)}>
+                  <Text numberOfLines={1} style={s.turfName}>{item.name ?? "Turf"}</Text>
+                  <View style={s.locRow}>
+                    <Ionicons name="location-outline" size={12} color="#6B7280" />
+                    <Text numberOfLines={1} style={s.locTxt}>{item.location ?? "—"}</Text>
                   </View>
-                  <View style={{ flex: 1 }}>
-                    <Text style={s.phoneStripTitle}>Bookings by phone</Text>
-                    <Text style={s.phoneStripSub}>
-                      Open {shortLabel(item.openingTime ?? 6)} – {shortLabel(item.closingTime ?? 24)} · Tap to see number
+                  <SportPills sports={sports} />
+                  {!!offer && (
+                    <Text numberOfLines={1} style={s.offerLine}>
+                      {offer.title}
+                      {offer.qualifier ? ` · ${offer.qualifier}` : ""}
+                    </Text>
+                  )}
+                </TouchableOpacity>
+
+                {/* Call-to-book turfs look like any other turf here (no "call" hints).
+                    They have no live slots, so we show their timings instead.
+                    The call option is only revealed on the turf page. */}
+                {phoneOnly ? (
+                  <View style={s.slotSection}>
+                    <Text style={s.slotLabel}>Timings</Text>
+                    <Text style={s.hoursTxt}>
+                      {(item as any).hoursSet === false ? "Call to book" : `Open ${shortLabel(item.openingTime ?? 6)} – ${shortLabel(item.closingTime ?? 24)}`}
                     </Text>
                   </View>
-                  <Ionicons name="chevron-forward" size={16} color="#9CA3AF" />
-                </TouchableOpacity>
-              ) : (
-              <View style={s.slotSection}>
-                <Text style={s.slotLabel}>Today's slots</Text>
-                {item.slotsLoading ? (
-                  <ActivityIndicator size="small" color="#0B1220" style={{ marginVertical: 6 }} />
-                ) : slotPreview.length === 0 ? (
-                  <Text style={s.noSlots}>No upcoming slots today</Text>
                 ) : (
-                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingRight: 6 }}>
-                    {slotPreview.map((sl, i) => <SlotChip key={i} slot={sl} />)}
-                    <TouchableOpacity style={s.moreArrow} onPress={() => handleBook(item.id)} activeOpacity={0.8}>
-                      <Ionicons name="chevron-forward" size={16} color="#6B7280" />
-                    </TouchableOpacity>
-                  </ScrollView>
+                  // Scroll-only: chips are plain Views, nothing here opens the turf
+                  <View style={s.slotSection}>
+                    <Text style={s.slotLabel}>Today's slots</Text>
+                    {item.slotsLoading ? (
+                      <ActivityIndicator size="small" color="#0B1220" style={{ alignSelf: "flex-start", marginVertical: 4 }} />
+                    ) : slotPreview.length === 0 ? (
+                      <Text style={s.noSlots}>No upcoming slots today</Text>
+                    ) : (
+                      <ScrollView
+                        horizontal
+                        showsHorizontalScrollIndicator={false}
+                        contentContainerStyle={s.slotRow}
+                        nestedScrollEnabled
+                        keyboardShouldPersistTaps="handled"
+                      >
+                        {slotPreview.map((sl, i) => <SlotChip key={i} slot={sl} />)}
+                      </ScrollView>
+                    )}
+                  </View>
                 )}
+
+                {/* ── Bottom: price + free count | button ── */}
+                <View style={s.bottomRow}>
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    {!hasPrice(basePrice) && !(timeFilter && !phoneOnly) ? (
+                      <Text style={[s.price, { fontSize: 14 }]} numberOfLines={1}>Price on call</Text>
+                    ) : (
+                    <Text style={s.price} numberOfLines={1}>
+                      {timeFilter && !phoneOnly ? `₹${winPrice}` : `₹${basePrice}`}
+                      <Text style={s.priceUnit}>
+                        {timeFilter && !phoneOnly ? ` · ${hourLabel(timeFilter.start)}–${hourLabel(timeFilter.end)}` : "/hr"}
+                      </Text>
+                    </Text>
+                    )}
+                    {!phoneOnly && !item.slotsLoading && upcoming.length > 0 && (
+                      <Text style={[s.freeCount, freeCount === 0 && { color: "#B91C1C" }]}>
+                        {freeCount === 0 ? "Full today" : `${freeCount} free today`}
+                      </Text>
+                    )}
+                  </View>
+                  <TouchableOpacity style={s.bookBtn} onPress={() => handleBook(item.id)} activeOpacity={0.85}>
+                    <Text style={s.bookBtnTxt}>Book Now</Text>
+                  </TouchableOpacity>
+                </View>
               </View>
-              )}
             </View>
           );
         }}
       />
-            {/* ── Time filter sheet ── */}
+      {/* ── Time filter sheet ── */}
       <Modal visible={showTimeSheet} transparent animationType="slide" onRequestClose={() => setShowTimeSheet(false)}>
         <View style={s.sheetBackdrop}>
           <View style={[s.sheet, { paddingBottom: insets.bottom + 16 }]}>
@@ -1061,14 +1249,17 @@ const s = StyleSheet.create({
   header: {
     flexDirection: "row", justifyContent: "space-between", alignItems: "center",
     backgroundColor: "#fff", paddingHorizontal: 16,
-      
     paddingBottom: 8,
   },
   title: { fontSize: 22, fontWeight: "800", color: "#0B1220", letterSpacing: -0.3 },
   sub:   { fontSize: 12, color: "#9CA3AF", marginTop: 1 },
 
   nearBadge:    { flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: "#DCFCE7", paddingHorizontal: 10, paddingVertical: 5, borderRadius: 999, borderWidth: 1, borderColor: "#86EFAC" },
-  nearBadgeTxt: { fontSize: 12, fontWeight: "700", color: "#15803D" },
+  nearBadgeTxt: { fontSize: 12, fontWeight: "700", color: "#15803D", maxWidth: 140 },
+  // 🏙️ other-city search results
+  otherRow:     { flexDirection: "row", alignItems: "center", gap: 8, backgroundColor: "#fff", borderRadius: 12, padding: 12, borderWidth: 1, borderColor: "#E5E7EB" },
+  otherName:    { fontSize: 14, fontWeight: "800", color: "#0B1220" },
+  otherCity:    { fontSize: 12, color: "#6B7280", marginTop: 2 },
 
   searchWrap: { backgroundColor: "#fff", paddingHorizontal: 16, paddingBottom: 10 },
   searchBar:  { flexDirection: "row", alignItems: "center", backgroundColor: "#FFFFFF", borderRadius: 16, paddingHorizontal: 14, height: 52, borderWidth: 1, borderColor: "#E5E7EB", shadowColor: "#000", shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.04, shadowRadius: 6, elevation: 2 },
@@ -1082,66 +1273,65 @@ const s = StyleSheet.create({
   chipTxt:   { fontSize: 12, fontWeight: "600", color: "#374151" },
   chipTxtOn: { color: "#fff" },
 
-  legendRow:  { flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 7, backgroundColor: "#fff", borderTopWidth: 0.5, borderTopColor: "#F0F0F0", gap: 10 },
+  legendRow:  {  marginBottom:5,flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 7, backgroundColor: "#fff", borderTopWidth: 0.5, borderTopColor: "#F0F0F0", gap: 10 },
   legendItem: { flexDirection: "row", alignItems: "center", gap: 5 },
   legendDot:  { width: 12, height: 12, borderRadius: 3, borderWidth: 1 },
   legendTxt:  { fontSize: 11, fontWeight: "600", color: "#6B7280" },
   listCount:  { fontSize: 11, fontWeight: "600", color: "#9CA3AF" },
 
-  likedSection: { backgroundColor: "#fff", marginTop: 8, paddingTop: 10, paddingBottom: 6 },
-  sectionTitle: { fontSize: 13, fontWeight: "700", color: "#0B1220", paddingHorizontal: 16, marginBottom: 8 },
-  likedRow:     { paddingHorizontal: 16, gap: 10 },
-  likedCard:    { width: 110, borderRadius: 10, overflow: "hidden", backgroundColor: "#fff", shadowColor: "#000", shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.07, shadowRadius: 3, elevation: 2 },
-  likedImg:     { width: "100%", height: 68, backgroundColor: "#E5E7EB" },
-  likedInfo:    { padding: 7 },
-  likedName:    { fontSize: 11, fontWeight: "700", color: "#0B1220" },
-  likedPrice:   { fontSize: 10, color: "#6B7280", marginTop: 1 },
+  // Saved chip count bubble
+  chipCount:      { minWidth: 18, height: 18, paddingHorizontal: 5, borderRadius: 9, backgroundColor: "#FEF3C7", alignItems: "center", justifyContent: "center", marginLeft: 2 },
+  chipCountOn:    { backgroundColor: "#FACC15" },
+  chipCountTxt:   { fontSize: 10, fontWeight: "800", color: "#92400E" },
+  chipCountTxtOn: { color: "#0B1220" },
 
-  card: { backgroundColor: "#fff", borderRadius: 18, marginHorizontal: 10, marginBottom: 14, overflow: "hidden", shadowColor: "#000", shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.06, shadowRadius: 8, elevation: 3 },
-  imgWrap:      { width: "100%", height: 165, position: "relative" },
-  img:          { width: "100%", height: "100%", backgroundColor: "#E5E7EB" },
-  sportBadge: { position: "absolute", top: 10, left: 10, flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: "rgba(11,18,32,0.72)", paddingHorizontal: 9, paddingVertical: 4, borderRadius: 20 },
-  sportBadgeTxt:{ fontSize: 11, fontWeight: "700", color: "#fff" },
-  heart:        { position: "absolute", top: 10, right: 10, width: 30, height: 30, borderRadius: 15, backgroundColor: "rgba(0,0,0,0.3)", alignItems: "center", justifyContent: "center" },
-  imgPrice:     { position: "absolute", bottom: 10, right: 10, backgroundColor: "#0B1220", paddingHorizontal: 9, paddingVertical: 4, borderRadius: 20 },
-    imgPriceTxt:  { fontSize: 12, fontWeight: "800", color: "#fff" },
+  // ── Turf card: photo left, details right ──
+  card: { flexDirection: "row", minHeight: 200, backgroundColor: "#fff", borderRadius: 16, marginHorizontal: 10, marginBottom: 10, overflow: "hidden", shadowColor: "#000", shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.06, shadowRadius: 8, elevation: 3 },
+  imgWrap:      { width: 132, alignSelf: "stretch", position: "relative", backgroundColor: "#E5E7EB" },
+  img:          { ...StyleSheet.absoluteFillObject },
+  heart:        { position: "absolute", top: 6, right: 6, width: 28, height: 28, borderRadius: 14, backgroundColor: "rgba(0,0,0,0.38)", alignItems: "center", justifyContent: "center" },
+  imgBottom:    { position: "absolute", left: 6, right: 6, bottom: 8, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 4 },
 
-  offerBadge:    { position: "absolute", bottom: 10, left: 10, flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: "#16A34A", paddingHorizontal: 9, paddingVertical: 4, borderRadius: 20 },
-  offerBadgeTxt: { fontSize: 11, fontWeight: "800", color: "#fff", letterSpacing: 0.2 },
-  offerLine:     { fontSize: 11, fontWeight: "700", color: "#16A34A", marginTop: 3 },
+  // Option B offer badge: corner tag flush to the photo's top-left corner
+  offerBadge: {
+    position: "absolute", top: 0, left: 0,
+    width: 74, height: 46, paddingHorizontal: 6,
+    alignItems: "center", justifyContent: "center",
+    backgroundColor: "#15803D", borderBottomRightRadius: 14,
+    shadowColor: "#000", shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.25, shadowRadius: 6, elevation: 4,
+  },
+  offerBadgeNum: { fontSize: 18, lineHeight: 24, fontWeight: "900", color: "#fff", textAlign: "center" },
+  offerBadgeOff: { fontSize: 10, fontWeight: "800", letterSpacing: 1.5, color: "#fff", marginTop: 1 },
+  offerLine:     { fontSize: 11, fontWeight: "700", color: "#15803D", marginTop: 2 },
 
-  distBadge:    { position: "absolute", bottom: 10, left: 10, flexDirection: "row", alignItems: "center", gap: 3, backgroundColor: "rgba(11,18,32,0.75)", paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999 },
-  distBadgeTxt: { fontSize: 11, fontWeight: "700", color: "#fff" },
+  distBadge:    { backgroundColor: "#0B1220", paddingHorizontal: 7, paddingVertical: 3, borderRadius: 20 },
+  distBadgeTxt: { fontSize: 10, fontWeight: "700", color: "#fff" },
 
-  infoRow:    { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingTop: 8, paddingBottom: 6 },
-  turfName:   { fontSize: 15, fontWeight: "800", color: "#0B1220" },
-  locRow:     { flexDirection: "row", alignItems: "center", marginTop: 2 },
-  locTxt:     { fontSize: 12, color: "#9CA3AF" },
-  distInline: { fontSize: 12, color: "#059669", fontWeight: "600" },
+  body:       { flex: 1, minWidth: 0, paddingVertical: 12, paddingLeft: 12, paddingRight: 10, gap: 8, justifyContent: "space-between" },
+  turfName:   { fontSize: 16, fontWeight: "800", color: "#0B1220" },
+  locRow:     { flexDirection: "row", alignItems: "center", gap: 3 },
+  locTxt:     { flex: 1, fontSize: 12, color: "#6B7280" },
+  hoursTxt:   { fontSize: 13, fontWeight: "700", color: "#0B1220" },
 
-  bookBtn:    { backgroundColor: "#178c42", paddingHorizontal: 14, paddingVertical: 8, borderRadius: 10 },
+  bottomRow:  { flexDirection: "row", alignItems: "center", gap: 8, borderTopWidth: 1, borderTopColor: "#F1F3F5", paddingTop: 10 },
+  price:      { fontSize: 16, fontWeight: "900", color: "#0B1220" },
+  priceUnit:  { fontSize: 11, fontWeight: "600", color: "#6B7280" },
+  bookBtn:    { height: 34, justifyContent: "center", backgroundColor: "#178c42", paddingHorizontal: 16, borderRadius: 10 },
   bookBtnTxt: { fontSize: 12, fontWeight: "800", color: "#fff" },
 
-  slotSection: { borderTopWidth: 1, borderTopColor: "#F3F4F6", paddingHorizontal: 12, paddingTop: 6, paddingBottom: 10 },
-  slotLabel:   { fontSize: 10, fontWeight: "700", color: "#9CA3AF", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 },
+  slotSection: { gap: 5 },
+  slotRow:     { gap: 5, paddingRight: 4 },   // one row, swipe left for later slots
+  slotLabel:   { fontSize: 10, fontWeight: "700", color: "#6B7280", textTransform: "uppercase", letterSpacing: 0.5 },
+  freeCount:   { fontSize: 11, fontWeight: "700", color: "#15803D", marginTop: 1 },
   noSlots:     { fontSize: 12, color: "#9CA3AF", paddingVertical: 4 },
-  moreArrow:   { width: 34, height: 50, borderRadius: 8, borderWidth: 1, borderColor: "#E5E7EB", backgroundColor: "#F9FAFB", alignItems: "center", justifyContent: "center" },
 
   empty:      { alignItems: "center", paddingTop: 80, paddingHorizontal: 40 },
   emptyTitle: { fontSize: 17, fontWeight: "700", color: "#374151", marginTop: 14 },
   emptySub:   { fontSize: 13, color: "#9CA3AF", textAlign: "center", marginTop: 6, lineHeight: 20 },
   emptyBtn:   { marginTop: 18, backgroundColor: "#0B1220", paddingHorizontal: 22, paddingVertical: 10, borderRadius: 10 },
   emptyBtnTxt:{ fontSize: 13, fontWeight: "700", color: "#fff" },
-    // phone booking
-  bookBtnPhone:    { flexDirection: "row", alignItems: "center", gap: 5 },
-  callLine:        { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 3 },
-  callLineTxt:     { fontSize: 11, fontWeight: "700", color: "#15803D" },
-  phoneStrip:      { flexDirection: "row", alignItems: "center", gap: 10, borderTopWidth: 1, borderTopColor: "#F3F4F6", paddingHorizontal: 12, paddingVertical: 10 },
-  phoneStripIcon:  { width: 30, height: 30, borderRadius: 9, backgroundColor: "#DCFCE7", alignItems: "center", justifyContent: "center" },
-  phoneStripTitle: { fontSize: 12.5, fontWeight: "800", color: "#0B1220" },
-  phoneStripSub:   { fontSize: 11, fontWeight: "600", color: "#6B7280", marginTop: 1 },
 
-    // time filter
+  // time filter
   searchFilterOn:  { backgroundColor: "#16A34A" },
   timePillRow:     { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingBottom: 8, backgroundColor: "#fff" },
   timePill:        { flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: "#F0FDF4", borderWidth: 1, borderColor: "#86EFAC", paddingHorizontal: 12, paddingVertical: 6, borderRadius: 999 },

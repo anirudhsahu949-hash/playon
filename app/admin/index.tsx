@@ -348,11 +348,13 @@ export default function AdminDashboard() {
           <View style={s.quickGrid}>
             {([
               { icon: "business-outline",   label: "Add Turf",       route: "/admin/add-turf", color: "#6366F1", bg: "#EEF2FF" },
+              { icon: "flash-outline",      label: "Quick\nAdd",    route: "/admin/add-listing", color: "#0EA5A4", bg: "#CCFBF1" },
               { icon: "grid-outline",       label: "Manage\nTurfs",  route: "/admin/turfs",    color: "#22C55E", bg: "#DCFCE7" },
           //    { icon: "person-add-outline", label: "Create\nOwner",  route: "/admin/owners",   color: "#F59E0B", bg: "#FEF3C7" },
               { icon: "people-outline",     label: "Manage\nOwners", route: "/admin/owners",   color: "#3B82F6", bg: "#DBEAFE" },
-              { icon: "image-outline",      label: "Banners",        route: "/admin/settings", color: "#8B5CF6", bg: "#EDE9FE" },
+              { icon: "image-outline",      label: "Banners",        route: "/admin/banners", color: "#8B5CF6", bg: "#EDE9FE" },
                 { icon: "apps-outline",      label: "user home control",        route: "/admin/user-home-control", color: "#000000", bg: "#d6d6d6" },
+              { icon: "map-outline",        label: "Cities",         route: "/admin/cities",   color: "#0EA5A4", bg: "#CCFBF1" },
             ] as const).map((q, i) => (
               <TouchableOpacity key={i} style={s.quickItem} onPress={() => router.push(q.route as any)} activeOpacity={0.75}>
                 <View style={[s.quickIcon, { backgroundColor: q.bg }]}>
@@ -513,7 +515,7 @@ const s = StyleSheet.create({
 
   quickGrid: {
     backgroundColor: CARD, borderRadius: 20,
-    flexDirection: "row", paddingVertical: 14, paddingHorizontal: 4,
+    flexDirection: "row", flexWrap: "wrap", paddingVertical: 14, paddingHorizontal: 4,
     shadowColor: "#000", shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.04, shadowRadius: 8, elevation: 2,
   },
   quickItem: { width: "20%", alignItems: "center", paddingVertical: 6 },

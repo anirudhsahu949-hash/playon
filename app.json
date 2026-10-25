@@ -2,7 +2,7 @@
   "expo": {
     "name": "Playon",
     "slug": "bookora",
-    "version": "1.1.9",
+    "version": "2.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/playon-icon-v15.png",
     "scheme": "playon",
@@ -11,7 +11,7 @@
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.playonnew.app",
-      "buildNumber": "24",
+      "buildNumber": "25",
       "googleServicesFile": "./GoogleService-Info.plist",
       "icon": "./assets/images/playon-icon-v15.png",
       "infoPlist": {
@@ -48,7 +48,7 @@
       }
     },
     "android": {
-      "versionCode": 20,
+      "versionCode": 21,
       "googleServicesFile": "./google-services.json",
       "package": "com.playonnew.app",
       "softwareKeyboardLayoutMode": "pan",

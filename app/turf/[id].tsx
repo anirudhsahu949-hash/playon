@@ -23,6 +23,8 @@ import {
   KeyboardAvoidingView,
   Keyboard,
   Switch,
+  AccessibilityInfo,
+  Easing,
 } from "react-native";
 
 import { useLocalSearchParams, Stack } from "expo-router";
@@ -50,6 +52,7 @@ import { db, auth } from "../../firebaseConfig";
 import { onAuthStateChanged } from "firebase/auth";
 import { useRouter } from "expo-router";
 import { useFocusEffect } from "expo-router";
+import { DEFAULT_TURF_IMAGE, hasPrice, priceOrCall } from "../../utils/turfDisplay";
 // add to existing RN imports
 
 type BookingType = "advance" | "full";
@@ -108,8 +111,12 @@ interface SlotChip {
   status: "available" | "booked" | "locked" | "past" | "outside";
 }
 
-const FALLBACK_IMAGE =
-  "https://media.istockphoto.com/id/1405637348/photo/red-cricket-ball.jpg?s=612x612&w=0&k=20&c=DBkyp2Pp7AZOtqJrn9daux-NHl7ZwdDC5VnH8mCSZrE=";
+// No photo → default PlayOn photo · no price → "On call" (utils/turfDisplay.ts)
+const FALLBACK_IMAGE = DEFAULT_TURF_IMAGE;
+
+// 🌙 Booking number is hidden between these hours (24-hour clock, phone's time)
+const CALL_QUIET_FROM = 22;   // 10 PM
+const CALL_QUIET_TO   = 7;    // 7 AM
 
 const MAX_BOOKING_HOURS = 3;        // ✅ Was 2, now 3
 const MIN_BOOKING_HOURS = 1;
@@ -146,6 +153,91 @@ const SPORT_STYLE: Record<string, { bg: string; icon: keyof typeof Ionicons.glyp
   Pickleball: { bg: "#0891B2", icon: "tennisball-outline" },
   Volleyball: { bg: "#0EA5E9", icon: "ellipse-outline" },
 };
+
+// ── Quick slots: short label "6 – 7 PM", "11 PM – 12 AM", "6:30 – 7:30 PM" ──
+function quickLabel(fmt: (v: number) => string, start: number, end: number) {
+  const a = fmt(start).replace(":00", "");
+  const b = fmt(end).replace(":00", "");
+  const [aNum, aSuf] = a.split(" ");
+  const bSuf = b.split(" ")[1];
+  // Thin dash with no spaces when AM/PM differs, so "11 PM–12 AM" fits at full size
+  return aSuf === bSuf ? `${aNum} – ${b}` : `${a}–${b}`;
+}
+
+// ── Quick slot box (time only). Offer slots flip like a railway board:
+//    time → ~₹1000~ ₹800 → time …  One shared `flip` value drives every box.
+const FLIP_H = 18;
+function QuickSlotBox({
+  label, state, offerOld, offerNew, offerText, flip, last, onPress,
+}: {
+  label: string;
+  state: "free" | "selected" | "booked";
+  offerOld?: number | null;   // original price (percent offers)
+  offerNew?: number | null;   // offer price   (percent offers)
+  offerText?: string | null;  // e.g. "₹100 off" (flat offers)
+  flip: Animated.Value;
+  last: boolean;              // 3rd box in a row → no right margin
+  onPress: () => void;
+}) {
+  const isOffer   = !!offerText || (offerNew != null && offerOld != null && offerNew < offerOld);
+  const selected  = state === "selected";
+  const booked    = state === "booked";
+  const showFlip  = isOffer && !booked;
+
+  const timeY  = flip.interpolate({ inputRange: [0, 1, 1.001, 2], outputRange: [0, -FLIP_H, FLIP_H, 0] });
+  const timeOp = flip.interpolate({ inputRange: [0, 1, 1.001, 2], outputRange: [1, 0, 0, 1] });
+  const offY   = flip.interpolate({ inputRange: [0, 1, 2], outputRange: [FLIP_H, 0, -FLIP_H] });
+  const offOp  = flip.interpolate({ inputRange: [0, 1, 2], outputRange: [0, 1, 0] });
+
+  const txtColor = booked ? "#9CA3AF" : selected ? "#FFFFFF" : isOffer ? "#15803D" : "#1A1D21";
+
+  return (
+    <TouchableOpacity
+      disabled={booked}
+      onPress={onPress}
+      activeOpacity={0.8}
+      accessibilityRole="button"
+      accessibilityState={{ selected, disabled: booked }}
+      accessibilityLabel={`${label}${booked ? ", booked" : ""}${isOffer && !booked ? ", offer price" : ""}`}
+      style={[
+        styles.qBox,
+        !last && { marginRight: "2%" },
+        isOffer && styles.qBoxOffer,
+        selected && styles.qBoxSelected,
+        booked && styles.qBoxBooked,
+      ]}
+    >
+      {showFlip ? (
+        <View style={styles.qFlipWrap}>
+          <Animated.View style={[styles.qFlipRow, { opacity: timeOp, transform: [{ translateY: timeY }] }]}>
+            <Text style={[styles.qTime, { color: txtColor }]} numberOfLines={1} adjustsFontSizeToFit>{label}</Text>
+          </Animated.View>
+          <Animated.View style={[styles.qFlipRow, { opacity: offOp, transform: [{ translateY: offY }] }]}>
+            {offerText ? (
+              <Text style={[styles.qTime, { color: selected ? "#FFFFFF" : "#EA580C" }]} numberOfLines={1}>{offerText}</Text>
+            ) : (
+              <Text numberOfLines={1}>
+                <Text style={[styles.qOld, selected && { color: "#DCFCE7" }]}>₹{offerOld}</Text>
+                <Text style={[styles.qTime, { color: txtColor }]}> ₹{offerNew}</Text>
+              </Text>
+            )}
+          </Animated.View>
+        </View>
+      ) : (
+        <Text
+          style={[styles.qTime, { color: txtColor }, booked && { textDecorationLine: "line-through" }]}
+          numberOfLines={1}
+          adjustsFontSizeToFit
+        >
+          {label}
+        </Text>
+      )}
+      {isOffer && !booked && (
+        <View style={styles.qBadge}><Text style={styles.qBadgeTxt}>%</Text></View>
+      )}
+    </TouchableOpacity>
+  );
+}
 
 function SportPill({ sport }: { sport: string }) {
   const cfg = SPORT_STYLE[sport] ?? { bg: "#111111", icon: "ellipse-outline" as const };
@@ -468,6 +560,16 @@ useEffect(() => {
   const unsub = onAuthStateChanged(auth, (u) => setIsLoggedIn(!!u));
   return unsub;
 }, []);
+
+// ── 🌙 Night quiet hours: booking number hidden 10 PM – 7 AM ──
+// So turf owners don't get late-night calls. Re-checked every minute, so the
+// number hides/shows by itself if the page stays open.
+const [nowHour, setNowHour] = useState<number>(new Date().getHours());
+useEffect(() => {
+  const t = setInterval(() => setNowHour(new Date().getHours()), 60_000);
+  return () => clearInterval(t);
+}, []);
+const callsQuiet = nowHour >= CALL_QUIET_FROM || nowHour < CALL_QUIET_TO;
 
 useEffect(() => {
   const uid = auth.currentUser?.uid;
@@ -959,6 +1061,35 @@ const advanceAmount = useMemo(() => {
     [quickGroups, quickPart]
   );
 
+  // Booking sheet: promo / coins rows start collapsed
+  const [promoOpen, setPromoOpen] = useState(false);
+  const [coinsOpen, setCoinsOpen] = useState(false);
+  const sheetScrollRef = useRef<ScrollView>(null);
+  const promoYRef      = useRef(0);
+
+  // Railway-board flip for offer slots: time (3s) → offer price (2.2s) → time …
+  const quickFlip = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    if (bookingMode !== "quick") return;
+    let loop: Animated.CompositeAnimation | null = null;
+    let cancelled = false;
+    AccessibilityInfo.isReduceMotionEnabled().then((reduce) => {
+      if (reduce || cancelled) return;
+      quickFlip.setValue(0);
+      loop = Animated.loop(
+        Animated.sequence([
+          Animated.delay(3000),
+          Animated.timing(quickFlip, { toValue: 1, duration: 320, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+          Animated.delay(2200),
+          Animated.timing(quickFlip, { toValue: 2, duration: 320, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+          Animated.timing(quickFlip, { toValue: 0, duration: 0, useNativeDriver: true }),
+        ])
+      );
+      loop.start();
+    }).catch(() => {});
+    return () => { cancelled = true; loop?.stop(); quickFlip.setValue(0); };
+  }, [bookingMode]);
+
   // Open on the part with the next free slot (re-checked on date change)
   useEffect(() => {
     if (quickGroups.length === 0) return;
@@ -1010,6 +1141,11 @@ const advanceAmount = useMemo(() => {
           setPromoApplied(null);
           setPromoCode("");
           setPromoError("");
+          // …and coins: an offer can't be combined with PCoin / VCoin
+          setUsePcoins(false);
+          setUseVcoins(false);
+          setPcoinToUse(0);
+          setVcoinToUse(0);
         }
       } catch {
         // A failed offer lookup must NEVER stop someone booking.
@@ -1611,14 +1747,19 @@ function requestCloseBilling() {
     } catch {}
   };
 
+  const quietAlert = () =>
+    Alert.alert("Calls open at 7 AM", "To respect the turf owner's rest, the booking number is hidden from 10 PM to 7 AM. Please call after 7 AM.");
+
   const callTurf = () => {
     if (!requireLogin()) return;
+    if (callsQuiet) return quietAlert();
     logCallLead("call");
     Linking.openURL(`tel:${turf.bookingPhone}`);
   };
 
   const whatsappTurf = () => {
     if (!requireLogin()) return;
+    if (callsQuiet) return quietAlert();
     logCallLead("whatsapp");
     const msg = encodeURIComponent(`Hi, I want to book ${turf.name} (found on PlayOn).`);
     Linking.openURL(`https://wa.me/91${turf.bookingPhone}?text=${msg}`).catch(() =>
@@ -1629,7 +1770,7 @@ function requestCloseBilling() {
   // "9876543210" → "98765 43210"
   // "9876543210" → "98765 43210"  (guests see "98XXX XXXXX")
   const prettyPhone = turf.bookingPhone
-    ? isLoggedIn
+    ? isLoggedIn && !callsQuiet          // 🌙 night: masked even for logged-in players
       ? `${turf.bookingPhone.slice(0, 5)} ${turf.bookingPhone.slice(5)}`
       : `${turf.bookingPhone.slice(0, 2)}XXX XXXXX`
     : "";
@@ -1687,27 +1828,23 @@ function requestCloseBilling() {
         {/* ── Header Card ── */}
         <View style={styles.headerCard}>
 
-          {/* Name row + rating + share */}
-         {/* Name + rating (left)  |  Sport pills (right) */}
-<View style={styles.titleRow}>
-  <View style={{ flex: 1, marginRight: 10 }}>
-    <View style={styles.nameLine}>
-      <Text style={[styles.title, { flex: 1 }]} numberOfLines={2}>{turf.name}</Text>
-      {ratingValue && (
-        <View style={styles.ratingBadge}>
-          <Text style={styles.ratingStar}>★</Text>
-          <Text style={styles.ratingValue}>{ratingValue}</Text>
-        </View>
-      )}
-    </View>
-  </View>
+          {/* Name on ONE line · rating on the right */}
+          <View style={tp.nameRow}>
+            <Text style={tp.name} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>{turf.name}</Text>
+            {ratingValue && (
+              <View style={[styles.ratingBadge, { marginTop: 0 }]}>
+                <Text style={styles.ratingStar}>★</Text>
+                <Text style={styles.ratingValue}>{ratingValue}</Text>
+              </View>
+            )}
+          </View>
 
-<View style={styles.sportWrap}>
-  {(Array.isArray(turf.sport) ? turf.sport : [turf.sport || "Sport"]).map((item, index) => (
-    <SportPill key={index} sport={item as string} />
-  ))}
-</View>
-</View>
+          {/* Sports — own row under the name */}
+          <View style={tp.sportRow}>
+            {(Array.isArray(turf.sport) ? turf.sport : [turf.sport || "Sport"]).map((item, index) => (
+              <SportPill key={index} sport={item as string} />
+            ))}
+          </View>
 
 {/* Location + distance (left)  |  View Location pill (right) */}
 <View style={styles.locationBlock}>
@@ -1785,7 +1922,7 @@ function requestCloseBilling() {
 
                 <View key={label} style={styles.priceCard}>
                   <Text style={styles.priceLabel}>{label}</Text>
-                  <Text style={styles.priceValue}>₹{val || 0}</Text>
+                  <Text style={styles.priceValue}>{priceOrCall(val)}</Text>
                 </View>
               ))}
             </TouchableOpacity>
@@ -1802,6 +1939,48 @@ function requestCloseBilling() {
           </TouchableOpacity>
 
           
+
+          {/* VCoin cashback — slim, amount stays a surprise */}
+          {showOnline && vcoinEnabled && (
+            <View style={tp.vcoinRow}>
+              <View style={tp.vcoinCoin}><Text style={tp.vcoinCoinTxt}>V</Text></View>
+              <Text style={tp.vcoinTxt}>Earn VCoin cashback here 🎁</Text>
+            </View>
+          )}
+
+          {/* Offer — coupon ticket (orange, same as the % on offer slots) */}
+          {(bannerOffer || upcomingOffer) && (() => {
+            const o = (bannerOffer || upcomingOffer)!;
+            const isTodayOffer = !!bannerOffer;
+            const nextDays = (o.runsOn || []).filter((k) => k > keyOfDate(selectedDate)).slice(0, 3)
+              .map((k) => { const [y, m, d] = k.split("-").map(Number); return `${d} ${new Date(y, m - 1, d).toLocaleDateString("en-US", { month: "short" })}`; });
+            const [big, small] = o.type === "flat" ? [`₹${o.value}`, "OFF"] : [`${o.value}%`, "OFF"];
+            const detail = isTodayOffer
+              ? `${windowsText(o)}${o.type === "percent" && Number(o.maxDiscount) > 0 ? ` · up to ₹${o.maxDiscount} off` : ""}`
+              : `On ${nextDays.join(", ")} · book ahead`;
+            return (
+              <View style={tp.ticket}>
+                <View style={tp.ticketStub}>
+                  <Text style={tp.ticketBig} numberOfLines={1} adjustsFontSizeToFit>{big}</Text>
+                  <Text style={tp.ticketSmall}>{small}</Text>
+                </View>
+                <View style={[tp.notch, { top: -8 }]} />
+                <View style={[tp.notch, { bottom: -8 }]} />
+                <View style={tp.ticketBody}>
+                  <View style={tp.ticketTop}>
+                    <Text style={tp.ticketKicker}>
+                      {isTodayOffer ? (selectedDate.toDateString() === new Date().toDateString() ? "TODAY'S SPECIAL" : "OFFER ON THIS DAY") : "COMING SOON"}
+                    </Text>
+                    {isTodayOffer && <Text style={tp.ticketAuto}>✓ Auto-applied</Text>}
+                  </View>
+                  <Text style={tp.ticketName} numberOfLines={1}>
+                    {o.tag || o.title}{todayOffers.length > 1 && isTodayOffer ? `  +${todayOffers.length - 1} more` : ""}
+                  </Text>
+                  <Text style={tp.ticketDetail} numberOfLines={2}>{detail}</Text>
+                </View>
+              </View>
+            );
+          })()}
 
           {turf.facilities && turf.facilities.length > 0 && (
             <View style={styles.facilitiesWrap}>
@@ -1847,12 +2026,20 @@ function requestCloseBilling() {
                 <Text style={styles.callNumber}>{prettyPhone}</Text>
               </View>
               <Text style={styles.callHours}>
-                {shortTime(openingTime)} – {shortTime(closingTime)}
+                {(turf as any).hoursSet === false ? "" : `${shortTime(openingTime)} – ${shortTime(closingTime)}`}
               </Text>
             </View>
 
-                        {/* Buttons — logged in: WhatsApp + Call | guest: Log in */}
-            {isLoggedIn ? (
+                        {/* Buttons — night: closed note | logged in: WhatsApp + Call | guest: Log in */}
+            {callsQuiet ? (
+              <View style={styles.quietBox}>
+                <Ionicons name="moon" size={18} color="#4338CA" />
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.quietTitle}>Calls closed for the night</Text>
+                  <Text style={styles.quietSub}>The number shows again at 7:00 AM. Plan your game and call in the morning.</Text>
+                </View>
+              </View>
+            ) : isLoggedIn ? (
               <>
                 <View style={styles.callBtnRow}>
                   <TouchableOpacity style={styles.callOutlineBtn} onPress={whatsappTurf} activeOpacity={0.85}>
@@ -1881,67 +2068,14 @@ function requestCloseBilling() {
 
           
             {!showOnline && (
-              <Text style={styles.callNote}>
-                Online slots, coins and offers are not available for this turf. Pay the full amount at the venue.
-              </Text>
+              <View style={tp.soonPill}>
+                <Ionicons name="time-outline" size={13} color="#1D4ED8" />
+                <Text style={tp.soonTxt}>Online booking coming soon</Text>
+              </View>
             )}
           </View>
         )}
 
-       {/* ── Coin Balance Strip ── */}
-       {showOnline &&(
-        <TouchableOpacity
-          style={coinStyles.strip}
-          activeOpacity={0.82}
-          onPress={() => router.push("/wallet" as any)}
-        >
-          <View style={coinStyles.iconCircle}>
-            <Text style={{ fontSize: 18 }}>🪙</Text>
-          </View>
-
-          <View style={{ flex: 1, marginLeft: 10 }}>
-            <View style={coinStyles.pillsRow}>
-              {pcoinBalance > 0 && (
-                <View style={[coinStyles.pill, { backgroundColor: "#EDE9FE" }]}>
-                  <View style={[coinStyles.pillDot, { backgroundColor: "#7C3AED" }]} />
-                  <Text style={[coinStyles.pillTxt, { color: "#7C3AED" }]}>
-                    {pcoinBalance} PCoin
-                  </Text>
-                </View>
-              )}
-              {vcoinEnabled && (
-                vcoinBalance > 0 ? (
-                  <View style={[coinStyles.pill, { backgroundColor: "#FEF3C7" }]}>
-                    <View style={[coinStyles.pillDot, { backgroundColor: "#D97706" }]} />
-                    <Text style={[coinStyles.pillTxt, { color: "#D97706" }]}>
-                      {vcoinBalance} VCoin · This turf
-                    </Text>
-                  </View>
-                ) : (
-                  <View style={[coinStyles.pill, { backgroundColor: "#FEF3C7" }]}>
-                    <View style={[coinStyles.pillDot, { backgroundColor: "#D97706" }]} />
-                    <Text style={[coinStyles.pillTxt, { color: "#D97706" }]}>
-                      Earn {vcoinRate}/hr VCoin here
-                    </Text>
-                  </View>
-                )
-              )}
-            </View>
-
-            <Text style={coinStyles.sub}>
-              {(pcoinBalance > 0 || (vcoinBalance > 0 && vcoinEnabled))
-                ? `₹${pcoinBalance + (vcoinEnabled ? vcoinBalance : 0)} available · Tap wallet to use`
-                : vcoinEnabled
-                  ? `Earn ${vcoinRate} VCoin/hr + PCoin on every booking here`
-                  : "Earn PCoin on every booking · Tap to view wallet"
-              }
-            </Text>
-          </View>
-
-          <Ionicons name="chevron-forward" size={15} color="#9CA3AF" />
-        </TouchableOpacity>
-  
-            )}
         {/* ── Turf Status Banner ── */}
           
         {turf.status && (
@@ -1978,34 +2112,12 @@ function requestCloseBilling() {
         )}
 
               {showOnline && (<>
-        {/* ── Offer banner ── */}
-        {(bannerOffer || upcomingOffer) && (() => {
-          const o = (bannerOffer || upcomingOffer)!;
-          const isToday = !!bannerOffer;
-          const nextDays = (o.runsOn || []).filter((k) => k > keyOfDate(selectedDate)).slice(0, 3)
-            .map((k) => { const [y, m, d] = k.split("-").map(Number); return `${d} ${new Date(y, m - 1, d).toLocaleDateString("en-US", { month: "short" })}`; });
-          return (
-            <View style={offerStyles.banner}>
-              <View style={offerStyles.bannerIcon}><Text style={{ fontSize: 22 }}>🎉</Text></View>
-              <View style={{ flex: 1 }}>
-                <Text style={offerStyles.bannerKicker}>
-                  {isToday ? (selectedDate.toDateString() === new Date().toDateString() ? "TODAY'S SPECIAL" : "OFFER ON THIS DAY") : "COMING SOON"}
-                </Text>
-                <Text style={offerStyles.bannerTitle} numberOfLines={1}>{o.tag || o.title} · {offerLabel(o)}</Text>
-                <Text style={offerStyles.bannerSub} numberOfLines={2}>
-                  {isToday
-                    ? `${windowsText(o)}${o.type === "percent" && Number(o.maxDiscount) > 0 ? ` · save up to ₹${o.maxDiscount}` : ""} · applied automatically`
-                    : `On ${nextDays.join(", ")} · book ahead`}
-                  {isToday && todayOffers.length > 1 ? ` · +${todayOffers.length - 1} more` : ""}
-                </Text>
-              </View>
-            </View>
-          );
-        })()}
-
-        {/* ── Date Picker ── */}
+        {/* ── ONE card: Book your slot = date + time ── */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Choose Date</Text>
+          <View style={tp.bookHead}>
+            <Text style={styles.sectionTitle}>Book your slot</Text>
+            <Text style={tp.monthTxt}>{selectedDate.toLocaleDateString("en-US", { month: "long" })}</Text>
+          </View>
           <FlatList
             horizontal data={days} keyExtractor={(item) => item.toDateString()}
             showsHorizontalScrollIndicator={false} contentContainerStyle={styles.dateList}
@@ -2031,12 +2143,7 @@ function requestCloseBilling() {
               );
             }}
           />
-          <Text style={styles.selectedDateLabel}>{formatFullDate(selectedDate)}</Text>
-        </View>
-
-        {/* ── Booking Mode + Picker ── */}
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Book Your Time</Text>
+          <View style={tp.stepDivider} />
                     {closingTime > 24 && (() => {
             const cutoff = Number(turf.lateCutoffHours || 0);
             const shut   = isLateClosed();
@@ -2229,72 +2336,91 @@ function requestCloseBilling() {
                 </View>
               )}
 
-              {/* Morning / Afternoon / Evening / Night */}
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.partRow}>
-                {quickGroups.map((g) => {
-                  const on = quickPart === g.key;
-                  return (
-                    <TouchableOpacity
-                      key={g.key}
-                      style={[styles.partChip, on && styles.partChipOn]}
-                      onPress={() => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setQuickPart(g.key); }}
-                      activeOpacity={0.8}
-                    >
-                      <Ionicons name={g.icon} size={14} color={on ? "#fff" : "#6B7280"} />
-                      <Text style={[styles.partChipTxt, on && styles.partChipTxtOn]}>{g.label}</Text>
-                      <View style={[styles.partCount, on && styles.partCountOn]}>
-                        <Text style={[styles.partCountTxt, on && { color: "#15803D" }]}>{g.free}</Text>
-                      </View>
-                    </TouchableOpacity>
-                  );
-                })}
-              </ScrollView>
+              {/* All slots in one list (no Morning/Evening tabs) — price shown once, offers flip */}
+              {(() => {
+                // Prices shown ONCE above the grid
+                const rates = quickSlots.map((s) => Math.round(getRangePrice(s.startValue, s.endValue) / Math.max(s.endValue - s.startValue, 0.01)));
+                const simpleDayNight = turf.advancePricingEnabled !== true && specialPrices.length === 0;
+                const dayP   = Number(turf.dayPrice   || turf.price || 0);
+                const nightP = Number(turf.nightPrice || turf.price || 0);
+                const minR = rates.length ? Math.min(...rates) : 0;
+                const maxR = rates.length ? Math.max(...rates) : 0;
+                const priceText = simpleDayNight && dayP !== nightP
+                  ? `Day ₹${dayP}/hr · Night ₹${nightP}/hr`
+                  : minR === maxR ? `₹${minR}/hr` : `₹${minR} – ₹${maxR}/hr`;
 
-            <View style={styles.quickSlotGrid}>
-            {visibleQuickSlots.length === 0 && (
-              <Text style={styles.noSlotsText}>No slots left today. Try another date.</Text>
-            )}
-            {visibleQuickSlots.map((slot) => {
-    const past     = isPastTime(slot.startValue);
-  const lateShut = slot.endValue > 24 && isLateClosed();
-  const disabled = isRangeUnavailable(slot.startValue, slot.endValue) || past;
-  const selected = selectedQuickSlots.some((s) => s.time === slot.time);
-  return (
-    <TouchableOpacity
-      key={slot.time} disabled={disabled}
-      style={[styles.quickSlotCard, selected && styles.quickSlotCardActive, disabled && styles.quickSlotCardDisabled]}
-      onPress={() => handleQuickSlotSelect(slot)}
-      activeOpacity={0.8}
-    >
-      {selected && (
-        <View style={styles.quickSlotCheck}>
-          <Ionicons name="checkmark" size={12} color="#FFFFFF" />
-        </View>
-      )}
-      <Text style={[styles.quickSlotTime, selected && styles.quickSlotTimeActive, disabled && styles.quickSlotTextDisabled]}>{slot.time}</Text>
-      {(() => {
-        const price = getRangePrice(slot.startValue, slot.endValue);
-        const so = !disabled ? slotOffer(slot.startValue, slot.endValue) : null;
-        const np = so ? slotOfferPrice(so, price) : null;
-        return (
-          <>
-            <Text style={[styles.quickSlotPrice, disabled && styles.quickSlotTextDisabled]}>
-              {np !== null && np < price && (
-                <Text style={offerStyles.oldPrice}>₹{price}  </Text>
-              )}
-              <Text style={np !== null && np < price ? { color: "#15803D" } : undefined}>₹{np !== null && np < price ? np : price}</Text>
-            </Text>
-            {so && <Text style={offerStyles.slotTag} numberOfLines={1}>🏷 {so.tag || so.title}</Text>}
-          </>
-        );
-      })()}
-      <Text style={[styles.quickSlotStatus, selected && styles.quickSlotStatusActive, disabled && styles.quickSlotTextDisabled]}>
-               {past ? "Time Over" : lateShut ? "Closed" : disabled ? "Unavailable" : selected ? "Selected" : "Available"}
-      </Text>
-    </TouchableOpacity>
-  );
-})}
-            </View>
+                // Offer explained ONCE
+                const firstOffer = quickSlots.map((s) => slotOffer(s.startValue, s.endValue)).find(Boolean) || null;
+                const offerLine = firstOffer
+                  ? `${firstOffer.tag || firstOffer.title} · ${firstOffer.type === "flat" ? `₹${firstOffer.value} off` : `${firstOffer.value}% off`} on ${windowsText(firstOffer)}`
+                  : null;
+
+                return (
+                  <>
+                    {quickSlots.length > 0 && (
+                      <View style={styles.qPriceStrip}>
+                        <Text style={styles.qPriceTxt}>{priceText}</Text>
+                        <Text style={styles.qPriceSub}>{slotDuration >= 60 && slotDuration % 60 === 0 ? `${slotDuration / 60}-hr` : `${slotDuration}-min`} slots</Text>
+                      </View>
+                    )}
+                    {offerLine && (
+                      <View style={styles.qOfferStrip}>
+                        <View style={styles.qOfferPill}><Text style={styles.qOfferPillTxt}>%</Text></View>
+                        <Text style={styles.qOfferTxt} numberOfLines={2}>{offerLine}</Text>
+                      </View>
+                    )}
+
+                    <View style={styles.qGrid}>
+                      {quickSlots.length === 0 && (
+                        <Text style={styles.noSlotsText}>No slots left today. Try another date.</Text>
+                      )}
+                      {quickSlots.map((slot, i) => {
+                        const booked   = isRangeUnavailable(slot.startValue, slot.endValue) || isPastTime(slot.startValue);
+                        const selected = selectedQuickSlots.some((s) => s.time === slot.time);
+                        const price    = getRangePrice(slot.startValue, slot.endValue);
+                        const so       = !booked ? slotOffer(slot.startValue, slot.endValue) : null;
+                        const np       = so ? slotOfferPrice(so, price) : null;
+                        return (
+                          <QuickSlotBox
+                            key={slot.time}
+                            label={quickLabel(formatTime, slot.startValue, slot.endValue)}
+                            state={booked ? "booked" : selected ? "selected" : "free"}
+                            offerOld={np !== null && np < price ? price : null}
+                            offerNew={np !== null && np < price ? np : null}
+                            offerText={so && so.type === "flat" ? `₹${so.value} off` : null}
+                            flip={quickFlip}
+                            last={i % 3 === 2}
+                            onPress={() => handleQuickSlotSelect(slot)}
+                          />
+                        );
+                      })}
+                    </View>
+
+                    {/* Legend */}
+                    {quickSlots.length > 0 && (
+                      <View style={styles.qLegend}>
+                        <View style={styles.qLegendItem}><View style={[styles.qLegendDot, { backgroundColor: "#FFFFFF", borderWidth: 1.5, borderColor: "#E5E7EB" }]} /><Text style={styles.qLegendTxt}>Available</Text></View>
+                        <View style={styles.qLegendItem}><View style={[styles.qLegendDot, { backgroundColor: "#16A34A" }]} /><Text style={styles.qLegendTxt}>Selected</Text></View>
+                        <View style={styles.qLegendItem}><View style={[styles.qLegendDot, { backgroundColor: "#F3F4F6", borderWidth: 1.5, borderColor: "#E5E7EB" }]} /><Text style={styles.qLegendTxt}>Booked</Text></View>
+                        {offerLine && (
+                          <View style={styles.qLegendItem}><View style={[styles.qLegendDot, { backgroundColor: "#F0FDF4", borderWidth: 1.5, borderColor: "#86EFAC" }]} /><Text style={styles.qLegendTxt}>Offer</Text></View>
+                        )}
+                      </View>
+                    )}
+
+                    {/* Selection summary — total + savings shown here, not on each slot */}
+                    {selectedQuickSlots.length > 0 && selectedStartValue !== null && selectedEndValue !== null && (
+                      <View style={styles.qSummary}>
+                        <Text style={styles.qSummaryTxt} numberOfLines={1}>
+                          {formatTime(selectedStartValue)} – {formatTime(selectedEndValue)} · {durationLabel}
+                          {offerDiscount > 0 && <Text style={{ color: "#EA580C" }}>  · saved ₹{offerDiscount}</Text>}
+                        </Text>
+                        <Text style={styles.qSummaryAmt}>₹{offerTotal}</Text>
+                      </View>
+                    )}
+                  </>
+                );
+              })()}
             </View>
           )}
         </View>
@@ -2360,167 +2486,148 @@ function requestCloseBilling() {
   
 >
   <View style={{ flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" }}>
-    <View style={{ backgroundColor: "#fff", borderTopLeftRadius: 28, borderTopRightRadius: 28, maxHeight: "90%", paddingHorizontal: 20, paddingTop: 12, paddingBottom: insets.bottom + 16 + kbHeight }}>
+    <View style={{ backgroundColor: "#fff", borderTopLeftRadius: 28, borderTopRightRadius: 28, maxHeight: "90%", paddingHorizontal: 20, paddingTop: 12, paddingBottom: kbHeight > 0 ? 12 + (Platform.OS === "ios" ? kbHeight : 0) : insets.bottom + 16 }}>
       <View style={{ width: 44, height: 4, borderRadius: 2, backgroundColor: "#E5E7EB", alignSelf: "center", marginBottom: 16 }} />
-      <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
-
-        <View style={styles.summaryHeader}>
-          <View>
-            <Text style={styles.summaryLabel}>Booking Summary</Text>
-            <Text style={styles.summaryTime}>{selectedTimeLabel}</Text>
-          </View>
-         <TouchableOpacity style={styles.clearBtn} onPress={requestCloseBilling}>
-  <Text style={styles.clearBtnText}>Close</Text>
-</TouchableOpacity>
-        </View>
-        <View style={styles.summaryDivider} />
-        <View style={styles.summaryRow}>
-  <Text style={styles.summaryKey}>Date</Text>
-  <Text style={styles.summaryValue}>{formatFullDate(selectedDate)}</Text>
-</View>
-<View style={styles.summaryRow}>
-  <Text style={styles.summaryKey}>Duration</Text>
-  <Text style={styles.summaryValue}>{durationLabel}</Text>
-</View>
-<View style={styles.summaryRow}>
-  <Text style={styles.summaryKey}>Total</Text>
-  <Text style={styles.summaryTotal}>₹{totalPrice}</Text>
-</View>
-
-        <Text style={styles.paymentTitle}>Payment Type</Text>
-<View style={styles.paymentTypeRow}>
-  {(["advance", "full"] as BookingType[]).map((type) => {
-    const active = bookingType === type;
-    return (
-      <TouchableOpacity
-        key={type}
-        style={[styles.paymentOption, active && styles.paymentOptionActive]}
-        onPress={() => setBookingType(type)}
-        activeOpacity={0.85}
+      <ScrollView
+        ref={sheetScrollRef}
+        style={{ flexShrink: 1 }}
+        showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
       >
-        {active && (
-          <View style={styles.paymentOptionCheck}>
-            <Ionicons name="checkmark" size={11} color="#FFFFFF" />
+
+        {/* 1 · Header */}
+        <View style={bs.header}>
+          <Text style={bs.title}>Confirm booking</Text>
+          <TouchableOpacity style={bs.closeBtn} onPress={requestCloseBilling} accessibilityLabel="Close" hitSlop={8}>
+            <Ionicons name="close" size={18} color="#4B5563" />
+          </TouchableOpacity>
+        </View>
+
+        {/* 2 · One booking card */}
+        <View style={bs.bookingCard}>
+          <View style={bs.dateBlock}>
+            <Text style={bs.dateDow}>{selectedDate.toLocaleDateString("en-US", { weekday: "short" }).toUpperCase()}</Text>
+            <Text style={bs.dateDay}>{selectedDate.getDate()}</Text>
+            <Text style={bs.dateMon}>{selectedDate.toLocaleDateString("en-US", { month: "short" }).toUpperCase()}</Text>
+          </View>
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={bs.turfName} numberOfLines={1}>{turf.name}</Text>
+            {selectedStartValue !== null && selectedEndValue !== null && (
+              <Text style={bs.timeTxt}>{formatTime(selectedStartValue)} – {formatTime(selectedEndValue)}</Text>
+            )}
+            <Text style={bs.metaTxt} numberOfLines={1}>{durationLabel}{turf.location ? ` · ${turf.location}` : ""}</Text>
+          </View>
+          <TouchableOpacity onPress={requestCloseBilling} hitSlop={8}>
+            <Text style={bs.changeTxt}>Change</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* 3 · Offer — one compact line */}
+        {offer && (
+          <View style={bs.offerRow}>
+            <View style={bs.offerIcon}><Ionicons name="pricetag" size={14} color="#fff" /></View>
+            <View style={{ flex: 1, minWidth: 0 }}>
+              <Text style={bs.offerTitle} numberOfLines={1}>{offer.title} applied · −₹{offer.discount}</Text>
+              <Text style={bs.offerSub}>Can't be combined with promo code or coins</Text>
+            </View>
+            <Ionicons name="checkmark" size={18} color="#16A34A" />
           </View>
         )}
-        <Text style={[styles.paymentOptionLabel, active && styles.paymentOptionLabelActive]}>{type === "advance" ? "Advance" : "Full Payment"}</Text>
-        <Text style={[styles.paymentOptionAmount, active && styles.paymentOptionAmountActive]}>
-  ₹{type === "advance" ? Math.min(computedAdvanceAmount, offerTotal) : offerTotal}
-</Text>
-        <Text style={[styles.paymentOptionNote, active && styles.paymentOptionNoteActive]}>{type === "advance" ? "Pay rest at turf" : "Paid online"}</Text>
-      </TouchableOpacity>
-    );
-  })}
-</View>
 
-   {/* ── Venue offer (auto-applied) ── */}
-{offer && (
-  <View style={{
-    marginTop: 10, paddingTop: 16, borderTopWidth: 1, borderTopColor: "#F3F4F6",
-  }}>
-    <View style={{
-      flexDirection: "row", alignItems: "center", gap: 10,
-      backgroundColor: "#F0FDF4", borderWidth: 1, borderColor: "#86EFAC",
-      borderRadius: 14, paddingHorizontal: 12, paddingVertical: 11,
-    }}>
-      <View style={{
-        width: 34, height: 34, borderRadius: 10, backgroundColor: "#DCFCE7",
-        alignItems: "center", justifyContent: "center",
-      }}>
-        <Ionicons name="pricetag" size={16} color="#15803D" />
-      </View>
-      <View style={{ flex: 1 }}>
-        <Text style={{ fontSize: 13, fontWeight: "900", color: "#15803D" }}>
-          {offer.title}
-        </Text>
-        <Text style={{ fontSize: 11, fontWeight: "600", color: "#16A34A", marginTop: 2 }}>
-          ₹{offer.discount} off — applied automatically
-        </Text>
-        {bookingType === "advance" && (
-          <Text style={{ fontSize: 11, fontWeight: "700", color: "#15803D", marginTop: 2 }}>
-            Same advance now · you pay ₹{offer.discount} less at the turf
-          </Text>
+        {/* 4a · Promo — collapsed row, only when there is no offer */}
+        {!offer && (
+          promoApplied ? (
+            <View style={[promoStyles.appliedBox, { marginTop: 10 }]}>
+              <View style={promoStyles.appliedLeft}>
+                <View style={promoStyles.appliedBadge}>
+                  <Text style={promoStyles.appliedBadgeTxt}>🎟️ {promoApplied.code}</Text>
+                </View>
+                <Text style={promoStyles.appliedDesc} numberOfLines={1}>₹{promoApplied.discount} off applied</Text>
+              </View>
+              <TouchableOpacity style={promoStyles.removeBtn} onPress={removePromo}>
+                <Text style={{ fontSize: 16, color: "#6B7280" }}>✕</Text>
+              </TouchableOpacity>
+            </View>
+          ) : !promoOpen ? (
+            <TouchableOpacity
+              style={[bs.lineRow, coinDiscountAmount > 0 && { opacity: 0.5 }]}
+              activeOpacity={0.8}
+              onPress={() => {
+                if (coinDiscountAmount > 0) { Alert.alert("Remove Coins First", "Deselect coins to use a promo code."); return; }
+                LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+                setPromoOpen(true);
+              }}
+            >
+              <Text style={{ fontSize: 16 }}>🎟️</Text>
+              <Text style={[bs.lineTitle, { flex: 1 }]}>Have a promo code?</Text>
+              <Ionicons name="chevron-down" size={16} color="#9CA3AF" />
+            </TouchableOpacity>
+          ) : (
+            <View style={{ marginTop: 10 }} onLayout={(e) => { promoYRef.current = e.nativeEvent.layout.y; }}>
+              <View style={promoStyles.inputRow}>
+                <TextInput
+                  style={promoStyles.input}
+                  placeholder="Enter code"
+                  placeholderTextColor="#9CA3AF"
+                  value={promoCode}
+                  autoFocus
+                  onFocus={() => setTimeout(() => sheetScrollRef.current?.scrollTo({ y: promoYRef.current - 12, animated: true }), 250)}
+                  onChangeText={(v) => { setPromoCode(v.toUpperCase()); setPromoError(""); }}
+                  autoCapitalize="characters"
+                  returnKeyType="done"
+                  onSubmitEditing={applyPromo}
+                />
+                <TouchableOpacity
+                  style={[promoStyles.applyBtn, (!promoCode.trim() || promoLoading) && promoStyles.applyBtnDisabled]}
+                  onPress={applyPromo}
+                  disabled={!promoCode.trim() || promoLoading}
+                >
+                  {promoLoading ? <ActivityIndicator size="small" color="#fff" /> : <Text style={promoStyles.applyBtnTxt}>Apply</Text>}
+                </TouchableOpacity>
+              </View>
+              {!!promoError && (
+                <View style={promoStyles.errorBox}>
+                  <Text style={promoStyles.errorTxt}>⚠ {promoError}</Text>
+                </View>
+              )}
+            </View>
+          )
         )}
-      </View>
-    </View>
-    <Text style={{ fontSize: 11, color: "#9CA3AF", fontWeight: "600", marginTop: 8 }}>
-      This venue offer can't be combined with a promo code.
-    </Text>
-  </View>
-)}
 
-{/* ── Promo Code Section ── */}
-{!offer && (
-<View style={promoStyles.wrap}>
-  <Text style={promoStyles.sectionTitle}>
-    Have a promo code?{coinDiscountAmount > 0 ? " (Remove coins to use promo)" : ""}
-  </Text>
-
-  {promoApplied ? (
-    <View style={promoStyles.appliedBox}>
-      <View style={promoStyles.appliedLeft}>
-        <View style={promoStyles.appliedBadge}>
-          <Text style={promoStyles.appliedBadgeTxt}>🎟️ {promoApplied.code}</Text>
-        </View>
-        <Text style={promoStyles.appliedDesc} numberOfLines={1}>
-          ₹{promoApplied.discount} off applied
-        </Text>
-      </View>
-      <TouchableOpacity style={promoStyles.removeBtn} onPress={removePromo}>
-        <Text style={{ fontSize: 16, color: "#6B7280" }}>✕</Text>
-      </TouchableOpacity>
-    </View>
-  ) : (
-    <View style={[promoStyles.inputRow, coinDiscountAmount > 0 && { opacity: 0.4 }]}>
-      <TextInput
-        style={promoStyles.input}
-        placeholder="Enter code"
-        placeholderTextColor="#9CA3AF"
-        value={promoCode}
-        onChangeText={(v) => {
-          if (coinDiscountAmount > 0) {
-            Alert.alert("Remove Coins First", "Deselect coins to use a promo code.");
-            return;
-          }
-          setPromoCode(v.toUpperCase());
-          setPromoError("");
-        }}
-        editable={coinDiscountAmount === 0}
-        autoCapitalize="characters"
-        returnKeyType="done"
-        onSubmitEditing={applyPromo}
-      />
-      <TouchableOpacity
-        style={[promoStyles.applyBtn, (!promoCode.trim() || promoLoading || coinDiscountAmount > 0) && promoStyles.applyBtnDisabled]}
-        onPress={() => {
-          if (coinDiscountAmount > 0) {
-            Alert.alert("Remove Coins First", "Deselect coins to use a promo code.");
-            return;
-          }
-          applyPromo();
-        }}
-        disabled={!promoCode.trim() || promoLoading || coinDiscountAmount > 0}
-      >
-        {promoLoading
-          ? <ActivityIndicator size="small" color="#fff" />
-          : <Text style={promoStyles.applyBtnTxt}>Apply</Text>
-        }
-      </TouchableOpacity>
-    </View>
-  )}
-   {!!promoError && (
-    <View style={promoStyles.errorBox}>
-      <Text style={promoStyles.errorTxt}>⚠ {promoError}</Text>
-    </View>
-  )}
-</View>
-)}
-
-{/* ── Coin Redeem Section ── */}
-<View style={[coinRedeemStyles.wrap, promoApplied && { opacity: 0.4 }]}>
-  <Text style={coinRedeemStyles.sectionTitle}>
-    Use Your Coins{promoApplied ? " (Remove promo to use coins)" : ""}
-  </Text>
+        {/* 4b · Coins — one row; locked with an offer, expands otherwise */}
+        {offer ? (
+          <View style={[bs.lineRow, { opacity: 0.6 }]}>
+            <Text style={{ fontSize: 16 }}>🪙</Text>
+            <View style={{ flex: 1, minWidth: 0 }}>
+              <Text style={bs.lineTitle}>Coins · {pcoinBalance} PCoin · {vcoinEnabled ? vcoinBalance : 0} VCoin</Text>
+              <Text style={[bs.lineSub, { color: "#9A3412" }]} numberOfLines={1}>Locked with {offer.title} · stay saved for next time</Text>
+            </View>
+            <Ionicons name="lock-closed-outline" size={15} color="#9CA3AF" />
+          </View>
+        ) : (
+          <>
+            <TouchableOpacity
+              style={[bs.lineRow, promoApplied && { opacity: 0.5 }]}
+              activeOpacity={0.8}
+              onPress={() => {
+                if (promoApplied) { Alert.alert("Remove Promo First", "Remove the promo code to use coins."); return; }
+                LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+                setCoinsOpen(!coinsOpen);
+              }}
+            >
+              <Text style={{ fontSize: 16 }}>🪙</Text>
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text style={bs.lineTitle}>
+                  {coinDiscountAmount > 0 ? `Coins applied · −₹${coinDiscountAmount}` : "Use your coins"}
+                </Text>
+                <Text style={bs.lineSub} numberOfLines={1}>
+                  {pcoinBalance} PCoin · {vcoinEnabled ? `${vcoinBalance} VCoin` : "VCoin not available here"}
+                </Text>
+              </View>
+              <Ionicons name={coinsOpen ? "chevron-up" : "chevron-down"} size={16} color="#9CA3AF" />
+            </TouchableOpacity>
+            {coinsOpen && !promoApplied && (
+              <View style={{ marginTop: 8 }}>
   <View style={coinRedeemStyles.cardsRow}>
     {/* PCoin card */}
     <TouchableOpacity
@@ -2595,70 +2702,82 @@ function requestCloseBilling() {
       )}
     </TouchableOpacity>
   </View>
-</View>
+              </View>
+            )}
+          </>
+        )}
 
-      <View style={styles.paymentBreakdown}>
-  {offerDiscount > 0 && (
-    <>
-      <View style={styles.breakdownRow}>
-        <Text style={styles.breakdownKey}>Slot price</Text>
-        <Text style={styles.breakdownVal}>₹{totalPrice}</Text>
-      </View>
-      <View style={styles.breakdownRow}>
-        <Text style={[styles.breakdownKey, { color: "#16A34A" }]}>🎉 {offer?.title}</Text>
-        <Text style={[styles.breakdownVal, { color: "#16A34A" }]}>− ₹{offerDiscount}</Text>
-      </View>
-      <View style={styles.breakdownRow}>
-        <Text style={[styles.breakdownKey, { fontWeight: "800", color: "#111111" }]}>Total</Text>
-        <Text style={[styles.breakdownVal, { fontWeight: "900" }]}>₹{offerTotal}</Text>
-      </View>
-      <View style={styles.summaryDivider} />
-    </>
-  )}
-  {discountAmount > 0 && (
-    <View style={styles.breakdownRow}>
-      <Text style={[styles.breakdownKey, { color: "#16A34A" }]}>Promo ({promoApplied?.code})</Text>
-      <Text style={[styles.breakdownVal, { color: "#16A34A" }]}>− ₹{discountAmount}</Text>
-    </View>
-  )}
-  {coinDiscountAmount > 0 && (
-    <View style={styles.breakdownRow}>
-      <Text style={[styles.breakdownKey, { color: "#7C3AED" }]}>Coins ({coinDiscountAmount} 🪙)</Text>
-      <Text style={[styles.breakdownVal, { color: "#7C3AED" }]}>− ₹{coinDiscountAmount}</Text>
-    </View>
-  )}
-   {(discountAmount > 0 || coinDiscountAmount > 0) && (
-    <View style={styles.summaryDivider} />
-  )}
-  <View style={styles.breakdownRow}>
-    <Text style={styles.breakdownKey}>Pay now</Text>
-    <Text style={[styles.breakdownVal, { fontSize: 16, fontWeight: "900", color: "#111111" }]}>
-      ₹{finalAdvanceAmount}
-    </Text>
-  </View>
-  <View style={styles.breakdownRow}>
-    <Text style={styles.breakdownKey}>Remaining at turf</Text>
-    <Text style={styles.breakdownVal}>
-      {offerDiscount > 0 && bookingType === "advance" && (
-        <Text style={{ color: "#9CA3AF", textDecorationLine: "line-through", fontWeight: "700" }}>₹{remainingAmount + offerDiscount}  </Text>
-      )}
-      ₹{remainingAmount}
-    </Text>
-  </View>
-</View>
-{offerDiscount > 0 && (
-  <Text style={{ textAlign: "center", marginTop: 10, fontSize: 12.5, fontWeight: "800", color: "#15803D" }}>
-    🎉 You save ₹{offerDiscount} on this booking
-  </Text>
-)}
-        
-        
-        <TouchableOpacity style={[styles.bookBtn, { marginTop: 16 },{backgroundColor:"#16A34A"}, loading && styles.bookBtnLoading]} onPress={handlePayment} disabled={loading}>
-          {loading ? <ActivityIndicator size="small" color="#fff" /> : <Text style={styles.bookBtnText}>Pay ₹{finalAdvanceAmount} & Book</Text>}
-        </TouchableOpacity>
-          
-        
+        {/* 5 · How do you want to pay? */}
+        <Text style={bs.sec}>How do you want to pay?</Text>
+        <View style={{ flexDirection: "row", gap: 8 }}>
+          {(["advance", "full"] as BookingType[]).map((type) => {
+            const active = bookingType === type;
+            const amt = type === "advance" ? Math.min(computedAdvanceAmount, offerTotal) : offerTotal;
+            return (
+              <TouchableOpacity
+                key={type}
+                style={[bs.payOpt, active && bs.payOptOn]}
+                onPress={() => setBookingType(type)}
+                activeOpacity={0.85}
+                accessibilityRole="radio"
+                accessibilityState={{ selected: active }}
+              >
+                <View style={[bs.radio, active && bs.radioOn]} />
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <Text style={bs.payAmt}>₹{amt} now</Text>
+                  <Text style={[bs.payNote, active && { color: "#15803D" }]} numberOfLines={1}>
+                    {type === "advance" ? "Advance · rest at turf" : "Full · nothing at turf"}
+                  </Text>
+                </View>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+
+        {/* 6 · Bill details — the only place with numbers */}
+        <Text style={bs.sec}>Bill details</Text>
+        <View style={bs.bill}>
+          <View style={bs.billRow}><Text style={bs.billKey}>Slot price ({durationLabel})</Text><Text style={bs.billVal}>₹{totalPrice}</Text></View>
+          {offerDiscount > 0 && (
+            <View style={bs.billRow}><Text style={[bs.billKey, { color: "#16A34A" }]} numberOfLines={1}>{offer?.title}</Text><Text style={[bs.billVal, { color: "#16A34A" }]}>− ₹{offerDiscount}</Text></View>
+          )}
+          <View style={bs.billLine} />
+          <View style={bs.billRow}><Text style={[bs.billKey, { color: "#111", fontWeight: "800" }]}>Total</Text><Text style={[bs.billVal, { fontWeight: "900" }]}>₹{offerTotal}</Text></View>
+          {discountAmount > 0 && (
+            <View style={bs.billRow}><Text style={[bs.billKey, { color: "#16A34A" }]}>Promo ({promoApplied?.code})</Text><Text style={[bs.billVal, { color: "#16A34A" }]}>− ₹{discountAmount}</Text></View>
+          )}
+          {coinDiscountAmount > 0 && (
+            <View style={bs.billRow}><Text style={[bs.billKey, { color: "#7C3AED" }]}>Coins</Text><Text style={[bs.billVal, { color: "#7C3AED" }]}>− ₹{coinDiscountAmount}</Text></View>
+          )}
+          <View style={bs.billRow}><Text style={bs.billKey}>Pay now{bookingType === "advance" ? " (advance)" : ""}</Text><Text style={bs.billVal}>₹{finalAdvanceAmount}</Text></View>
+          <View style={bs.billRow}><Text style={bs.billKey}>Pay at turf</Text><Text style={bs.billVal}>₹{remainingAmount}</Text></View>
+        </View>
+
+        {(offerDiscount + discountAmount + coinDiscountAmount) > 0 && (
+          <View style={bs.saveRibbon}>
+            <Text style={bs.saveTxt}>🎉 You're saving ₹{offerDiscount + discountAmount + coinDiscountAmount} on this booking</Text>
+          </View>
+        )}
+        <View style={{ height: 8 }} />
       </ScrollView>
+
+      {/* 7 · Pay bar — always visible (hidden while typing a promo code to give it room) */}
+      {kbHeight === 0 && (
+      <View style={bs.payBar}>
+        <View style={{ flex: 1 }}>
+          <Text style={bs.payBarAmt}>₹{finalAdvanceAmount}</Text>
+          <Text style={bs.payBarSub}>{remainingAmount > 0 ? `₹${remainingAmount} at turf` : "Nothing to pay at turf"}</Text>
+        </View>
+        <TouchableOpacity style={[bs.payBtn, loading && { opacity: 0.7 }]} onPress={handlePayment} disabled={loading} activeOpacity={0.85}>
+          {loading ? <ActivityIndicator size="small" color="#fff" /> : (
+            <>
+              <Text style={bs.payBtnTxt}>Pay & Book</Text>
+              <Ionicons name="arrow-forward" size={16} color="#fff" />
+            </>
+          )}
+        </TouchableOpacity>
+      </View>
+      )}
     </View>
   </View>
 </Modal>
@@ -2748,7 +2867,7 @@ function requestCloseBilling() {
                 <Text style={pi.slabNowTxt}>Day rate</Text>
               </View>
               <Text style={pi.slabRate}>
-                ₹{Number(turf.dayPrice || 0)}<Text style={pi.slabUnit}> /hr</Text>
+                {priceOrCall(turf.dayPrice)}{hasPrice(turf.dayPrice) && <Text style={pi.slabUnit}> /hr</Text>}
               </Text>
             </View>
             <View style={pi.slabRow}>
@@ -2757,7 +2876,7 @@ function requestCloseBilling() {
                 <Text style={pi.slabNowTxt}>Night rate</Text>
               </View>
               <Text style={pi.slabRate}>
-                ₹{Number(turf.nightPrice || 0)}<Text style={pi.slabUnit}> /hr</Text>
+                {priceOrCall(turf.nightPrice)}{hasPrice(turf.nightPrice) && <Text style={pi.slabUnit}> /hr</Text>}
               </Text>
             </View>
             <Text style={pi.footNote}>
@@ -2926,6 +3045,10 @@ breakdownVal: {
     callPrivacy:        { fontSize: 11, fontWeight: "600", color: "#6B7280", textAlign: "center", marginTop: -4 },
       callLoginBtn:       { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, height: 48, borderRadius: 14, backgroundColor: "#16A34A" },
   callLoginBtnText:   { color: "#fff", fontSize: 14, fontWeight: "800" },
+  // 🌙 night quiet hours
+  quietBox:           { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: "#EEF2FF", borderRadius: 14, borderWidth: 1, borderColor: "#C7D2FE", padding: 12 },
+  quietTitle:         { fontSize: 14, fontWeight: "800", color: "#312E81" },
+  quietSub:           { fontSize: 12, fontWeight: "600", color: "#4338CA", marginTop: 2, lineHeight: 17 },
 
   //back 
  backBtn: {
@@ -3076,17 +3199,31 @@ modeButtonTextActive:{ color: "#16A34A" },
   validationText:  { color: "#DC2626", fontSize: 12, fontWeight: "600", lineHeight: 17 },
 
   // quick slots
- quickSlotCard:         { width: "48.5%", backgroundColor: "#FCFCFD", borderWidth: 1.5, borderColor: "#E5E7EB", borderRadius: 18, padding: 10, marginTop: 8, minHeight: 76 },
- quickSlotGrid: { flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between", marginTop: 10 },
-quickSlotCardActive:   { backgroundColor: "#F0FDF4", borderColor: "#16A34A", borderWidth: 2 },
-quickSlotCardDisabled: { backgroundColor: "#F3F4F6", opacity: 0.65 },
-quickSlotTime:         { color: "#1A1D21", fontSize: 12, fontWeight: "800", lineHeight: 17 },
-quickSlotTimeActive:   { color: "#16A34A" },
-quickSlotPrice:        { marginTop: 8, color: "#1A1D21", fontSize: 14, fontWeight: "900" },
-quickSlotStatus:       { marginTop: 3, color: "#6B7280", fontSize: 11, fontWeight: "700" },
-quickSlotStatusActive: { color: "#16A34A" },
-quickSlotTextDisabled: { color: "#9CA3AF" },
-quickSlotCheck:        { position: "absolute", top: 8, right: 8, width: 20, height: 20, borderRadius: 10, backgroundColor: "#16A34A", alignItems: "center", justifyContent: "center", zIndex: 2 },
+  qPriceStrip:   { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 14, paddingHorizontal: 12, paddingVertical: 10, backgroundColor: "#F9FAFB", borderWidth: 1, borderColor: "#EEF0F4", borderRadius: 12 },
+  qPriceTxt:     { flexShrink: 1, fontSize: 12.5, fontWeight: "800", color: "#1A1D21" },
+  qPriceSub:     { fontSize: 11.5, fontWeight: "600", color: "#6B7280" },
+  qOfferStrip:   { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 8, paddingHorizontal: 12, paddingVertical: 9, backgroundColor: "#FFF7ED", borderWidth: 1, borderColor: "#FED7AA", borderRadius: 12 },
+  qOfferPill:    { height: 18, paddingHorizontal: 6, borderRadius: 9, backgroundColor: "#EA580C", alignItems: "center", justifyContent: "center" },
+  qOfferPillTxt: { color: "#FFFFFF", fontSize: 10.5, fontWeight: "900" },
+  qOfferTxt:     { flex: 1, fontSize: 12.5, fontWeight: "700", color: "#9A3412" },
+  qGrid:         { flexDirection: "row", flexWrap: "wrap", marginTop: 14 },
+  qBox:          { width: "32%", height: 44, marginBottom: 8, borderRadius: 12, borderWidth: 1.5, borderColor: "#E5E7EB", backgroundColor: "#FFFFFF", alignItems: "center", justifyContent: "center", paddingHorizontal: 2 },
+  qBoxOffer:     { backgroundColor: "#F0FDF4", borderColor: "#86EFAC" },
+  qBoxSelected:  { backgroundColor: "#16A34A", borderColor: "#16A34A" },
+  qBoxBooked:    { backgroundColor: "#F3F4F6", borderColor: "#E5E7EB" },
+  qTime:         { fontSize: 13, fontWeight: "800", color: "#1A1D21" },
+  qOld:          { fontSize: 10.5, fontWeight: "700", color: "#9CA3AF", textDecorationLine: "line-through" },
+  qFlipWrap:     { height: FLIP_H, width: "100%", overflow: "hidden" },
+  qFlipRow:      { position: "absolute", left: 0, right: 0, top: 0, height: FLIP_H, alignItems: "center", justifyContent: "center" },
+  qBadge:        { position: "absolute", top: -7, right: -5, height: 16, paddingHorizontal: 5, borderRadius: 8, backgroundColor: "#EA580C", alignItems: "center", justifyContent: "center" },
+  qBadgeTxt:     { color: "#FFFFFF", fontSize: 9.5, fontWeight: "900" },
+  qLegend:       { flexDirection: "row", flexWrap: "wrap", gap: 12, marginTop: 4 },
+  qLegendItem:   { flexDirection: "row", alignItems: "center", gap: 5 },
+  qLegendDot:    { width: 12, height: 12, borderRadius: 3 },
+  qLegendTxt:    { fontSize: 11, fontWeight: "600", color: "#4B5563" },
+  qSummary:      { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 14, paddingHorizontal: 12, paddingVertical: 10, backgroundColor: "#F0FDF4", borderWidth: 1, borderColor: "#BBF7D0", borderRadius: 12 },
+  qSummaryTxt:   { flex: 1, fontSize: 12.5, fontWeight: "700", color: "#166534" },
+  qSummaryAmt:   { fontSize: 16, fontWeight: "900", color: "#15803D" },
 
   quickInfo:     { flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: "#F0FDF4", borderWidth: 1, borderColor: "#BBF7D0", borderRadius: 12, paddingHorizontal: 12, paddingVertical: 9, marginTop: 14 },
   quickInfoTxt:  { fontSize: 12.5, fontWeight: "800", color: "#15803D" },
@@ -3234,6 +3371,79 @@ const offerStyles = StyleSheet.create({
   slotTag:      { fontSize: 10.5, fontWeight: "800", color: "#15803D", marginTop: 2 },
 });
 
+// ── Turf page restart: name row, VCoin line, offer ticket, book-your-slot card ──
+const tp = StyleSheet.create({
+  nameRow:      { flexDirection: "row", alignItems: "center", gap: 10 },
+  name:         { flex: 1, fontSize: 22, fontWeight: "800", color: "#111111" },
+  sportRow:     { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 10 },
+
+  vcoinRow:     { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 8, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 12, backgroundColor: "#FEF3C7", borderWidth: 1, borderColor: "#FCD34D" },
+  vcoinCoin:    { width: 22, height: 22, borderRadius: 11, backgroundColor: "#F59E0B", borderWidth: 1.5, borderColor: "#FDE68A", alignItems: "center", justifyContent: "center" },
+  vcoinCoinTxt: { color: "#7C2D12", fontSize: 11, fontWeight: "900" },
+  vcoinTxt:     { flex: 1, fontSize: 12, fontWeight: "800", color: "#78350F" },
+
+  ticket:       { flexDirection: "row", marginTop: 8, borderRadius: 14, overflow: "hidden", borderWidth: 1.5, borderStyle: "dashed", borderColor: "#FB923C", backgroundColor: "#FFF7ED" },
+  ticketStub:   { width: 78, backgroundColor: "#EA580C", alignItems: "center", justifyContent: "center", paddingVertical: 10, paddingHorizontal: 6 },
+  ticketBig:    { color: "#fff", fontSize: 22, fontWeight: "900", lineHeight: 24 },
+  ticketSmall:  { color: "#fff", fontSize: 11, fontWeight: "900", letterSpacing: 1, marginTop: 2 },
+  notch:        { position: "absolute", left: 70, width: 16, height: 16, borderRadius: 8, backgroundColor: "#FFFFFF" },
+  ticketBody:   { flex: 1, minWidth: 0, paddingHorizontal: 12, paddingVertical: 9 },
+  ticketTop:    { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6 },
+  ticketKicker: { fontSize: 9.5, fontWeight: "900", letterSpacing: 0.6, color: "#C2410C" },
+  ticketAuto:   { fontSize: 10, fontWeight: "800", color: "#15803D" },
+  ticketName:   { fontSize: 14, fontWeight: "900", color: "#7C2D12", marginTop: 1 },
+  ticketDetail: { fontSize: 11, fontWeight: "700", color: "#9A3412", marginTop: 2 },
+
+  soonPill:     { alignSelf: "center", flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: "#EFF6FF", borderWidth: 1, borderColor: "#BFDBFE", paddingHorizontal: 12, paddingVertical: 6, borderRadius: 999 },
+  soonTxt:      { fontSize: 12, fontWeight: "800", color: "#1D4ED8" },
+
+  bookHead:     { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  monthTxt:     { fontSize: 12, fontWeight: "700", color: "#9CA3AF" },
+  stepDivider:  { height: 1, backgroundColor: "#F1F3F6", marginTop: 14 },
+});
+
+// ── Booking sheet (Confirm booking) ──
+const bs = StyleSheet.create({
+  header:      { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  title:       { fontSize: 18, fontWeight: "900", color: "#1A1D21" },
+  closeBtn:    { width: 32, height: 32, borderRadius: 16, backgroundColor: "#F3F4F6", alignItems: "center", justifyContent: "center" },
+  bookingCard: { marginTop: 12, flexDirection: "row", alignItems: "center", gap: 12, padding: 12, borderWidth: 1, borderColor: "#EEF0F4", borderRadius: 16, backgroundColor: "#F9FAFB" },
+  dateBlock:   { width: 52, borderRadius: 12, backgroundColor: "#16A34A", paddingVertical: 6, alignItems: "center" },
+  dateDow:     { fontSize: 10.5, fontWeight: "800", color: "#fff", letterSpacing: 0.5 },
+  dateDay:     { fontSize: 20, fontWeight: "900", color: "#fff", lineHeight: 23 },
+  dateMon:     { fontSize: 10, fontWeight: "700", color: "#DCFCE7" },
+  turfName:    { fontSize: 14, fontWeight: "900", color: "#1A1D21" },
+  timeTxt:     { fontSize: 13, fontWeight: "800", color: "#15803D", marginTop: 2 },
+  metaTxt:     { fontSize: 11.5, fontWeight: "600", color: "#6B7280", marginTop: 2 },
+  changeTxt:   { fontSize: 12, fontWeight: "800", color: "#16A34A" },
+  offerRow:    { marginTop: 10, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 12, paddingVertical: 10, backgroundColor: "#F0FDF4", borderWidth: 1, borderStyle: "dashed", borderColor: "#4ADE80", borderRadius: 14 },
+  offerIcon:   { width: 28, height: 28, borderRadius: 8, backgroundColor: "#16A34A", alignItems: "center", justifyContent: "center" },
+  offerTitle:  { fontSize: 13, fontWeight: "900", color: "#15803D" },
+  offerSub:    { fontSize: 11, fontWeight: "600", color: "#16A34A", marginTop: 1 },
+  lineRow:     { marginTop: 8, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 12, paddingVertical: 10, borderWidth: 1, borderColor: "#EEF0F4", borderRadius: 14, backgroundColor: "#fff" },
+  lineTitle:   { fontSize: 12.5, fontWeight: "800", color: "#374151" },
+  lineSub:     { fontSize: 11, fontWeight: "600", color: "#6B7280", marginTop: 1 },
+  sec:         { fontSize: 11, fontWeight: "800", color: "#9CA3AF", textTransform: "uppercase", letterSpacing: 0.5, marginTop: 16, marginBottom: 8 },
+  payOpt:      { flex: 1, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 10, paddingVertical: 9, borderWidth: 1.5, borderColor: "#E5E7EB", borderRadius: 14, backgroundColor: "#fff" },
+  payOptOn:    { borderWidth: 2, borderColor: "#16A34A", backgroundColor: "#F0FDF4" },
+  radio:       { width: 16, height: 16, borderRadius: 8, borderWidth: 1.5, borderColor: "#D1D5DB", backgroundColor: "#fff" },
+  radioOn:     { borderWidth: 5, borderColor: "#16A34A" },
+  payAmt:      { fontSize: 13, fontWeight: "900", color: "#1A1D21" },
+  payNote:     { fontSize: 10.5, fontWeight: "600", color: "#6B7280" },
+  bill:        { backgroundColor: "#F9FAFB", borderRadius: 14, paddingHorizontal: 12, paddingVertical: 8 },
+  billRow:     { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 5, gap: 10 },
+  billKey:     { flexShrink: 1, fontSize: 13, fontWeight: "600", color: "#6B7280" },
+  billVal:     { fontSize: 13, fontWeight: "800", color: "#1A1D21" },
+  billLine:    { height: 1, backgroundColor: "#E5E7EB", marginVertical: 5 },
+  saveRibbon:  { marginTop: 10, alignItems: "center", paddingVertical: 8, borderRadius: 10, backgroundColor: "#ECFDF5" },
+  saveTxt:     { fontSize: 12.5, fontWeight: "800", color: "#15803D" },
+  payBar:      { marginHorizontal: -20, marginTop: 8, paddingHorizontal: 20, paddingTop: 12, borderTopWidth: 1, borderTopColor: "#EEF0F4", backgroundColor: "#fff", flexDirection: "row", alignItems: "center", gap: 12 },
+  payBarAmt:   { fontSize: 20, fontWeight: "900", color: "#1A1D21" },
+  payBarSub:   { fontSize: 11, fontWeight: "600", color: "#6B7280" },
+  payBtn:      { flex: 1.4, height: 50, borderRadius: 14, backgroundColor: "#16A34A", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8 },
+  payBtnTxt:   { color: "#fff", fontSize: 15, fontWeight: "900" },
+});
+
 const promoStyles = StyleSheet.create({
   wrap:         { marginTop: 10, paddingTop: 16, borderTopWidth: 1, borderTopColor: "#F3F4F6" },
   sectionTitle: { fontSize: 12, fontWeight: "700", color: "#6B7280", marginBottom: 10, textTransform: "uppercase", letterSpacing: 0.4 },
@@ -3325,11 +3535,11 @@ coinCard: {
     flex: 1,
     backgroundColor: "#F9FAFB",
     borderRadius: 12,
-    padding: 8,
-    borderWidth: 2,
+    padding: 6,
+    borderWidth: 1.5,
     borderColor: "#E5E7EB",
     marginBottom: 5,
-     minHeight: 100,   // ← badge ke liye space
+    minHeight: 84,    // ← badge ke liye space
   },
   coinCardActive: {
     backgroundColor: "#F5F3FF",

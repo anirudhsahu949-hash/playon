@@ -27,6 +27,8 @@ import {
 } from "firebase/firestore";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
+import MapPickerModal from "../../components/Mappickermodal";
+import { City, CITY_STATUS_META, fetchCities, guessCity } from "../../utils/cities";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const SERVER_URL = "https://bookora-backend-95u4.onrender.com";
@@ -129,6 +131,15 @@ export default function AddTurf() {
   // ── Section 1: Turf details ──────────────────────────────────────────────
   const [name,         setName]         = useState("");
   const [location,     setLocation]     = useState("");
+
+  // ── City (all-India) — every turf belongs to one city ───────────────────
+  const [cities,       setCities]       = useState<City[]>([]);
+  const [cityId,       setCityId]       = useState("");
+  const [locality,     setLocality]     = useState("");
+  const [pinLat,       setPinLat]       = useState<number | null>(null);
+  const [pinLng,       setPinLng]       = useState<number | null>(null);
+  const [showMap,      setShowMap]      = useState(false);
+  const selectedCity = cities.find((c) => c.id === cityId) || null;
   const [sports,       setSports]       = useState<string[]>([]);
   const [customSport,  setCustomSport]  = useState("");
   const [mapLink,      setMapLink]      = useState("");
@@ -208,6 +219,29 @@ export default function AddTurf() {
 
   // ── Fetch on mount ───────────────────────────────────────────────────────
   useEffect(() => { fetchOwners(); }, []);
+  useEffect(() => {
+    fetchCities(true)
+      .then((list) => {
+        setCities(list);
+        // Pre-select the default city so the common case is one tap less
+        const def = list.find((c) => c.isDefault) || (list.length === 1 ? list[0] : null);
+        if (def) setCityId((cur) => cur || def.id);
+      })
+      .catch(() => Alert.alert("Error", "Unable to load cities."));
+  }, []);
+
+  // Map pin → coords, fill location text, and auto-pick the city it falls in
+  const onMapConfirm = (lat: number, lng: number, address: string) => {
+    setPinLat(lat); setPinLng(lng);
+    if (!mapLink.trim()) setMapLink(`https://maps.google.com/?q=${lat},${lng}`);
+    const hit = guessCity({ lat, lng, text: address }, cities);
+    if (hit) setCityId(hit.id);
+    if (!location.trim()) setLocation(address);
+    setShowMap(false);
+    if (!hit) {
+      Alert.alert("Pin is outside your cities", "This pin isn't inside any city's radius. Pick the city by hand, or add the city first in Admin → Cities.");
+    }
+  };
   useEffect(() => { if (addOperator) fetchOperators(); }, [addOperator]);
   useEffect(() => {
     if (isBallMachineOnly) setBallMachineEnabled(true);
@@ -308,7 +342,7 @@ export default function AddTurf() {
 
   // ── Reset ─────────────────────────────────────────────────────────────────
   const resetForm = () => {
-    setName(""); setLocation(""); setSports([]); setCustomSport(""); setMapLink("");
+    setName(""); setLocation(""); setLocality(""); setPinLat(null); setPinLng(null); setSports([]); setCustomSport(""); setMapLink("");
     setDayPrice(""); setNightPrice(""); setBookingPrice("");
     setOpeningTime("6"); setClosingTime("23"); setSlotDuration("60");
     setBallMachineEnabled(false); setBallMachineCount("1");
@@ -329,6 +363,10 @@ export default function AddTurf() {
   // ── Validate ──────────────────────────────────────────────────────────────
   const validate = (): string | null => {
     if (!name.trim())     return "Turf name is required.";
+    if (!cityId)          return cities.length === 0
+      ? "No cities set up yet. Go to Admin → Cities and set up a city first."
+      : "Pick the city this turf is in.";
+    if (!locality.trim()) return "Area / locality is required (e.g. Rajapeth, Camp).";
     if (!location.trim()) return "Location is required.";
 
     if (venueType === "other" && !customVenueType.trim())
@@ -543,6 +581,11 @@ export default function AddTurf() {
       const turfRef = await addDoc(collection(db, "turfs"), {
         name:         name.trim(),
         location:     location.trim(),
+        // ✅ All-India: city + area. Home/Explore filter turfs by cityId.
+        cityId,
+        cityName:     selectedCity?.name || "",
+        locality:     locality.trim(),
+        ...(pinLat != null && pinLng != null ? { latitude: pinLat, longitude: pinLng } : {}),
         // Ball Machine Only venues are cricket practice by definition — no
         // sport picker is shown for them, so don't rely on finalSports (empty).
         sport:        isBallMachineOnly ? ["Cricket"] : finalSports,     // ✅ BUG FIX #2: no stray "Other" string
@@ -724,11 +767,71 @@ export default function AddTurf() {
             />
           </Field>
 
-          <Field label="Location *">
+          {/* ── City (required) ── */}
+          <Field label="City *">
+            {cities.length === 0 ? (
+              <TouchableOpacity style={styles.newOwnerBanner} onPress={() => router.push("/admin/cities" as any)}>
+                <Ionicons name="alert-circle-outline" size={16} color="#1D4ED8" />
+                <Text style={styles.newOwnerBannerText}>No cities yet — tap to set up your first city.</Text>
+              </TouchableOpacity>
+            ) : (
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chipRow}>
+                {cities.map((c) => {
+                  const active = cityId === c.id;
+                  return (
+                    <TouchableOpacity key={c.id} style={[styles.chip, active && styles.chipActive]} onPress={() => setCityId(c.id)}>
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
+                        {c.name}{c.status !== "live" ? ` · ${CITY_STATUS_META[c.status].label}` : ""}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
+            )}
+            {selectedCity && selectedCity.status !== "live" && (
+              <Text style={[styles.hint, { color: "#B45309" }]}>
+                {selectedCity.name} is {CITY_STATUS_META[selectedCity.status].label.toLowerCase()} — players won't see this turf until the city is Live.
+              </Text>
+            )}
+          </Field>
+
+          <Field label="Area / Locality *">
+            <TextInput
+              style={styles.input} placeholder="e.g. Rajapeth, Camp, Badnera"
+              placeholderTextColor="#9CA3AF" value={locality}
+              onChangeText={(v) => {
+                setLocality(v);
+                // keep the display line in step while it's still auto-made
+                const auto = [locality.trim(), selectedCity?.name].filter(Boolean).join(", ");
+                if (!location.trim() || location.trim() === auto) {
+                  setLocation([v.trim(), selectedCity?.name].filter(Boolean).join(", "));
+                }
+              }}
+              autoCapitalize="words"
+            />
+            <Text style={styles.hint}>Used for the area filter inside a city.</Text>
+          </Field>
+
+          <Field label="Location (shown on cards) *">
             <TextInput
               style={styles.input} placeholder="Area, City"
               placeholderTextColor="#9CA3AF" value={location} onChangeText={setLocation}
             />
+          </Field>
+
+          <Field label="Map Pin">
+            <TouchableOpacity style={styles.mapPinBtn} onPress={() => setShowMap(true)} activeOpacity={0.85}>
+              <Ionicons name="map-outline" size={18} color="#fff" />
+              <Text style={styles.mapPinBtnText}>{pinLat != null ? "Change pin" : "Open map & drop pin"}</Text>
+              {pinLat != null && pinLng != null && (
+                <View style={styles.mapPinPill}>
+                  <Text style={styles.mapPinPillText}>{pinLat.toFixed(4)}, {pinLng!.toFixed(4)}</Text>
+                </View>
+              )}
+            </TouchableOpacity>
+            <Text style={styles.hint}>
+              {pinLat != null ? "✓ Pin set — distance and \"Near you\" will work for this turf." : "Recommended: without a pin, players can't see how far this turf is."}
+            </Text>
           </Field>
 
           {/* Sport chips — not shown for Ball Machine Only venues (always Cricket) */}
@@ -1593,6 +1696,15 @@ export default function AddTurf() {
 
         <View style={{ height: 48 }} />
       </ScrollView>
+
+      <MapPickerModal
+        visible={showMap}
+        initialLocation={[locality, selectedCity?.name].filter(Boolean).join(", ") || selectedCity?.name || "India"}
+        initialLat={pinLat ?? selectedCity?.lat ?? undefined}
+        initialLng={pinLng ?? selectedCity?.lng ?? undefined}
+        onConfirm={onMapConfirm}
+        onClose={() => setShowMap(false)}
+      />
     </View>
   );
 }
@@ -1701,6 +1813,12 @@ const styles = StyleSheet.create({
   },
   submitText: { color: "#fff", fontSize: 16, fontWeight: "900" },
 
+  // ✅ Map pin
+  mapPinBtn:      { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: ACCENT, paddingVertical: 13, paddingHorizontal: 14, borderRadius: 12 },
+  mapPinBtnText:  { color: "#fff", fontWeight: "800", fontSize: 14, flex: 1 },
+  mapPinPill:     { backgroundColor: "rgba(255,255,255,0.25)", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 999 },
+  mapPinPillText: { fontSize: 10, color: "#fff", fontWeight: "700" },
+
   // ✅ Banking section
   bankBanner:     { flexDirection: "row", alignItems: "flex-start", gap: 8, backgroundColor: "#F0FDFA", borderRadius: 12, padding: 12, marginBottom: 4, borderWidth: 1, borderColor: "#99F6E4" },
   bankBannerText: { fontSize: 12, color: "#0F766E", fontWeight: "600", flex: 1, lineHeight: 18 },
@@ -1720,4 +1838,4 @@ venueChipActive:    { backgroundColor: DARK, borderColor: DARK },
 venueChipEmoji:     { fontSize: 20, textAlign: "center" },
 venueChipLabel:     { fontSize: 11, fontWeight: "700", color: "#6B7280", marginTop: 5, textAlign: "center" },
 venueChipLabelActive:{ color: "#fff" },
-});
+});

@@ -12,6 +12,7 @@ import {
 } from "firebase/firestore";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
+import { City, fetchCities } from "../../utils/cities";
 import DraggableFlatList, {
   RenderItemParams,
   ScaleDecorator,
@@ -38,6 +39,7 @@ type FeaturedSection = {
   active: boolean;
   order: number;
   style: "horizontal" | "grid";
+  cityIds?: string[];                 // 🏙️ ["all"] | city ids | "coming_soon" (missing = All India)
 };
 
 type HighlightCard = {
@@ -51,9 +53,41 @@ type HighlightCard = {
   actionValue: string;
   active: boolean;
   order: number;
+  cityIds?: string[];                 // 🏙️ same as sections
 };
 
-type Turf = { id: string; name?: string; sport?: string; location?: string; rating?: number | string };
+type Turf = { id: string; name?: string; sport?: string; location?: string; rating?: number | string; cityId?: string; cityName?: string };
+
+// ── 🏙️ "Show in" chips — All India / cities / coming-soon places ─────────────
+const isAllIndia = (ids?: string[]) => !ids || ids.length === 0 || ids.includes("all");
+
+function CityChips({ value, cities, onChange }: { value?: string[]; cities: City[]; onChange: (ids: string[]) => void }) {
+  const all = isAllIndia(value);
+  const ids = all ? [] : (value || []);
+  const toggle = (id: string) => {
+    const next = ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id];
+    onChange(next.length ? next : ["all"]);
+  };
+  const chip = (key: string, label: string, on: boolean, onPress: () => void) => (
+    <TouchableOpacity key={key} style={[s.typeBtn, on && s.typeBtnActive]} onPress={onPress}>
+      <Text style={[s.typeTxt, on && s.typeTxtActive]}>{label}</Text>
+    </TouchableOpacity>
+  );
+  return (
+    <View>
+      <Text style={s.fieldLabel}>Show in</Text>
+      <View style={s.typeRow}>
+        {chip("all", "All India", all, () => onChange(["all"]))}
+        {cities.filter(c => c.status !== "hidden").map(c =>
+          chip(c.id, c.name + (c.status !== "live" ? " · soon" : ""), !all && ids.includes(c.id), () => toggle(c.id)))}
+        {chip("coming_soon", "Coming soon cities", !all && ids.includes("coming_soon"), () => toggle("coming_soon"))}
+      </View>
+      <Text style={s.hint}>
+        Turfs inside a section always follow the player's city automatically. Use this only for a section meant for some cities.
+      </Text>
+    </View>
+  );
+}
 
 const ICON_OPTS = [ "","🏏","⚽","🏓","🏸","🏀","🎾","🏐","🤼","🏑","🔥","⭐","🎁","🛡️","📅","🏆","🆕","💡","📍","🎯","📢","📞","🏊","✅", "☀️","🌙","🌧️","⛅","🔔","⚡","🔒","🔓","👀",];
 const COLOR_OPTS = ["#FFF7ED","#F0FDF4","#EFF6FF","#F5F3FF","#FEF9C3","#FFF1F2","#F0FDFA","#FAFAFA"];
@@ -71,6 +105,7 @@ const EMPTY_SECTION = (): Omit<FeaturedSection,"id"> => ({
   maxItems: 6,
   highlightIds: [],
   active: true, order: 0, style: "horizontal",
+  cityIds: ["all"],
 });
 
 const EMPTY_CARD = (): Omit<HighlightCard,"id"> => ({
@@ -78,6 +113,7 @@ const EMPTY_CARD = (): Omit<HighlightCard,"id"> => ({
   color: "#FFF7ED", iconBg: "#FB923C",
   action: "explore", actionValue: "",
   active: true, order: 0,
+  cityIds: ["all"],
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -90,6 +126,7 @@ const [sections,   setSections]   = useState<FeaturedSection[]>([]);
 const [highlights, setHighlights] = useState<HighlightCard[]>([]);
 const [turfs,      setTurfs]      = useState<Turf[]>([]);
 const [gyms,       setGyms]       = useState<Turf[]>([]);  // ✅ NEW
+const [cities,     setCities]     = useState<City[]>([]);  // 🏙️
   const [loading,    setLoading]    = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [saving,     setSaving]     = useState(false);
@@ -105,6 +142,10 @@ const [gyms,       setGyms]       = useState<Turf[]>([]);  // ✅ NEW
   const [turfSearch,     setTurfSearch]     = useState("");
 
   useEffect(() => { fetchAll(); }, []);
+  useEffect(() => { fetchCities(true).then(setCities).catch(() => {}); }, []);
+  const cityLabel = (ids?: string[]) => isAllIndia(ids)
+    ? "All India"
+    : (ids || []).map(id => id === "coming_soon" ? "Coming soon" : cities.find(c => c.id === id)?.name || id).join(", ");
 
 const fetchAll = async (isRefresh = false) => {
   isRefresh ? setRefreshing(true) : setLoading(true);
@@ -148,6 +189,7 @@ const fetchAll = async (isRefresh = false) => {
     active:       s.active,
     order:    s.order,
     style:    s.style,
+    cityIds:  isAllIndia(s.cityIds) ? ["all"] : [...(s.cityIds || [])],
   });
   setSectionModal(true);
 };
@@ -262,7 +304,7 @@ const addTurfToSection = (id: string) => {
 
   const openEditCard = (c: HighlightCard) => {
     setEditingCard(c);
-    setCardForm({ title: c.title, sub: c.sub, icon: c.icon, color: c.color, iconBg: c.iconBg, action: c.action, actionValue: c.actionValue, active: c.active, order: c.order });
+    setCardForm({ title: c.title, sub: c.sub, icon: c.icon, color: c.color, iconBg: c.iconBg, action: c.action, actionValue: c.actionValue, active: c.active, order: c.order, cityIds: isAllIndia(c.cityIds) ? ["all"] : [...(c.cityIds || [])] });
     setHighlightModal(true);
   };
 
@@ -454,6 +496,9 @@ const addTurfToSection = (id: string) => {
                           <View style={s.metaChip}>
                             <Text style={s.metaChipTxt}>{item.style === "horizontal" ? "↔ Scroll" : "⊞ Grid"}</Text>
                           </View>
+                          <View style={[s.metaChip, { backgroundColor: "#EFF6FF" }]}>
+                            <Text style={[s.metaChipTxt, { color: "#1D4ED8" }]}>🏙️ {cityLabel(item.cityIds)}</Text>
+                          </View>
                           {item.type === "manual" && (
                             <View style={s.metaChip}>
                               <Text style={s.metaChipTxt}>{item.turfIds.length} turfs</Text>
@@ -601,6 +646,7 @@ const addTurfToSection = (id: string) => {
                         </View>
                         <View style={s.sectionMeta}>
                           <View style={s.metaChip}><Text style={s.metaChipTxt}>→ {item.action}{item.actionValue ? `: ${item.actionValue}` : ""}</Text></View>
+                          <View style={[s.metaChip, { backgroundColor: "#EFF6FF" }]}><Text style={[s.metaChipTxt, { color: "#1D4ED8" }]}>🏙️ {cityLabel(item.cityIds)}</Text></View>
                           <View style={[s.metaChip, item.active ? s.metaActive : s.metaInactive]}>
                             <Text style={[s.metaChipTxt, { color: item.active ? "#15803D" : "#9CA3AF" }]}>{item.active ? "Live" : "Hidden"}</Text>
                           </View>
@@ -864,6 +910,9 @@ const addTurfToSection = (id: string) => {
                 </View>
               )}
 
+              {/* 🏙️ Which cities see this section */}
+              <CityChips value={sectionForm.cityIds} cities={cities} onChange={ids => setSectionForm(f => ({ ...f, cityIds: ids }))} />
+
               {/* Active toggle */}
               <View style={s.toggleRow}>
                 <View>
@@ -930,7 +979,7 @@ const addTurfToSection = (id: string) => {
         <Text style={s.turfPickMeta}>
           {sectionForm.venueType === "gym" 
             ? `${item.location || "—"}${item.rating ? ` · ⭐ ${item.rating}` : ""}`
-            : `${item.sport} · ${item.location}${item.rating ? ` · ⭐ ${item.rating}` : " · No rating"}`
+            : `${item.sport} · ${item.cityName || item.location}${item.rating ? ` · ⭐ ${item.rating}` : " · No rating"}`
           }
         </Text>
       </View>
@@ -1049,6 +1098,9 @@ const addTurfToSection = (id: string) => {
                   <Text style={{ fontSize: 20 }}>{cardForm.icon}</Text>
                 </View>
               </View>
+
+              {/* 🏙️ Which cities see this card */}
+              <CityChips value={cardForm.cityIds} cities={cities} onChange={ids => setCardForm(f => ({ ...f, cityIds: ids }))} />
 
               <View style={s.toggleRow}>
                 <View>

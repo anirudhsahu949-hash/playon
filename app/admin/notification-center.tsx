@@ -15,8 +15,10 @@ import {
   Modal,
 } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
-import { useState, useRef, useEffect } from "react";
-import { auth } from "../../firebaseConfig";
+import { useState, useRef, useEffect, useMemo } from "react";
+import { auth, db } from "../../firebaseConfig";
+import { collection, getDocs } from "firebase/firestore";
+import { City, fetchCities, citySlug } from "../../utils/cities";   // 🏙️
 import { Ionicons } from "@expo/vector-icons";
 
 const SERVER_URL = "https://bookora-backend-95u4.onrender.com";
@@ -219,7 +221,16 @@ export default function AdminNotificationCenter() {
   const [loading,      setLoading]      = useState(false);
   const [sentCount,    setSentCount]    = useState<number | null>(null);
   const [charCount,    setCharCount]    = useState(0);
-  const [history,      setHistory]      = useState<{ title: string; role: string; total: number; time: string }[]>([]);
+  const [history,      setHistory]      = useState<{ title: string; role: string; total: number; time: string; where?: string }[]>([]);
+
+  // ── 🏙️ City targeting ──
+  // target: "all" = everywhere · "cities" = chosen cityIds · "waitlist" = one city's "Notify me" list
+  const [cities,       setCities]       = useState<City[]>([]);
+  const [target,       setTarget]       = useState<"all" | "cities" | "waitlist">("all");
+  const [cityIds,      setCityIds]      = useState<string[]>([]);
+  const [waitKey,      setWaitKey]      = useState<string>("");
+  const [people,       setPeople]       = useState<{ role: string; cityId: string; city: string; token: boolean }[]>([]);
+  const [waitlist,     setWaitlist]     = useState<Record<string, { name: string; uids: Set<string>; guests: number }>>({});
   const [selectedTpl,  setSelectedTpl]  = useState<number | null>(null);
   const [savedMsgs,    setSavedMsgs]    = useState<SavedMessage[]>([]);
   const [showSaveModal,setShowSaveModal]= useState(false);
@@ -227,6 +238,56 @@ export default function AdminNotificationCenter() {
   const fadeAnim     = useRef(new Animated.Value(0)).current;
   const slideAnim    = useRef(new Animated.Value(24)).current;
   const successScale = useRef(new Animated.Value(0)).current;
+
+  // 🏙️ Load cities + who has the app, so we can show "reaches N phones"
+  useEffect(() => {
+    (async () => {
+      try {
+        const [list, uSnap, wSnap] = await Promise.all([
+          fetchCities(true),
+          getDocs(collection(db, "users")),
+          getDocs(collection(db, "cityWaitlist")).catch(() => null),
+        ]);
+        setCities(list);
+        setPeople(uSnap.docs.map((d) => {
+          const u: any = d.data();
+          return { role: u.role || "user", cityId: u.cityId || "", city: u.city || "", token: !!u.expoPushToken };
+        }));
+        const w: Record<string, { name: string; uids: Set<string>; guests: number }> = {};
+        wSnap?.docs.forEach((d) => {
+          const x: any = d.data();
+          const key = x.cityKey || citySlug(x.cityName || "");
+          if (!key) return;
+          if (!w[key]) w[key] = { name: x.cityName || key, uids: new Set(), guests: 0 };
+          if (x.uid) w[key].uids.add(x.uid); else w[key].guests++;
+        });
+        setWaitlist(w);
+      } catch { /* counts are a nice-to-have */ }
+    })();
+  }, []);
+
+  const cityLabel = (id: string) =>
+    id === "coming_soon" ? "Coming soon places" : cities.find((c) => c.id === id)?.name || id;
+  const whereLabel =
+    target === "waitlist" ? `${waitlist[waitKey]?.name || waitKey} waitlist`
+    : target === "cities" && cityIds.length ? cityIds.map(cityLabel).join(", ")
+    : "All India";
+
+  // Phones this send will reach (people with the app + notifications on)
+  const reach = useMemo(() => {
+    if (target === "waitlist") {
+      const uids = waitlist[waitKey]?.uids;
+      return uids ? uids.size : 0;   // tokens checked on the server
+    }
+    return people.filter((p) => {
+      if (!p.token) return false;
+      if (role !== "all" && p.role !== role) return false;
+      if (target === "cities" && cityIds.length) {
+        return p.cityId ? cityIds.includes(p.cityId) : cityIds.includes("coming_soon") && !!p.city;
+      }
+      return true;
+    }).length;
+  }, [people, role, target, cityIds, waitKey, waitlist]);
 
   useEffect(() => {
     Animated.parallel([
@@ -283,7 +344,16 @@ export default function AdminNotificationCenter() {
       setLoading(true);
       const idToken = await currentUser.getIdToken(true);
       const payload: Record<string, any> = { title: title.trim(), body: body.trim() };
-      if (role !== "all")  payload.role     = role;
+      if (target === "waitlist") {
+        if (!waitKey) { setLoading(false); return Alert.alert("Pick a city", "Choose which city's waitlist to notify."); }
+        payload.waitlistCity = waitKey;
+      } else {
+        if (role !== "all")  payload.role = role;
+        if (target === "cities") {
+          if (cityIds.length === 0) { setLoading(false); return Alert.alert("Pick a city", "Choose at least one city, or switch to All India."); }
+          payload.cityIds = cityIds;
+        }
+      }
       if (imageUrl.trim()) payload.imageUrl = imageUrl.trim();
       const response = await fetch(`${SERVER_URL}/send-admin-notification`, {
         method: "POST",
@@ -295,7 +365,7 @@ export default function AdminNotificationCenter() {
         const total = data.total ?? 0;
         showSuccess(total);
         setHistory((prev) => [
-          { title: title.trim(), role, total, time: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }) },
+          { title: title.trim(), role: target === "waitlist" ? "user" : role, total, where: whereLabel, time: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }) },
           ...prev.slice(0, 4),
         ]);
         setTitle(""); setBody(""); setImageUrl(""); setCharCount(0); setSelectedTpl(null);
@@ -481,6 +551,70 @@ export default function AdminNotificationCenter() {
           </View>
         </View>
 
+        {/* ── 🏙️ City ── */}
+        <View style={s.section}>
+          <View style={s.sectionHeader}>
+            <View style={s.sectionDot} />
+            <Text style={s.sectionTitle}>City</Text>
+          </View>
+          <View style={s.cityModeRow}>
+            {([
+              { key: "all",      label: "All India" },
+              { key: "cities",   label: "Choose cities" },
+              { key: "waitlist", label: "Notify-me list" },
+            ] as const).map((m) => (
+              <TouchableOpacity key={m.key} style={[s.cityMode, target === m.key && s.cityModeOn]} onPress={() => setTarget(m.key)} activeOpacity={0.8}>
+                <Text style={[s.cityModeTxt, target === m.key && { color: WHITE }]}>{m.label}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          {target === "cities" && (
+            <View style={s.cityChips}>
+              {[...cities.filter((c) => c.status !== "hidden").map((c) => ({ id: c.id, label: c.name + (c.status !== "live" ? " · soon" : "") })),
+                { id: "coming_soon", label: "Coming soon places" }].map((c) => {
+                const on = cityIds.includes(c.id);
+                const n = people.filter((p) => p.token && (role === "all" || p.role === role) &&
+                  (c.id === "coming_soon" ? !p.cityId && !!p.city : p.cityId === c.id)).length;
+                return (
+                  <TouchableOpacity
+                    key={c.id}
+                    style={[s.cityChip, on && s.cityChipOn]}
+                    onPress={() => setCityIds((prev) => on ? prev.filter((x) => x !== c.id) : [...prev, c.id])}
+                    activeOpacity={0.8}
+                  >
+                    <Text style={[s.cityChipTxt, on && { color: WHITE }]}>{c.label} · {n}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          )}
+
+          {target === "waitlist" && (
+            Object.keys(waitlist).length === 0 ? (
+              <Text style={s.cityHint}>No one has tapped "Notify me" yet.</Text>
+            ) : (
+              <View style={s.cityChips}>
+                {Object.entries(waitlist).sort((a, b) => b[1].uids.size - a[1].uids.size).map(([key, w]) => {
+                  const on = waitKey === key;
+                  return (
+                    <TouchableOpacity key={key} style={[s.cityChip, on && s.cityChipOn]} onPress={() => setWaitKey(key)} activeOpacity={0.8}>
+                      <Text style={[s.cityChipTxt, on && { color: WHITE }]}>{w.name} · {w.uids.size}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            )
+          )}
+          <Text style={s.cityHint}>
+            {target === "waitlist"
+              ? `Players who asked to be told when ${waitlist[waitKey]?.name || "a city"} goes live. Use it on launch day.${waitKey && waitlist[waitKey]?.guests ? ` (${waitlist[waitKey].guests} guests without an account can't get a push.)` : ""}`
+              : target === "cities"
+              ? "Players are counted by the city saved on their account."
+              : "Everyone with the app, in every city."}
+          </Text>
+        </View>
+
         {/* ── Compose ── */}
         <View style={s.section}>
           <View style={s.sectionHeader}>
@@ -587,7 +721,7 @@ export default function AdminNotificationCenter() {
           <View style={[s.audienceBadge, { backgroundColor: cfg.bg, borderColor: cfg.border }]}>
             <Ionicons name={cfg.icon as any} size={13} color={cfg.color} />
             <Text style={[s.audienceTxt, { color: cfg.color }]}>
-              Sending to: <Text style={{ fontWeight: "900" }}>{cfg.label}</Text>
+              Sending to: <Text style={{ fontWeight: "900" }}>{target === "waitlist" ? "Notify-me list" : cfg.label}</Text> · {whereLabel} · ~{reach} phone{reach === 1 ? "" : "s"}
             </Text>
           </View>
           <SendButton onPress={sendNotification} loading={loading} />
@@ -608,7 +742,7 @@ export default function AdminNotificationCenter() {
                 <View style={{ flex: 1 }}>
                   <Text style={s.historyTitle} numberOfLines={1}>{h.title}</Text>
                   <Text style={s.historySub}>
-                    {ROLE_CFG[h.role]?.label}  ·  {h.total} devices  ·  {h.time}
+                    {ROLE_CFG[h.role]?.label}{h.where ? `  ·  ${h.where}` : ""}  ·  {h.total} devices  ·  {h.time}
                   </Text>
                 </View>
               </View>
@@ -661,6 +795,16 @@ const s = StyleSheet.create({
 
   // Section
   section:       { paddingHorizontal: 16, marginTop: 16 },
+  // 🏙️ city targeting
+  cityModeRow:   { flexDirection: "row", gap: 8 },
+  cityMode:      { flex: 1, alignItems: "center", paddingVertical: 10, borderRadius: 12, backgroundColor: WHITE, borderWidth: 1, borderColor: GRAY2 },
+  cityModeOn:    { backgroundColor: BRAND, borderColor: BRAND },
+  cityModeTxt:   { fontSize: 12, fontWeight: "800", color: GRAY5 },
+  cityChips:     { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 10 },
+  cityChip:      { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 99, backgroundColor: WHITE, borderWidth: 1, borderColor: GRAY2 },
+  cityChipOn:    { backgroundColor: GREEN, borderColor: GREEN },
+  cityChipTxt:   { fontSize: 12, fontWeight: "700", color: GRAY5 },
+  cityHint:      { fontSize: 11, color: GRAY4, marginTop: 8, lineHeight: 16 },
   sectionHeader: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 12 },
   sectionDot:    { width: 4, height: 16, borderRadius: 2, backgroundColor: GREEN },
   sectionTitle:  { fontSize: 14, fontWeight: "800", color: BRAND, letterSpacing: -0.1, flex: 1 },

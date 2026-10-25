@@ -24,6 +24,7 @@ import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import * as Location from "expo-location";
 import MapPickerModal from "../../components/Mappickermodal"; // ✅ adjust path as needed
+import { City, CITY_STATUS_META, fetchCities, guessCity } from "../../utils/cities";
 
 const DARK  = "#0A0F1E";
 const ACCENT = "#0EA5A4";
@@ -100,6 +101,10 @@ type Turf = {
    priceSlabs?: { weekday?: PriceSlab[]; weekend?: PriceSlab[] };
   bookingMode?: BookingMode;
   bookingPhone?: string;
+  // ── All-India ──
+  cityId?: string;
+  cityName?: string;
+  locality?: string;
 };
 
 type Owner = { id: string; name?: string; email?: string };
@@ -112,6 +117,8 @@ export default function AdminTurfs() {
   const [loading,    setLoading]    = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [search,     setSearch]     = useState("");
+  const [cities,     setCities]     = useState<City[]>([]);
+  const [cityFilter, setCityFilter] = useState<string>("all"); // "all" | "none" | cityId
 
   const [editModal,  setEditModal]  = useState(false);
   const [editTurf,   setEditTurf]   = useState<Turf | null>(null);
@@ -133,6 +140,8 @@ export default function AdminTurfs() {
   priceSlabsWeekend: [] as PriceSlab[],
   bookingMode: "online" as BookingMode,
   bookingPhone: "",
+  cityId: "",
+  locality: "",
   });
   const [slabDayTab, setSlabDayTab] = useState<DayType>("weekday");
 
@@ -168,6 +177,7 @@ export default function AdminTurfs() {
     } else {
       Alert.alert("Error", "Could not load turfs.");
     }
+    try { setCities(await fetchCities(true)); } catch { /* list still works without cities */ }
     if (ownerResult.status === "fulfilled") {
       setOwners(ownerResult.value.docs.map((d) => ({ id: d.id, ...d.data() } as Owner)));
     }
@@ -175,14 +185,23 @@ export default function AdminTurfs() {
     setRefreshing(false);
   };
 
+  const cityIdSet = useMemo(() => new Set(cities.map((c) => c.id)), [cities]);
+  const hasCity = (t: Turf) => !!t.cityId && cityIdSet.has(t.cityId);
+  const cityName = (id?: string) => cities.find((c) => c.id === id)?.name || "";
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    if (!q) return turfs;
-    return turfs.filter((t) =>
-      [t.name, t.location, t.sport, t.ownerName, t.operatorEmail]
+    const byCity = turfs.filter((t) =>
+      cityFilter === "all" ? true :
+      cityFilter === "none" ? !hasCity(t) :
+      t.cityId === cityFilter
+    );
+    if (!q) return byCity;
+    return byCity.filter((t) =>
+      [t.name, t.location, t.sport, t.ownerName, t.operatorEmail, t.locality, cityName(t.cityId)]
         .some((f) => String(f || "").toLowerCase().includes(q))
     );
-  }, [turfs, search]);
+  }, [turfs, search, cityFilter, cities]);
 
   const openEdit = (turf: Turf) => {
     setEditTurf(turf);
@@ -220,6 +239,10 @@ export default function AdminTurfs() {
            : [{ start: 6, end: 18, rate: Number(turf.dayPrice) || 0 }],
     bookingMode:  turf.bookingMode || "online",   // old turfs = online
     bookingPhone: turf.bookingPhone || "",
+    cityId:   turf.cityId && cityIdSet.has(turf.cityId)
+      ? turf.cityId
+      : (guessCity({ lat: turf.latitude, lng: turf.longitude, text: turf.location }, cities)?.id || ""),
+    locality: turf.locality || "",
     });
     setSlabDayTab("weekday");
     setEditModal(true);
@@ -257,6 +280,8 @@ export default function AdminTurfs() {
       longitude: String(lng),
       // Also update location text if it was empty, or ask
       location: f.location.trim() || address,
+      // Pin decides the city when it falls inside one
+      cityId: guessCity({ lat, lng, text: address }, cities)?.id || f.cityId,
     }));
     setShowMap(false);
     Alert.alert(
@@ -287,6 +312,9 @@ const handleSaveEdit = async () => {
   if (!editTurf) return;
   if (!form.name.trim() || !form.location.trim()) {
     return Alert.alert("Required", "Name and location are required.");
+  }
+  if (cities.length > 0 && !form.cityId) {
+    return Alert.alert("Required", "Pick the city this turf is in.");
   }
 
   // Advance Pricing is only validated when the toggle is ON — if it's OFF,
@@ -361,6 +389,9 @@ const handleSaveEdit = async () => {
       image:         form.images[0] || "",
       active:        form.active,
       rating:        form.rating.trim() ? parseFloat(form.rating) : null,
+      cityId:        form.cityId,
+      cityName:      cityName(form.cityId),
+      locality:      form.locality.trim(),
        venueType:  form.venueType === "other"
     ? form.customVenueType.trim() || "other"
     : form.venueType,
@@ -373,7 +404,7 @@ const handleSaveEdit = async () => {
     });
     setTurfs((prev) =>
           prev.map((t) => t.id === editTurf.id
-        ? { ...t, ...form, bookingPhone: form.bookingMode === "online" ? "" : cleanPhone, latitude, longitude }
+        ? { ...t, ...form, bookingPhone: form.bookingMode === "online" ? "" : cleanPhone, latitude, longitude, cityName: cityName(form.cityId), locality: form.locality.trim() }
         : t)
     );
     setEditModal(false);
@@ -439,6 +470,12 @@ const handleSaveEdit = async () => {
               <View style={s.metaRow}>
                 <Ionicons name="location-outline" size={12} color="#6B7280" />
                 <Text style={s.metaText}>{item.location || "No location"}</Text>
+              </View>
+              <View style={[s.cityBadge, hasCity(item) ? s.cityBadgeOk : s.cityBadgeMissing]}>
+                <Ionicons name="business-outline" size={11} color={hasCity(item) ? "#1D4ED8" : "#B91C1C"} />
+                <Text style={[s.cityBadgeText, { color: hasCity(item) ? "#1D4ED8" : "#B91C1C" }]}>
+                  {hasCity(item) ? [item.locality, cityName(item.cityId)].filter(Boolean).join(" · ") : "No city"}
+                </Text>
               </View>
               {hasCoords && (
                 <Text style={s.coordsText}>{item.latitude!.toFixed(5)}, {item.longitude!.toFixed(5)}</Text>
@@ -564,6 +601,7 @@ const handleSaveEdit = async () => {
                   { label: "Live",   value: turfs.filter((t) => t.active !== false).length, color: "#34D399" },
                   { label: "Paused", value: turfs.filter((t) => t.active === false).length,  color: "#9CA3AF" },
                   { label: "No GPS", value: turfs.filter((t) => t.latitude == null).length,  color: "#FBBF24" },
+                  { label: "No city", value: turfs.filter((t) => !hasCity(t)).length,          color: "#F87171" },
                 ].map((st) => (
                   <View key={st.label} style={s.heroStat}>
                     <Text style={[s.heroStatValue, { color: st.color }]}>{st.value}</Text>
@@ -586,6 +624,21 @@ const handleSaveEdit = async () => {
                 <Ionicons name="add" size={20} color="#FFFFFF" />
               </TouchableOpacity>
             </View>
+            {/* City filter */}
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.cityFilterRow}>
+              {[
+                { key: "all", label: `All (${turfs.length})` },
+                ...cities.map((c) => ({ key: c.id, label: `${c.name} (${turfs.filter((t) => t.cityId === c.id).length})` })),
+                { key: "none", label: `No city (${turfs.filter((t) => !hasCity(t)).length})` },
+              ].map((c) => (
+                <TouchableOpacity key={c.key} style={[s.cityFilterChip, cityFilter === c.key && s.cityFilterChipOn]} onPress={() => setCityFilter(c.key)}>
+                  <Text style={[s.cityFilterTxt, cityFilter === c.key && { color: "#fff" }]}>{c.label}</Text>
+                </TouchableOpacity>
+              ))}
+              <TouchableOpacity style={s.cityFilterChip} onPress={() => router.push("/admin/cities" as any)}>
+                <Ionicons name="settings-outline" size={13} color="#374151" />
+              </TouchableOpacity>
+            </ScrollView>
             <Text style={s.sectionLabel}>{filtered.length} venue{filtered.length !== 1 ? "s" : ""}</Text>
           </View>
         }
@@ -837,6 +890,42 @@ const handleSaveEdit = async () => {
     )}
   </View>
 
+  {/* ══ City + area (all-India) ══════ */}
+  <Text style={s.fieldLabel}>City *</Text>
+  {cities.length === 0 ? (
+    <TouchableOpacity onPress={() => { setEditModal(false); router.push("/admin/cities" as any); }}>
+      <Text style={[s.modeHint, { color: ACCENT }]}>No cities set up yet — tap to set up your first city.</Text>
+    </TouchableOpacity>
+  ) : (
+    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 4 }}>
+      {cities.map((c) => (
+        <TouchableOpacity
+          key={c.id}
+          style={[s.ownerChip, form.cityId === c.id && s.ownerChipActive]}
+          onPress={() => setForm((f) => ({ ...f, cityId: c.id }))}
+        >
+          <Text style={[s.ownerChipText, form.cityId === c.id && s.ownerChipTextActive]}>
+            {c.name}{c.status !== "live" ? ` · ${CITY_STATUS_META[c.status].label}` : ""}
+          </Text>
+        </TouchableOpacity>
+      ))}
+    </ScrollView>
+  )}
+  {!!form.cityId && editTurf && editTurf.cityId !== form.cityId && (
+    <Text style={s.modeHint}>
+      {editTurf.cityId ? "City will change on save." : "Suggested from the map pin / location — check it's right."}
+    </Text>
+  )}
+  <Text style={s.fieldLabel}>Area / Locality</Text>
+  <TextInput
+    style={s.input}
+    placeholder="e.g. Rajapeth, Camp, Badnera"
+    placeholderTextColor="#9CA3AF"
+    value={form.locality}
+    onChangeText={(v) => setForm((f) => ({ ...f, locality: v }))}
+    autoCapitalize="words"
+  />
+
   {/* Rating */}
   <Text style={s.fieldLabel}>Rating (0.0 – 5.0)</Text>
   <TextInput
@@ -1014,7 +1103,7 @@ const s = StyleSheet.create({
   countText:   { color: "#FFFFFF", fontSize: 24, fontWeight: "900" },
   countLabel:  { color: "#9CA3AF", fontSize: 11, fontWeight: "600" },
   heroStats:     { flexDirection: "row", gap: 12, marginTop: 18 },
-  heroStat:      { backgroundColor: "rgba(255,255,255,0.07)", borderRadius: 12, paddingHorizontal: 18, paddingVertical: 10, alignItems: "center" },
+  heroStat:      { flex: 1, backgroundColor: "rgba(255,255,255,0.07)", borderRadius: 12, paddingHorizontal: 6, paddingVertical: 10, alignItems: "center" },
   heroStatValue: { fontSize: 20, fontWeight: "900" },
   heroStatLabel: { color: "#9CA3AF", fontSize: 11, fontWeight: "600", marginTop: 2 },
 
@@ -1130,4 +1219,13 @@ venuePreviewText:   { fontSize: 12, color: "#15803D", fontWeight: "700" },
   modeChipText:       { fontSize: 12, fontWeight: "700", color: "#6B7280" },
   modeChipTextActive: { color: "#fff" },
   modeHint:           { fontSize: 11, color: "#6B7280", fontWeight: "600", marginTop: 6 },
-});
+  // city
+  cityBadge:          { flexDirection: "row", alignItems: "center", gap: 4, alignSelf: "flex-start", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 999, marginTop: 5 },
+  cityBadgeOk:        { backgroundColor: "#EFF6FF" },
+  cityBadgeMissing:   { backgroundColor: "#FEF2F2" },
+  cityBadgeText:      { fontSize: 11, fontWeight: "800" },
+  cityFilterRow:      { gap: 8, paddingHorizontal: 16, paddingTop: 12 },
+  cityFilterChip:     { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 7, borderRadius: 999, backgroundColor: "#fff", borderWidth: 1, borderColor: "#E5E7EB" },
+  cityFilterChipOn:   { backgroundColor: DARK, borderColor: DARK },
+  cityFilterTxt:      { fontSize: 12, fontWeight: "700", color: "#374151" },
+});

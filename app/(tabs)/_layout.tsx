@@ -5,6 +5,7 @@ import { onAuthStateChanged } from "firebase/auth";
 import { doc, getDoc } from "firebase/firestore";
 import { auth, db } from "../../firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 
 
@@ -63,6 +64,10 @@ export default function UserTabLayout() {
   // null       → no user logged in
   // object     → user logged in
    
+  // Real space the phone needs at the bottom (gesture bar / buttons) — differs per phone
+  const insets = useSafeAreaInsets();
+  const bottomPad = Math.max(insets.bottom, 8) + 6;   // +6 = a little breathing room under the labels
+
   const [user, setUser] = useState<any>(undefined);
   const [role, setRole] = useState<string | null>(null);
   const [roleLoading, setRoleLoading] = useState(true);
@@ -132,8 +137,10 @@ export default function UserTabLayout() {
           backgroundColor: TAB_BG,
           borderTopWidth: 0.5,
           borderTopColor: BORDER,
-          height: Platform.OS === "ios" ? 80 : 110,
-          paddingBottom: Platform.OS === "ios" ? 24 : 8,
+          // 56 = icons + labels; then only the space THIS phone needs below them
+          // (was a fixed 110 on Android → big empty gap on gesture-bar phones like OnePlus)
+          height: 56 + bottomPad,
+          paddingBottom: bottomPad,
           paddingTop: 6,
           elevation: 0,         // remove Android shadow
           shadowOpacity: 0,     // remove iOS shadow
@@ -272,7 +279,36 @@ export default function UserTabLayout() {
     tabBarItemStyle: { display: "none" },
   }}
 />
+
+<Tabs.Screen
+  name="list-turf"
+  options={{
+    href: null,
+    headerShown: false,
+    tabBarStyle: { display: "none" },
+    tabBarItemStyle: { display: "none" },
+    
+  }}
+/>
+<Tabs.Screen
+  name="grow-with-playon"
+  options={{
+    href: null,
+    headerShown: false,
+    tabBarStyle: { display: "none" },
+    tabBarItemStyle: { display: "none" },
+    
+  }}
+/>
+<Tabs.Screen
+  name="add-a-turf"
+  options={{
+    href: null,
+    headerShown: false,
+    tabBarStyle: { display: "none" },
+    tabBarItemStyle: { display: "none" },
+  }}
+/>
     </Tabs>
   );
 }
-

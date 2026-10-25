@@ -21,6 +21,7 @@ import { useRouter, Stack, useFocusEffect } from "expo-router";
 import { BackHandler } from "react-native";
 import * as Location from "expo-location";
 import { Ionicons } from "@expo/vector-icons";
+import { City, fetchCities, guessCity, nearestCity } from "../../utils/cities"; // 🏙️ all-India
 
 const VENUES = ["Cricket", "Football", "Badminton", "Pickleball", "Swimming", "Gym"];
 
@@ -89,6 +90,14 @@ export default function Signup() {
   const [locating, setLocating] = useState(false);
   const [errors,   setErrors]   = useState<Errors>({});
   const [userCoords, setUserCoords] = useState<{ latitude: number; longitude: number } | null>(null);
+
+  // 🏙️ PlayOn city found from GPS. liveCity = a city where PlayOn is Live.
+  // If the player is somewhere we're not live yet, liveCity stays null and we
+  // keep the GPS city name (gpsCity) + the nearest live city for the home screen.
+  const [gpsCity,     setGpsCity]     = useState("");
+  const [gpsArea,     setGpsArea]     = useState("");
+  const [liveCity,    setLiveCity]    = useState<City | null>(null);
+  const [nearestLive, setNearestLive] = useState<{ city: City; km: number } | null>(null);
 
   // 🤝 Friend's referral code (optional)
   const [referralCode, setReferralCode] = useState("");
@@ -177,14 +186,30 @@ export default function Signup() {
       // City name is nice to have — if reverse geocoding fails we still have
       // the coordinates, so signup isn't blocked on it.
       let label = "";
+      let city  = "";
+      let area  = "";
       try {
         const address = await Location.reverseGeocodeAsync(loc.coords);
         if (address.length > 0) {
           const a = address[0];
-          const city = a.city || a.subregion || "";
+          city  = a.city || a.subregion || "";
+          area  = a.district || a.street || a.name || "";
           label = [city, a.region].filter(Boolean).join(", ");
         }
       } catch {}
+
+      // 🏙️ Match the GPS point to a PlayOn city. Never blocks signup.
+      setGpsCity(city);
+      setGpsArea(area);
+      try {
+        const live = (await fetchCities()).filter((c) => c.status === "live");
+        const hit  = guessCity({ lat: coords.latitude, lng: coords.longitude, text: city }, live);
+        setLiveCity(hit);
+        setNearestLive(hit ? null : nearestCity(coords.latitude, coords.longitude, live, false));
+      } catch {
+        setLiveCity(null);
+        setNearestLive(null);
+      }
 
       setUserCoords(coords);
       setLocation(label || "Current location");
@@ -254,6 +279,13 @@ export default function Signup() {
         location,
         latitude:      userCoords?.latitude  ?? null,
         longitude:     userCoords?.longitude ?? null,
+        // 🏙️ All-India. cityId = PlayOn city the home screen shows ("" = not live
+        // where the player is → home shows "PlayOn is coming to <gpsCity>").
+        cityId:        liveCity?.id   ?? "",
+        cityName:      liveCity?.name ?? "",
+        city:          gpsCity,          // raw GPS city name, e.g. "Pune"
+        area:          gpsArea,
+        nearestCityId: nearestLive?.city.id ?? "",
         favoriteVenue: venue,
         email:         email.trim().toLowerCase(),
         role:          "user",
@@ -374,7 +406,7 @@ export default function Signup() {
                     </View>
                   </View>
                   <TouchableOpacity
-                    onPress={() => { setLocation(""); setUserCoords(null); }}
+                    onPress={() => { setLocation(""); setUserCoords(null); setLiveCity(null); setNearestLive(null); setGpsCity(""); setGpsArea(""); }}
                     style={s.changeBtn}
                     activeOpacity={0.7}
                   >
@@ -398,8 +430,25 @@ export default function Signup() {
                     )}
                 </TouchableOpacity>
               )}
+              {/* 🏙️ Is PlayOn live where they are? Info only — signup continues either way */}
+              {located && (
+                liveCity ? (
+                  <View style={s.cityNote}>
+                    <Ionicons name="checkmark-circle" size={16} color={theme.primary} />
+                    <Text style={s.cityNoteTxt}>PlayOn is live in {liveCity.name}</Text>
+                  </View>
+                ) : (
+                  <View style={[s.cityNote, s.cityNoteSoon]}>
+                    <Ionicons name="time-outline" size={16} color="#B45309" />
+                    <Text style={[s.cityNoteTxt, { color: "#B45309" }]}>
+                      PlayOn isn't in {gpsCity || "your city"} yet
+                      {nearestLive ? ` — nearest: ${nearestLive.city.name} (${Math.round(nearestLive.km)} km)` : ""}
+                    </Text>
+                  </View>
+                )
+              )}
               {!!errors.location && <Text style={s.error}>{errors.location}</Text>}
-              <Text style={s.hint}>Required — we use this only to sort turfs by distance.</Text>
+              <Text style={s.hint}>Required — we use this to show turfs in your city.</Text>
 
               <Text style={s.label}>Favorite Venue</Text>
               <View style={s.venueGrid}>
@@ -619,6 +668,9 @@ const makeStyles = (theme: SignupTheme) =>
     locLeft:   { flexDirection: "row", alignItems: "center", gap: 10 },
     locCity:   { fontSize: 15, fontWeight: "700", color: theme.text },
     locTag:    { fontSize: 12, color: theme.subText, marginTop: 1 },
+    cityNote:     { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 10, paddingHorizontal: 12, paddingVertical: 10, borderRadius: 12, backgroundColor: theme.primary + "18" },
+    cityNoteSoon: { backgroundColor: "#FEF3C7" },
+    cityNoteTxt:  { flex: 1, fontSize: 13, fontWeight: "700", color: theme.primary },
     changeBtn: { paddingVertical: 10, paddingHorizontal: 12 },
     changeTxt: { color: theme.primary, fontWeight: "700", fontSize: 14 },
 

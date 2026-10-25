@@ -129,6 +129,26 @@ export default function AdminLayout() {
       />
 
       <Drawer.Screen
+        name="add-listing"
+        options={{
+          drawerLabel: "Quick Add Turf",
+          drawerIcon: ({ color, size }) => (
+            <Ionicons name="flash-outline" size={size} color={color} />
+          ),
+        }}
+      />
+
+      <Drawer.Screen
+        name="cities"
+        options={{
+          drawerLabel: "Cities",
+          drawerIcon: ({ color, size }) => (
+            <Ionicons name="map-outline" size={size} color={color} />
+          ),
+        }}
+      />
+
+      <Drawer.Screen
         name="settings"
         options={{
           drawerLabel: "Settings",
@@ -385,6 +405,14 @@ export default function AdminLayout() {
     drawerIcon: ({ color, size }) => (
       <Ionicons name="wallet-outline" size={size} color={color} />
     ),
+  }}
+/>
+
+<Drawer.Screen
+  name="banners"
+  options={{
+    drawerLabel: "Banners",
+    drawerIcon: ({ color, size }) => <Ionicons name="image-outline" size={size} color={color} />,
   }}
 />
 

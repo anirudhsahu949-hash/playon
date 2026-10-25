@@ -278,7 +278,10 @@ export default function Profile() {
   const displayName     = userData?.name     || user.displayName || "User";
   const displayEmail    = userData?.email    || user.email       || "";
   const displayPhone    = userData?.phone    || "";
-  const displayLocation = userData?.location ||
+  // 🏙️ PlayOn city first (set on the City Picker screen), then GPS text
+  const displayLocation =
+    (userData?.cityName ? [userData?.area, userData.cityName].filter(Boolean).join(", ") : "") ||
+    userData?.location ||
     [userData?.area, userData?.city].filter(Boolean).join(", ") ||
     "Add your location";
 
@@ -331,11 +334,13 @@ export default function Profile() {
                 </View>
               )}
 
+              {/* 🏙️ Tap → City Picker screen (search city, GPS, turfs in that city) */}
               <TouchableOpacity
                 style={s.locPill}
-                onPress={getLocation}
+                onPress={() => router.push("/city-picker" as any)}
                 disabled={detectingLocation}
                 activeOpacity={0.8}
+                accessibilityLabel={`City ${displayLocation}. Tap to change city`}
               >
                 <Ionicons
                   name={detectingLocation ? "sync-outline" : "location-outline"}
