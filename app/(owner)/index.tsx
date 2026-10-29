@@ -19,6 +19,9 @@
 // • Turfs that close after midnight (closingTime <= openingTime) now get their
 //   late-night slots in the grid; formatTime handles hours past 24.
 //
+// 📞 27 Oct: added "Customers from PlayOn" card — counts of Call / WhatsApp
+//    taps from the callLeads collection (this month + today, per turf).
+//
 // Data fetching is untouched — same queries, same fallbacks, same reads.
 // Everything in the Slot Overview is pure useMemo: changing date or turf
 // filter = 0 Firestore reads.
@@ -360,6 +363,8 @@ export default function OwnerHome() {
   const [selectedDate, setSelectedDate] = useState(new Date());
   const [selectedTurfId, setSelectedTurfId] = useState<string>("all");
   const [isDark,       setIsDark]       = useState(false);
+  // 📞 Customers PlayOn sent by phone/WhatsApp (counts only — never who)
+  const [leads,        setLeads]        = useState<any[]>([]);
 
   // Guards against setState after the screen goes away.
   const aliveRef = useRef(true);
@@ -419,11 +424,12 @@ export default function OwnerHome() {
         fetchTurfs(),
         fetchBookings(),
         fetchBlockedSlots(),
+        fetchCallLeads(),
       ]);
       results.forEach((r, i) => {
         if (r.status === "rejected") {
           console.log(
-            `Owner dashboard: ${["fetchOwner", "fetchTurfs", "fetchBookings", "fetchBlockedSlots"][i]} failed —`,
+            `Owner dashboard: ${["fetchOwner", "fetchTurfs", "fetchBookings", "fetchBlockedSlots", "fetchCallLeads"][i]} failed —`,
             r.reason
           );
         }
@@ -533,6 +539,43 @@ export default function OwnerHome() {
     }
 
     if (aliveRef.current) setBlockedSlots(docs.map((d) => ({ id: d.id, ...d.data() })));
+  };
+
+  // ─── fetchCallLeads ─────────────────────────────────────────────────────────
+  // Every Call / WhatsApp tap on the owner's phone-booking turfs this month.
+  // The server writes these to "callLeads" (POST /call-lead). Only counts are
+  // shown — the owner never sees who called.
+  //
+  // Needs the composite index:  callLeads → ownerId (ASC) + createdAt (ASC)
+  // Without it, falls back to all of the owner's leads and filters here.
+  const fetchCallLeads = async () => {
+    const uid = auth.currentUser!.uid;
+    const monthStart = new Date();
+    monthStart.setDate(1);
+    monthStart.setHours(0, 0, 0, 0);
+
+    let docs: any[];
+    try {
+      const snap = await getDocs(
+        query(
+          collection(db, "callLeads"),
+          where("ownerId", "==", uid),
+          where("createdAt", ">=", Timestamp.fromDate(monthStart))
+        )
+      );
+      docs = snap.docs;
+    } catch (indexErr) {
+      console.warn(
+        "⚠️ Owner dashboard: callLeads query failed. If the error says 'requires an index', " +
+          "open the link in it. If it says 'permission-denied', your Firestore rules don't " +
+          "let owners read callLeads.",
+        indexErr
+      );
+      const full = await getDocs(query(collection(db, "callLeads"), where("ownerId", "==", uid)));
+      docs = full.docs.filter((d) => (getSafeDate(d.data().createdAt)?.getTime() ?? 0) >= monthStart.getTime());
+    }
+
+    if (aliveRef.current) setLeads(docs.map((d) => ({ id: d.id, ...d.data() })));
   };
 
   // ── Derived — all pure useMemo, zero Firestore reads ─────────────────────
@@ -654,6 +697,21 @@ export default function OwnerHome() {
     };
   }, [slotsByTurf, activeTurfId]);
 
+  const leadStats = useMemo(() => {
+    const today = new Date().toDateString();
+    const byTurf: Record<string, number> = {};
+    let todayCount = 0, calls = 0, whatsapp = 0;
+    leads.forEach((l) => {
+      if (getSafeDate(l.createdAt)?.toDateString() === today) todayCount++;
+      if (l.channel === "whatsapp") whatsapp++; else calls++;
+      if (l.turfId) byTurf[l.turfId] = (byTurf[l.turfId] || 0) + 1;
+    });
+    return { month: leads.length, today: todayCount, calls, whatsapp, byTurf };
+  }, [leads]);
+
+  // Show the card when the owner has a phone-booking turf, or already has leads
+  const hasPhoneTurf = turfs.some((tf) => (tf.bookingMode || "online") !== "online");
+
   const dateStrip = useMemo(() =>
     Array.from({ length: 7 }, (_, i) => { const d = new Date(); d.setDate(d.getDate() + i); return d; }),
   []);
@@ -763,6 +821,51 @@ export default function OwnerHome() {
               label="WEEK" value={fmtAmt(weekRevenue)} sub="This week" decoration="bar" t={t} />
           </View>
         </View>
+
+        {/* ══ CUSTOMERS FROM PLAYON (call / WhatsApp leads) ════ */}
+        {(hasPhoneTurf || leadStats.month > 0) && (
+          <View style={[ld.card, { backgroundColor: t.card, borderColor: t.border, marginHorizontal: 16, marginTop: 16 }]}>
+            <View style={ld.head}>
+              <View style={[ld.icon, { backgroundColor: "rgba(63,185,80,0.15)" }]}>
+                <Ionicons name="call" size={20} color={accent} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={[ld.title, { color: t.text }]}>Customers from PlayOn</Text>
+                <Text style={[ld.sub, { color: t.textSub }]}>Players who called or messaged you from the app</Text>
+              </View>
+            </View>
+
+            <View style={ld.numsRow}>
+              <View style={ld.numBox}>
+                <Text style={[ld.bigNum, { color: t.text }]}>{leadStats.month}</Text>
+                <Text style={[ld.numLbl, { color: t.textSub }]}>THIS MONTH</Text>
+              </View>
+              <View style={[ld.numBox, { borderLeftWidth: 1, borderColor: t.border }]}>
+                <Text style={[ld.bigNum, { color: accent }]}>{leadStats.today}</Text>
+                <Text style={[ld.numLbl, { color: t.textSub }]}>TODAY</Text>
+              </View>
+            </View>
+
+            {leadStats.month > 0 ? (
+              <Text style={[ld.split, { color: t.textSub }]}>
+                {leadStats.calls} call{leadStats.calls !== 1 ? "s" : ""}  ·  {leadStats.whatsapp} WhatsApp
+              </Text>
+            ) : (
+              <Text style={[ld.split, { color: t.textSub }]}>No calls yet this month — we'll notify you when a player calls</Text>
+            )}
+
+            {turfs.length > 1 && leadStats.month > 0 && (
+              <View style={{ marginTop: 10, gap: 6 }}>
+                {turfs.filter((tf) => leadStats.byTurf[tf.id]).map((tf) => (
+                  <View key={tf.id} style={ld.turfRow}>
+                    <Text style={[ld.turfName, { color: t.text }]} numberOfLines={1}>{tf.name || "Turf"}</Text>
+                    <Text style={[ld.turfCnt, { color: t.textSub }]}>{leadStats.byTurf[tf.id]}</Text>
+                  </View>
+                ))}
+              </View>
+            )}
+          </View>
+        )}
 
         {/* ══ PENDING ALERT ════════════════════════════════════ */}
         {pendingCollections.length > 0 && (
@@ -1103,6 +1206,22 @@ const al = StyleSheet.create({
   card: { flexDirection: "row", alignItems: "center", gap: 10, borderRadius: 14, padding: 12, borderWidth: 1 },
   text: { flex: 1, fontSize: 12, fontWeight: "700" },
   link: { fontSize: 12, fontWeight: "800" },
+});
+
+const ld = StyleSheet.create({
+  card:     { borderRadius: 22, padding: 18, borderWidth: 1 },
+  head:     { flexDirection: "row", alignItems: "center", gap: 12 },
+  icon:     { width: 44, height: 44, borderRadius: 14, justifyContent: "center", alignItems: "center" },
+  title:    { fontSize: 16, fontWeight: "900" },
+  sub:      { fontSize: 12, fontWeight: "600", marginTop: 2 },
+  numsRow:  { flexDirection: "row", marginTop: 16 },
+  numBox:   { flex: 1, alignItems: "center", paddingVertical: 4 },
+  bigNum:   { fontSize: 32, fontWeight: "900", letterSpacing: -0.5 },
+  numLbl:   { fontSize: 11, fontWeight: "800", letterSpacing: 0.6, marginTop: 2 },
+  split:    { fontSize: 13, fontWeight: "700", textAlign: "center", marginTop: 12 },
+  turfRow:  { flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 8 },
+  turfName: { fontSize: 13, fontWeight: "700", flexShrink: 1 },
+  turfCnt:  { fontSize: 13, fontWeight: "900" },
 });
 
 const qa = StyleSheet.create({
