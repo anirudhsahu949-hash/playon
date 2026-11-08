@@ -105,7 +105,8 @@
         }
       ],
       "@react-native-community/datetimepicker",
-      "expo-web-browser"
+             "expo-web-browser",
+      "./plugins/withGradleMirror"
     ],
     "experiments": {
       "typedRoutes": true,
