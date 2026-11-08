@@ -1116,7 +1116,7 @@ export default function Explore() {
                   <View style={s.slotSection}>
                     <Text style={s.slotLabel}>Timings</Text>
                     <Text style={s.hoursTxt}>
-                      {(item as any).hoursSet === false ? "Call to book" : `Open ${shortLabel(item.openingTime ?? 6)} – ${shortLabel(item.closingTime ?? 24)}`}
+                      {(item as any).hoursSet === false ? "Online Booking Coming Soon" : `Open ${shortLabel(item.openingTime ?? 6)} – ${shortLabel(item.closingTime ?? 24)}`}
                     </Text>
                   </View>
                 ) : (
@@ -1160,8 +1160,15 @@ export default function Explore() {
                       </Text>
                     )}
                   </View>
-                  <TouchableOpacity style={s.bookBtn} onPress={() => handleBook(item.id)} activeOpacity={0.85}>
-                    <Text style={s.bookBtnTxt}>Book Now</Text>
+                                   <TouchableOpacity
+                    style={[s.bookBtn, phoneOnly && s.callBtn]}
+                    onPress={() => handleBook(item.id)}
+                    activeOpacity={0.85}
+                  >
+                    {phoneOnly && <Ionicons name="call-outline" size={13} color="#15803D" />}
+                    <Text style={[s.bookBtnTxt, phoneOnly && s.callBtnTxt]}>
+                      {phoneOnly ? "Book by Call" : "Book Now"}
+                    </Text>
                   </TouchableOpacity>
                 </View>
               </View>
@@ -1316,8 +1323,10 @@ const s = StyleSheet.create({
   bottomRow:  { flexDirection: "row", alignItems: "center", gap: 8, borderTopWidth: 1, borderTopColor: "#F1F3F5", paddingTop: 10 },
   price:      { fontSize: 16, fontWeight: "900", color: "#0B1220" },
   priceUnit:  { fontSize: 11, fontWeight: "600", color: "#6B7280" },
-  bookBtn:    { height: 34, justifyContent: "center", backgroundColor: "#178c42", paddingHorizontal: 16, borderRadius: 10 },
+  bookBtn:    { height: 34, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 5, backgroundColor: "#178c42", paddingHorizontal: 16, borderRadius: 10 },
   bookBtnTxt: { fontSize: 12, fontWeight: "800", color: "#fff" },
+  callBtn:    { backgroundColor: "#fff", borderWidth: 1.5, borderColor: "#15803D", paddingHorizontal: 12 },
+  callBtnTxt: { color: "#15803D" },
 
   slotSection: { gap: 5 },
   slotRow:     { gap: 5, paddingRight: 4 },   // one row, swipe left for later slots

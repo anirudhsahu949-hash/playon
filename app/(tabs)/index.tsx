@@ -3,6 +3,7 @@ import {
   ScrollView, RefreshControl, StatusBar,        // ← remove SafeAreaView here
   ActivityIndicator, Dimensions, Linking, Alert, Platform,
 } from "react-native";
+import { LinearGradient } from "expo-linear-gradient";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 // ← add this line
 import { useEffect, useMemo, useState, useCallback } from "react";
@@ -350,7 +351,7 @@ function TrendCard({
               : <Text style={[tc.price, { fontSize: 13 }]}>Price on call</Text>}
             {phoneOnly ? (
               <Text style={tc.hours} numberOfLines={1}>
-                {item.hoursSet === false ? "Call to book" : `Open ${shortLabel(turfOpen(item))} – ${shortLabel(turfClose(item))}`}
+                {item.hoursSet === false ? "Online Booking Coming Soon" : `Open ${shortLabel(turfOpen(item))} – ${shortLabel(turfClose(item))}`}
               </Text>
             ) : nextFree === undefined ? null : nextFree === null ? (
               <Text style={[tc.free, { color: "#B91C1C" }]}>Full today</Text>
@@ -358,8 +359,13 @@ function TrendCard({
               <Text style={tc.free} numberOfLines={1}>Next free: {nextFree}</Text>
             )}
           </View>
-          <TouchableOpacity style={tc.bookBtn} onPress={onPress} activeOpacity={0.85}>
-            <Text style={tc.bookTxt}>Book</Text>
+                  <TouchableOpacity
+            style={[tc.bookBtn, phoneOnly && tc.callBtn]}
+            onPress={onPress}
+            activeOpacity={0.85}
+          >
+            {phoneOnly && <Ionicons name="call-outline" size={13} color="#15803D" />}
+            <Text style={[tc.bookTxt, phoneOnly && tc.callTxt]}>{phoneOnly ? "Call" : "Book"}</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -391,7 +397,9 @@ const tc = StyleSheet.create({
   priceUnit: { fontSize: 11, fontWeight: "600", color: "#4B5563" },
   free:      { fontSize: 11, fontWeight: "700", color: "#15803D", marginTop: 1 },
   hours:     { fontSize: 11, fontWeight: "700", color: "#4B5563", marginTop: 1 },
-  bookBtn:   { height: 32, justifyContent: "center", backgroundColor: "#15803D", paddingHorizontal: 14, borderRadius: 10 },
+   bookBtn:   { height: 32, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 4, backgroundColor: "#15803D", paddingHorizontal: 14, borderRadius: 10 },
+  callBtn:   { backgroundColor: "#fff", borderWidth: 1.5, borderColor: "#15803D", paddingHorizontal: 12 },
+  callTxt:   { color: "#15803D" },
   bookTxt:   { fontSize: 12, fontWeight: "800", color: "#fff" },
 });
 
@@ -451,6 +459,7 @@ function BallMachineCard({
   onPress: () => void;
 }) {
   const sport = getSport(item);
+  
   const rating = getRating(item);
   const packages = Array.isArray(item.ballMachinePackages) ? item.ballMachinePackages : [];
   const cheapest = packages.length > 0
@@ -517,12 +526,18 @@ function FullCard({
     ? haversine(userCoords.lat, userCoords.lng, item.latitude, item.longitude)
     : null;
   const sport = getSport(item);
+    const phoneOnly = isPhoneOnly(item);
 
   return (
     <TouchableOpacity style={fc.card} onPress={onPress} activeOpacity={0.92}>
       <View style={fc.imgWrap}>
         <Image source={{ uri: getTurfImage(item) }} style={fc.img} resizeMode="cover" />
-        <View style={fc.gradient} />
+               {/* Dark fade behind the name so it reads on bright photos (sky, white walls) */}
+        <LinearGradient
+          colors={["rgba(0,0,0,0.62)", "rgba(0,0,0,0)"]}
+          style={fc.topShade}
+          pointerEvents="none"
+        />
 
         {dist != null && (
           <View style={fc.distBadge}>
@@ -582,10 +597,17 @@ function FullCard({
           })}
         </View>
 
-        {/* Book Now — same for every turf. Call-to-book is only revealed on the turf page. */}
-        <TouchableOpacity style={fc.bookBtn} onPress={onPress} activeOpacity={0.85}>
-          <Text style={fc.bookBtnTxt}>Book Now</Text>
-          <Ionicons name="arrow-forward" size={12} color="#fff" />
+               {/* Online → Book Now · Phone-only → Book by Call (both open the turf page) */}
+        <TouchableOpacity
+          style={[fc.bookBtn, phoneOnly && fc.callBtn]}
+          onPress={onPress}
+          activeOpacity={0.85}
+        >
+          {phoneOnly && <Ionicons name="call-outline" size={13} color="#15803D" />}
+          <Text style={[fc.bookBtnTxt, phoneOnly && fc.callBtnTxt]}>
+            {phoneOnly ? "Book by Call" : "Book Now"}
+          </Text>
+          {!phoneOnly && <Ionicons name="arrow-forward" size={12} color="#fff" />}
         </TouchableOpacity>
       </View>
     </TouchableOpacity>
@@ -596,7 +618,7 @@ const fc = StyleSheet.create({
   card:    { backgroundColor: "#fff", borderRadius: 18, marginBottom: 14, overflow: "hidden", shadowColor: "#000", shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.07, shadowRadius: 6, elevation: 3 },
   imgWrap: { width: "100%", height: 180, position: "relative" },
   img:     { width: "100%", height: "100%", backgroundColor: "#fff" },
-  gradient:{ position: "absolute", bottom: 0, left: 0, right: 0, top: 0, backgroundColor: "rgba(0,0,0,0.03)" },
+   topShade:{ position: "absolute", top: 0, left: 0, right: 0, height: 84 },
 
   distBadge: { position: "absolute", bottom: 10, right: 12, flexDirection: "row", alignItems: "center", gap: 3, backgroundColor: "rgba(11,18,32,0.75)", paddingHorizontal: 8, paddingVertical: 4, borderRadius: 99 },
   distTxt:   { fontSize: 11, fontWeight: "700", color: "#fff" },
@@ -624,6 +646,8 @@ const fc = StyleSheet.create({
   sportName:     { fontSize: 9.5, color: "#374151", fontWeight: "600", marginTop: 3 },
   bookBtn:       { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: "#178c42", paddingHorizontal: 14, paddingVertical: 9, borderRadius: 10 },
   bookBtnTxt:    { fontSize: 12, fontWeight: "800", color: "#fff" },
+    callBtn:       { backgroundColor: "#fff", borderWidth: 1.5, borderColor: "#15803D", paddingHorizontal: 12, paddingVertical: 8 },
+  callBtnTxt:    { color: "#15803D" },
 });
 
 

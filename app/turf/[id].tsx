@@ -1382,7 +1382,12 @@ const advanceAmount = useMemo(() => {
 }),
       });
       const data = await res.json();
-      if (!res.ok || !data.success) {
+           if (!res.ok || !data.success) {
+        if (data?.offerApplies && data.offer) {
+          // The turf's offer applies to this slot — show it instead of the promo
+          setOffer(data.offer);
+          setPromoCode("");
+        }
         setPromoError(data.error || "Invalid promo code");
         setPromoApplied(null);
         return;
@@ -1484,6 +1489,27 @@ const advanceAmount = useMemo(() => {
 
       const order = await response.json();
       if (!order?.orderId) throw new Error(order?.error || "Order creation failed");
+
+            // FIX: the server has the final say on price. If it worked out a different
+      // amount (e.g. it found a turf offer this screen missed), stop and show it.
+      const serverAmount = Math.round(Number(order.amount) / 100);
+      if (serverAmount !== Math.round(finalAdvanceAmount)) {
+        await unlockSlots(currentLocksRef.current);
+        currentLocksRef.current = [];
+        if (order.offer) {
+          setOffer(order.offer);
+          setPromoApplied(null); setPromoCode(""); setPromoError("");
+          setUsePcoins(false); setUseVcoins(false); setPcoinToUse(0); setVcoinToUse(0);
+        }
+        setLoading(false);
+        Alert.alert(
+          "Price updated",
+          order.offer
+            ? `"${order.offer.title}" from the turf applies to this slot instead of your promo code. You pay ₹${serverAmount} online now. Tap Pay again to continue.`
+            : `The amount to pay online is ₹${serverAmount}. Tap Pay again to continue.`
+        );
+        return;
+      }
 
        if (paymentCancelledRef.current) {
         await unlockSlots(currentLocksRef.current);
