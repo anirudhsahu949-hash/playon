@@ -1,17 +1,14 @@
 /**
  * MapPickerModal.tsx
  * ─────────────────────────────────────────────────────────────
- * Drop-pin location picker — zero new packages required.
- * Uses expo-location (already installed) for:
- *   1. Getting current GPS → centers map there
- *   2. Reverse-geocoding the dropped pin → human address
+ * Drop-pin location picker.
+ *   • Android / iOS → Leaflet map inside a <WebView> (same as before)
+ *   • Web           → same Leaflet map inside an <iframe>
+ *     (react-native-webview does not work on web — the map was blank)
  *
- * The interactive map is a self-contained HTML page injected
- * into a React Native Modal via a <WebView>.
- * 
- * ⚠️  REQUIRES: npm install react-native-webview
- *     Then add to app.json plugins: "react-native-webview"
- *     (one-time setup, takes ~2 minutes)
+ * Geocoding goes through utils/geocode.ts:
+ *   phones → expo-location, web → OpenStreetMap Nominatim
+ *   (expo-location geocoding throws on web)
  *
  * Usage:
  *   <MapPickerModal
@@ -30,9 +27,11 @@ import {
 import { WebView } from "react-native-webview";
 import * as Location from "expo-location";
 import { Ionicons } from "@expo/vector-icons";
+import { geocodeText, reverseGeocode } from "../utils/geocode";
 
 const ACCENT = "#0EA5A4";
 const DARK   = "#0A0F1E";
+const IS_WEB = Platform.OS === "web";
 
 type Props = {
   visible:         boolean;
@@ -43,7 +42,7 @@ type Props = {
   onClose:         () => void;
 };
 
-// ── Build the HTML page injected into WebView ─────────────────────────────────
+// ── Build the HTML page shown in the WebView / iframe ─────────────────────────
 function buildMapHTML(centerLat: number, centerLng: number): string {
   return `
 <!DOCTYPE html>
@@ -96,12 +95,10 @@ function buildMapHTML(centerLat: number, centerLng: number): string {
     iconSize: [32, 44],
   });
 
-  var marker = null;
   var selectedLat = ${centerLat};
   var selectedLng = ${centerLng};
 
-  // Place initial marker
-  marker = L.marker([${centerLat}, ${centerLng}], { icon: pinIcon, draggable: true }).addTo(map);
+  var marker = L.marker([${centerLat}, ${centerLng}], { icon: pinIcon, draggable: true }).addTo(map);
   marker.on('dragend', function(e) {
     selectedLat = e.target.getLatLng().lat;
     selectedLng = e.target.getLatLng().lng;
@@ -112,13 +109,7 @@ function buildMapHTML(centerLat: number, centerLng: number): string {
   map.on('click', function(e) {
     selectedLat = e.latlng.lat;
     selectedLng = e.latlng.lng;
-    if (marker) marker.setLatLng(e.latlng);
-    else marker = L.marker(e.latlng, { icon: pinIcon, draggable: true }).addTo(map);
-    marker.on('dragend', function(ev) {
-      selectedLat = ev.target.getLatLng().lat;
-      selectedLng = ev.target.getLatLng().lng;
-      updateHint(selectedLat, selectedLng);
-    });
+    marker.setLatLng(e.latlng);
     updateHint(selectedLat, selectedLng);
   });
 
@@ -128,9 +119,9 @@ function buildMapHTML(centerLat: number, centerLng: number): string {
   }
 
   function confirmPin() {
-    window.ReactNativeWebView.postMessage(
-      JSON.stringify({ lat: selectedLat, lng: selectedLng })
-    );
+    var msg = JSON.stringify({ source: 'playon-map', lat: selectedLat, lng: selectedLng });
+    if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(msg);   // phone
+    else if (window.parent) window.parent.postMessage(msg, '*');                 // web iframe
   }
 </script>
 </body>
@@ -147,7 +138,7 @@ export default function MapPickerModal({
   const [centerLng, setCenterLng] = useState(initialLng ?? 77.7796);
   const [locating,  setLocating]  = useState(false);
   const [mapReady,  setMapReady]  = useState(false);
-  const [address,   setAddress]   = useState("");
+  const [confirming, setConfirming] = useState(false);
 
   // When modal opens, center on saved coords or geocode the text location
   useEffect(() => {
@@ -169,10 +160,10 @@ export default function MapPickerModal({
   const geocodeInitial = async (text: string) => {
     setLocating(true);
     try {
-      const results = await Location.geocodeAsync(text);
-      if (results.length > 0) {
-        setCenterLat(results[0].latitude);
-        setCenterLng(results[0].longitude);
+      const hit = await geocodeText(text);
+      if (hit) {
+        setCenterLat(hit.latitude);
+        setCenterLng(hit.longitude);
       }
     } catch { /* fall through to default */ }
     finally { setLocating(false); }
@@ -190,39 +181,82 @@ export default function MapPickerModal({
     finally { setLocating(false); }
   };
 
-  // Message from WebView when user taps "Confirm Location"
-  const onMessage = async (event: any) => {
+  // Pin confirmed (from WebView on phones, from iframe postMessage on web)
+  const handlePin = async (raw: string) => {
+    let lat: number, lng: number;
     try {
-      const { lat, lng } = JSON.parse(event.nativeEvent.data);
-
-      // Reverse-geocode to get a human address
-      let humanAddress = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
-      try {
-        const geo = await Location.reverseGeocodeAsync({ latitude: lat, longitude: lng });
-        if (geo.length > 0) {
-          const p = geo[0];
-          const parts = [
-            p.street || p.name,
-            p.district || p.subregion,
-            p.city || p.subregion,
-            p.region,
-          ].filter(Boolean);
-          if (parts.length > 0) humanAddress = parts.join(", ");
-        }
-      } catch { /* use coords as fallback */ }
-
-      setAddress(humanAddress);
-      onConfirm(lat, lng, humanAddress);
+      const data = JSON.parse(raw);
+      lat = Number(data.lat); lng = Number(data.lng);
+      if (isNaN(lat) || isNaN(lng)) throw new Error("bad");
     } catch {
       Alert.alert("Error", "Could not read pin location.");
+      return;
     }
+    setConfirming(true);
+    const address = await reverseGeocode(lat, lng);
+    setConfirming(false);
+    onConfirm(lat, lng, address);
   };
+
+  // Web: listen for the iframe's "Confirm Location" message
+  useEffect(() => {
+    if (!IS_WEB || !visible || typeof window === "undefined") return;
+    const listener = (e: MessageEvent) => {
+      if (typeof e.data !== "string" || !e.data.includes("playon-map")) return;
+      handlePin(e.data);
+    };
+    window.addEventListener("message", listener);
+    return () => window.removeEventListener("message", listener);
+  }, [visible, onConfirm]);
 
   const html = buildMapHTML(centerLat, centerLng);
 
+  const renderMap = () => {
+    if (locating && !mapReady) {
+      return (
+        <View style={st.loadingBox}>
+          <ActivityIndicator size="large" color={ACCENT} />
+          <Text style={st.loadingText}>Finding location…</Text>
+        </View>
+      );
+    }
+    if (IS_WEB) {
+      // key forces a fresh map when the center changes (e.g. after GPS)
+      return (
+        <View style={st.map}>
+          {React.createElement("iframe", {
+            key: `${centerLat},${centerLng}`,
+            srcDoc: html,
+            title: "Pick location",
+            style: { border: 0, width: "100%", height: "100%" },
+            onLoad: () => setMapReady(true),
+          })}
+        </View>
+      );
+    }
+    return (
+      <WebView
+        ref={webRef}
+        style={st.map}
+        source={{ html }}
+        onMessage={(event) => handlePin(event.nativeEvent.data)}
+        onLoad={() => setMapReady(true)}
+        javaScriptEnabled
+        domStorageEnabled
+        startInLoadingState
+        renderLoading={() => (
+          <View style={st.loadingBox}>
+            <ActivityIndicator size="large" color={ACCENT} />
+            <Text style={st.loadingText}>Loading map…</Text>
+          </View>
+        )}
+      />
+    );
+  };
+
   return (
-    <Modal visible={visible} animationType="slide" statusBarTranslucent>
-      <SafeAreaView style={st.safe}>
+    <Modal visible={visible} animationType="slide" statusBarTranslucent onRequestClose={onClose}>
+      <SafeAreaView style={[st.safe, IS_WEB && { marginTop: 0, marginBottom: 0 }]}>
 
         {/* ── Header ── */}
         <View style={st.header}>
@@ -242,35 +276,17 @@ export default function MapPickerModal({
         </View>
 
         {/* ── Map ── */}
-        {locating && !mapReady ? (
-          <View style={st.loadingBox}>
-            <ActivityIndicator size="large" color={ACCENT} />
-            <Text style={st.loadingText}>Finding location…</Text>
-          </View>
-        ) : (
-          <WebView
-            ref={webRef}
-            style={st.map}
-            source={{ html }}
-            onMessage={onMessage}
-            onLoad={() => setMapReady(true)}
-            javaScriptEnabled
-            domStorageEnabled
-            startInLoadingState
-            renderLoading={() => (
-              <View style={st.loadingBox}>
-                <ActivityIndicator size="large" color={ACCENT} />
-                <Text style={st.loadingText}>Loading map…</Text>
-              </View>
-            )}
-          />
-        )}
+        {renderMap()}
 
         {/* ── Footer hint ── */}
         <View style={st.footer}>
-          <Ionicons name="information-circle-outline" size={15} color="#6B7280" />
+          {confirming
+            ? <ActivityIndicator size="small" color={ACCENT} />
+            : <Ionicons name="information-circle-outline" size={15} color="#6B7280" />}
           <Text style={st.footerText}>
-            Tap the map to place a pin · Drag to fine-tune · Tap <Text style={{ fontWeight: "800", color: ACCENT }}>Confirm Location</Text> on the map
+            {confirming
+              ? "Getting address…"
+              : <>Tap the map to place a pin · Drag to fine-tune · Tap <Text style={{ fontWeight: "800", color: ACCENT }}>Confirm Location</Text> on the map</>}
           </Text>
         </View>
 

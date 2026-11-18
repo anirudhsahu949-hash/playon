@@ -281,7 +281,8 @@ export default function BookingDetails() {
               if (!res.ok || !data.success) throw new Error(data.error || "Cancellation failed");
               await fetchBooking();
               Alert.alert("Booking cancelled", data.message || "Your booking has been cancelled.");
-            } catch (e: any) {
+                       } catch (e: any) {
+              await fetchBooking().catch(() => {});
               Alert.alert("Error", e?.message || "Unable to cancel booking.");
             } finally {
               setCancelling(false);

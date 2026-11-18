@@ -22,7 +22,7 @@ import {
 } from "firebase/firestore";
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
-import * as Location from "expo-location";
+import { geocodeText } from "../../utils/geocode";   // ✅ works on web too
 import MapPickerModal from "../../components/Mappickermodal"; // ✅ adjust path as needed
 import { City, CITY_STATUS_META, fetchCities, guessCity } from "../../utils/cities";
 
@@ -296,9 +296,9 @@ export default function AdminTurfs() {
     if (!form.location.trim()) { Alert.alert("Required", "Enter a location first."); return; }
     setGeocoding(true);
     try {
-      const results = await Location.geocodeAsync(form.location.trim());
-      if (results.length > 0) {
-        const { latitude, longitude } = results[0];
+      const hit = await geocodeText(form.location.trim());
+      if (hit) {
+        const { latitude, longitude } = hit;
         setForm((f) => ({ ...f, latitude: String(latitude), longitude: String(longitude) }));
         Alert.alert("Done", `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`);
       } else {
@@ -358,8 +358,8 @@ const handleSaveEdit = async () => {
     longitude = parsedLng;
   } else {
     try {
-      const geo = await Location.geocodeAsync(form.location.trim());
-      if (geo.length > 0) { latitude = geo[0].latitude; longitude = geo[0].longitude; }
+      const hit = await geocodeText(form.location.trim());
+      if (hit) { latitude = hit.latitude; longitude = hit.longitude; }
     } catch { /* non-fatal */ }
   }
 

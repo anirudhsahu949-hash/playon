@@ -27,7 +27,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
-import DateTimePicker from "@react-native-community/datetimepicker";
+import DateTimePicker from "../../components/WebSafeDatePicker";   // ✅ web-safe date picker
 import {
   collection, getDocs, doc, addDoc, updateDoc, deleteDoc, writeBatch,
   serverTimestamp, Timestamp,
@@ -48,6 +48,7 @@ const CARD_W = SW - 32;                   // banner cards in the list
 
 // App screens a banner can open (same routes Home already uses)
 const SCREENS = [
+  { label: "APL Registration", route: "/apl" },        // ← ये नई लाइन
   { label: "Refer & Earn",  route: "/refer-earn-user" },
   { label: "Explore",       route: "/(tabs)/explore" },
   { label: "Toss",          route: "/(tabs)/toss" },

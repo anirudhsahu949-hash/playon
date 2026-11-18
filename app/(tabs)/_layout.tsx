@@ -186,13 +186,12 @@ export default function UserTabLayout() {
 
       {/* ── Leagues (center action — navigates to the league world) ───────── */}
 <Tabs.Screen
-  name="leagues"
+  name="leagues"          // ← यहाँ "league" की जगह "leagues"
   options={{
     href: null,
     headerShown: false,
     tabBarStyle: { display: "none" },
     tabBarItemStyle: { display: "none" },
-    
   }}
 />
 

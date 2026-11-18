@@ -40,6 +40,7 @@ import {
   RefreshControl,
   Dimensions,
 } from "react-native";
+  import { OwnerQuickViewCard } from "../../utils/ownerQuickView";
 import { useRouter } from "expo-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { auth, db } from "../../firebaseConfig";
@@ -414,6 +415,7 @@ export default function OwnerHome() {
   }
 
   useEffect(() => { loadAll(); }, []);
+ 
 
   // allSettled, not all — one failing query must not wipe out the other three.
   const loadAll = async () => {
@@ -1174,6 +1176,14 @@ export default function OwnerHome() {
           <Ionicons name="chevron-forward" size={16} color={t.textMuted} />
         </TouchableOpacity>
       </ScrollView>
+              {/* 🔔 QUICK VIEW — draws the notification pictures off-screen (invisible) */}
+        <OwnerQuickViewCard
+          turfs={turfs}
+          bookings={bookings}
+          blockedSlots={blockedSlots}
+          ready={!loading}
+        />
+      
     </SafeAreaView>
   );
 }

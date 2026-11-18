@@ -1,3 +1,6 @@
+// ✅ WEB FIX: makes Alert.alert work in the browser (popups + confirm buttons).
+// Must stay the FIRST import so every screen gets it.
+import "../utils/alert";
 import { usePushNotifications } from "../app/notification/usenotification";
 import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native';
 import { Stack, useRouter, useSegments } from 'expo-router';
@@ -153,7 +156,7 @@ export default function RootLayout() {
     <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
       <AppThemeProvider>
         <Stack screenOptions={{ headerShown: false }}>
-         
+
           <Stack.Screen name="(tabs)" />
            <Stack.Screen name="(auth)" />
           <Stack.Screen name="(owner)" />

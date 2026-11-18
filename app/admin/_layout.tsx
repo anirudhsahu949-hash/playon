@@ -182,15 +182,6 @@ export default function AdminLayout() {
   }}
 />
 
-<Drawer.Screen
-  name="booking-analysis"
-  options={{
-    title: "Analytics",
-    drawerIcon: ({ color, size }) => (
-      <Ionicons name="stats-chart-outline" size={size} color={color} />
-    ),
-  }}
-/>
    <Drawer.Screen
         name="adminavabar"
         options={{

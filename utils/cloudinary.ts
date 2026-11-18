@@ -1,8 +1,8 @@
 /**
  * utils/cloudinary.ts — pick photos, shrink them, upload to Cloudinary.
  *
- * Used by the Add a Turf / List Your Turf form (app/list-turf.tsx).
- * Can be reused later in admin Add Turf instead of pasting image links.
+ * Used by the Add a Turf / List Your Turf form (app/list-turf.tsx),
+ * admin Quick Add (add-listing.tsx) and admin Banners.
  *
  * Needs (run once in the project folder, then make a new build):
  *   npx expo install expo-image-picker expo-image-manipulator
@@ -11,7 +11,12 @@
  *   Cloud name:    ptaivw9h
  *   Upload preset: playon_turf  (Unsigned, folder playon/turfs)
  * These two values are NOT secrets — never put the API Secret in the app.
+ *
+ * WEB FIX: on web the photo is a blob:/data: link, and FormData can't take
+ * { uri, type, name } like on phones — it needs a real Blob. uploadPhoto now
+ * converts the photo to a Blob on web, so uploads work in the browser too.
  */
+import { Platform } from "react-native";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
 
@@ -30,8 +35,10 @@ const QUALITY = 0.7;
  */
 export async function pickPhotos(max: number): Promise<string[]> {
   if (max <= 0) return [];
-  const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
-  if (!perm.granted) throw new Error("PERMISSION");
+  if (Platform.OS !== "web") {
+    const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!perm.granted) throw new Error("PERMISSION");
+  }
 
   const result = await ImagePicker.launchImageLibraryAsync({
     mediaTypes: ["images"],
@@ -73,9 +80,16 @@ async function shrink(uri: string): Promise<string> {
  */
 export async function uploadPhoto(uri: string, tag = "turf-request"): Promise<string> {
   const small = await shrink(uri);
+  const fileName = `turf_${Date.now()}.jpg`;
 
   const form = new FormData();
-  form.append("file", { uri: small, type: "image/jpeg", name: `turf_${Date.now()}.jpg` } as any);
+  if (Platform.OS === "web") {
+    // Browser: turn the blob:/data: link into a real file
+    const blob = await (await fetch(small)).blob();
+    form.append("file", blob, fileName);
+  } else {
+    form.append("file", { uri: small, type: "image/jpeg", name: fileName } as any);
+  }
   form.append("upload_preset", CLOUDINARY_UPLOAD_PRESET);
   form.append("tags", tag);
 

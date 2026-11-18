@@ -16,6 +16,7 @@ import {
   Switch,
   KeyboardAvoidingView,
 } from "react-native";
+import { QUICK_VIEW_SUPPORTED, isQuickViewOn, setQuickViewOn, clearOwnerQuickView } from "../../utils/ownerQuickView";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useEffect, useState } from "react";
 import { auth, db } from "../../firebaseConfig";
@@ -106,6 +107,23 @@ const [bankName, setBankName] = useState("");
 const [bankUpi, setBankUpi] = useState("");
 const [bankSaving, setBankSaving] = useState(false);
 
+
+  // 🔔 QUICK VIEW on/off
+  const [qvOn, setQvOn]     = useState(false);
+  const [qvBusy, setQvBusy] = useState(false);
+  useEffect(() => { isQuickViewOn().then(setQvOn); }, []);
+
+  const toggleQuickView = async (next: boolean) => {
+    setQvBusy(true);
+    const final = await setQuickViewOn(next);
+    setQvOn(final);
+    setQvBusy(false);
+    if (next && !final) {
+      Alert.alert("Notifications are off", "Allow notifications for PlayOn in your phone settings to see your slots when you pull down.");
+    } else if (next) {
+      Alert.alert("Slot Quick View is on", "Pull down your phone to see today's slots of all your turfs.");
+    }
+  };
   
 
   useEffect(() => { fetchAll(); }, []);
@@ -518,6 +536,28 @@ const handleLogout = async () => {
         )}
 
         {/* ── Operators section ── */}
+
+                {/* 🔔 Slot Quick View switch (Android only) */}
+        {QUICK_VIEW_SUPPORTED && (
+          <View style={s.card}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+              <View style={s.turfIcon}>
+                <Ionicons name="notifications-outline" size={18} color="#22C55E" />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={s.turfName}>Slot Quick View</Text>
+                <Text style={s.turfOp}>See today's free, booked and blocked slots of all turfs when you pull down your phone</Text>
+              </View>
+              <Switch
+                value={qvOn}
+                onValueChange={toggleQuickView}
+                disabled={qvBusy}
+                trackColor={{ false: "#D1D5DB", true: "#86EFAC" }}
+                thumbColor={qvOn ? "#15803D" : "#F9FAFB"}
+              />
+            </View>
+          </View>
+        )}
         
 
         {/* ── Quick actions ── */}
